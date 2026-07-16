@@ -1,0 +1,331 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>EDGAR 财报下载器</title>
+<style>
+  :root {
+    --bg: #0b0c10;
+    --card: #14151c;
+    --card2: #101118;
+    --border: #2a2b36;
+    --text: #e8e8ee;
+    --muted: #8b8c9a;
+    --accent: #7c7ff3;
+    --accent-dim: #23244a;
+    --err: #f37c7c;
+    --ok: #7cf3a8;
+  }
+  * { box-sizing: border-box; margin: 0; padding: 0; }
+  body {
+    background: var(--bg);
+    color: var(--text);
+    font-family: "Segoe UI", "Microsoft YaHei", system-ui, sans-serif;
+    display: flex;
+    justify-content: center;
+    padding: 40px 16px;
+  }
+  .card {
+    background: var(--card);
+    border: 1px solid var(--border);
+    border-radius: 16px;
+    padding: 36px 32px;
+    width: 100%;
+    max-width: 560px;
+  }
+  h1 { font-size: 26px; letter-spacing: .5px; }
+  .sub { color: var(--muted); font-size: 13px; margin-top: 6px; }
+  .head { display: flex; align-items: center; gap: 14px; margin-bottom: 28px; }
+  .logo { font-size: 34px; }
+  label.section { display: block; color: var(--text); font-size: 14px; font-weight: 600; margin: 22px 0 8px; }
+  input[type=text], input[type=email], select {
+    width: 100%;
+    background: var(--card2);
+    border: 1px solid var(--border);
+    border-radius: 10px;
+    color: var(--text);
+    font-size: 15px;
+    padding: 12px 14px;
+    outline: none;
+  }
+  input:focus, select:focus { border-color: var(--accent); }
+  .hint { color: var(--muted); font-size: 12px; margin-top: 6px; }
+  .info-box {
+    display: flex; align-items: center; gap: 12px;
+    background: var(--card2);
+    border: 1px solid var(--border);
+    border-radius: 10px;
+    padding: 12px 14px;
+    margin-top: 10px;
+    font-size: 13px;
+  }
+  .info-box .icon { font-size: 18px; }
+  .info-box .k { color: var(--muted); display: block; font-size: 12px; margin-bottom: 2px; }
+  .info-box a { color: var(--accent); text-decoration: none; word-break: break-all; }
+  .info-box a:hover { text-decoration: underline; }
+  .types { display: grid; grid-template-columns: 1fr 1fr; gap: 12px; }
+  .type-card {
+    background: var(--card2);
+    border: 1px solid var(--border);
+    border-radius: 12px;
+    padding: 18px 12px;
+    text-align: center;
+    cursor: pointer;
+    user-select: none;
+    transition: border-color .15s, background .15s;
+  }
+  .type-card .icon { font-size: 22px; }
+  .type-card .t { font-weight: 700; font-size: 14px; margin-top: 8px; }
+  .type-card .d { color: var(--muted); font-size: 13px; margin-top: 2px; }
+  .type-card.selected { border-color: var(--accent); background: var(--accent-dim); }
+  .range { display: flex; align-items: center; gap: 8px; flex-wrap: wrap; }
+  .range select { width: auto; padding: 10px 8px; }
+  .range .arrow { color: var(--muted); }
+  .range label.latest { display: flex; align-items: center; gap: 6px; font-size: 13px; color: var(--text); cursor: pointer; }
+  .summary { color: var(--accent); font-size: 13px; margin-top: 10px; }
+  button.download {
+    width: 100%;
+    margin-top: 24px;
+    background: var(--accent);
+    color: #fff;
+    font-size: 16px;
+    font-weight: 700;
+    border: none;
+    border-radius: 10px;
+    padding: 15px;
+    cursor: pointer;
+  }
+  button.download:hover { filter: brightness(1.08); }
+  button.download:disabled { opacity: .5; cursor: wait; }
+  .status { margin-top: 14px; font-size: 13px; min-height: 18px; }
+  .status.err { color: var(--err); }
+  .status.ok { color: var(--ok); }
+  .status.busy { color: var(--muted); }
+  .foot { color: var(--muted); font-size: 12px; margin-top: 24px; text-align: center; }
+  .foot a { color: var(--muted); }
+</style>
+</head>
+<body>
+<div class="card">
+  <div class="head">
+    <div class="logo">📊</div>
+    <div>
+      <h1>EDGAR 财报下载器</h1>
+      <div class="sub">通过 SEC EDGAR 官方数据库下载财报文件</div>
+    </div>
+  </div>
+
+  <label class="section" for="ticker">公司股票代码</label>
+  <input type="text" id="ticker" placeholder="例如 NVDA / AAPL / BABA" autocomplete="off" spellcheck="false">
+
+  <div id="companyInfo" style="display:none">
+    <div class="info-box">
+      <span class="icon">🏢</span>
+      <div><span class="k">公司</span><span id="coName">—</span></div>
+    </div>
+    <div class="info-box">
+      <span class="icon">🌐</span>
+      <div><span class="k">公司官网</span><span id="coSite">未提供</span></div>
+    </div>
+    <div class="info-box">
+      <span class="icon">📈</span>
+      <div><span class="k">投资者网站</span><span id="coIR">未提供</span></div>
+    </div>
+    <div class="info-box">
+      <span class="icon">🗓️</span>
+      <div><span class="k">最新财报</span><span id="coLatest">—</span></div>
+    </div>
+  </div>
+
+  <label class="section" for="email">您的邮箱</label>
+  <input type="email" id="email" placeholder="your@email.com">
+  <div class="hint">SEC 要求请求方提供真实联系邮箱（放在 User-Agent 里），不会发送任何邮件</div>
+
+  <label class="section">下载类型（可多选）</label>
+  <div class="types">
+    <div class="type-card selected" id="typeQ" data-type="quarterly">
+      <div class="icon">📄</div>
+      <div class="t">10-Q / 6-K</div>
+      <div class="d">季度报告</div>
+    </div>
+    <div class="type-card selected" id="typeA" data-type="annual">
+      <div class="icon">📚</div>
+      <div class="t">10-K / 20-F</div>
+      <div class="d">年度报告</div>
+    </div>
+  </div>
+
+  <label class="section">时间范围</label>
+  <div class="range">
+    <select id="startQ"></select>
+    <select id="startY"></select>
+    <span class="arrow">→</span>
+    <select id="endQ"></select>
+    <select id="endY"></select>
+    <label class="latest"><input type="checkbox" id="toLatest" checked> 到最新</label>
+  </div>
+  <div class="summary" id="summary"></div>
+
+  <button class="download" id="btn">下载 SEC 文件</button>
+  <div class="status" id="status"></div>
+
+  <div class="foot">
+    数据来自 <a href="https://www.sec.gov/cgi-bin/browse-edgar" target="_blank">SEC EDGAR</a>，
+    文件自动重命名为 代码_表单_报告期，并附 manifest.csv
+  </div>
+</div>
+
+<script>
+const $ = (id) => document.getElementById(id);
+const state = { company: null };
+
+// ---- 初始化下拉框 ----
+const NOW = new Date();
+const CUR_Y = NOW.getFullYear();
+const CUR_Q = Math.floor(NOW.getMonth() / 3) + 1;
+for (const sel of [$("startQ"), $("endQ")]) {
+  for (let q = 1; q <= 4; q++) sel.add(new Option("Q" + q, q));
+}
+for (const sel of [$("startY"), $("endY")]) {
+  for (let y = CUR_Y; y >= 1995; y--) sel.add(new Option(y + "年", y));
+}
+$("startQ").value = 1;
+$("startY").value = CUR_Y - 3;
+$("endQ").value = CUR_Q;
+$("endY").value = CUR_Y;
+
+// ---- 邮箱记忆 ----
+$("email").value = localStorage.getItem("edgar_email") || "";
+$("email").addEventListener("change", () => localStorage.setItem("edgar_email", $("email").value.trim()));
+
+// ---- 下载类型切换 ----
+for (const card of document.querySelectorAll(".type-card")) {
+  card.addEventListener("click", () => { card.classList.toggle("selected"); refreshSummary(); });
+}
+
+// ---- 时间范围 ----
+function refreshRange() {
+  const latest = $("toLatest").checked;
+  $("endQ").disabled = latest;
+  $("endY").disabled = latest;
+  refreshSummary();
+}
+$("toLatest").addEventListener("change", refreshRange);
+for (const id of ["startQ", "startY", "endQ", "endY"]) $(id).addEventListener("change", refreshSummary);
+
+function refreshSummary() {
+  const latest = $("toLatest").checked;
+  const endTxt = latest ? "最新" : `${$("endY").value} Q${$("endQ").value}`;
+  const types = selectedTypes().map(t => t === "quarterly" ? "季报" : "年报").join("+") || "（未选类型）";
+  $("summary").textContent = `将下载 ${$("startY").value} Q${$("startQ").value} → ${endTxt} 的${types}文件`;
+}
+function selectedTypes() {
+  return [...document.querySelectorAll(".type-card.selected")].map(c => c.dataset.type);
+}
+
+// ---- 公司查询 ----
+let lookupTimer = null;
+$("ticker").addEventListener("input", () => {
+  clearTimeout(lookupTimer);
+  lookupTimer = setTimeout(lookup, 600);
+});
+
+async function lookup() {
+  const ticker = $("ticker").value.trim().toUpperCase();
+  if (!ticker) { $("companyInfo").style.display = "none"; return; }
+  try {
+    const email = $("email").value.trim() || "anonymous@example.com";
+    const res = await fetch(`/api/company/${encodeURIComponent(ticker)}?email=${encodeURIComponent(email)}`);
+    if (!res.ok) {
+      const body = await res.json().catch(() => ({}));
+      showCompanyError(body.detail || `未找到 ${ticker}`);
+      return;
+    }
+    const info = await res.json();
+    state.company = info;
+    $("coName").textContent = `${info.name}（CIK ${info.cik}${info.exchanges.length ? " · " + info.exchanges.join("/") : ""}）`;
+    $("coSite").innerHTML = info.website
+      ? `<a href="${info.website}" target="_blank">${info.website}</a>` : "未提供";
+    $("coIR").innerHTML = info.investorWebsite
+      ? `<a href="${info.investorWebsite}" target="_blank">${info.investorWebsite}</a>` : "未提供";
+    const parts = [];
+    for (const [form, d] of Object.entries(info.latest)) {
+      parts.push(`${form}：报告期 ${d.reportDate || "?"}（${d.filingDate} 提交）`);
+    }
+    $("coLatest").textContent = parts.length ? parts.join("； ") : "未找到";
+    $("companyInfo").style.display = "block";
+  } catch (e) {
+    showCompanyError("查询失败：" + e.message);
+  }
+}
+function showCompanyError(msg) {
+  state.company = null;
+  $("coName").textContent = msg;
+  $("coSite").textContent = "—";
+  $("coIR").textContent = "—";
+  $("coLatest").textContent = "—";
+  $("companyInfo").style.display = "block";
+}
+
+// ---- 下载 ----
+$("btn").addEventListener("click", async () => {
+  const ticker = $("ticker").value.trim().toUpperCase();
+  const email = $("email").value.trim();
+  const status = $("status");
+  status.className = "status";
+
+  if (!ticker) return setStatus("err", "请输入股票代码");
+  if (!/^[^@\s]+@[^@\s]+\.[^@\s]+$/.test(email)) return setStatus("err", "请输入有效邮箱");
+  if (selectedTypes().length === 0) return setStatus("err", "请至少选择一种下载类型");
+
+  const payload = {
+    ticker,
+    email,
+    report_types: selectedTypes(),
+    start_year: +$("startY").value,
+    start_quarter: +$("startQ").value,
+    to_latest: $("toLatest").checked,
+    end_year: +$("endY").value,
+    end_quarter: +$("endQ").value,
+  };
+
+  $("btn").disabled = true;
+  setStatus("busy", "正在从 SEC EDGAR 获取并打包文件，文件较多时需要一点时间…");
+  try {
+    const res = await fetch("/api/download", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify(payload),
+    });
+    if (!res.ok) {
+      const body = await res.json().catch(() => ({}));
+      throw new Error(body.detail || `请求失败（HTTP ${res.status}）`);
+    }
+    const count = res.headers.get("X-File-Count") || "?";
+    const blob = await res.blob();
+    const cd = res.headers.get("Content-Disposition") || "";
+    const m = cd.match(/filename="([^"]+)"/);
+    const a = document.createElement("a");
+    a.href = URL.createObjectURL(blob);
+    a.download = m ? m[1] : `${ticker}_filings.zip`;
+    a.click();
+    URL.revokeObjectURL(a.href);
+    setStatus("ok", `完成：共 ${count} 个文件，已重命名并打包（含 manifest.csv）`);
+  } catch (e) {
+    setStatus("err", e.message);
+  } finally {
+    $("btn").disabled = false;
+  }
+});
+
+function setStatus(cls, msg) {
+  const status = $("status");
+  status.className = "status " + cls;
+  status.textContent = msg;
+}
+
+refreshRange();
+</script>
+</body>
+</html>
