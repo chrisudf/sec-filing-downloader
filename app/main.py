@@ -21,8 +21,10 @@ class DownloadRequest(BaseModel):
     ticker: str
     email: str
     report_types: list[str]  # "quarterly" 和/或 "annual"
-    start_year: int = Field(ge=1994, le=2100)
-    start_quarter: int = Field(ge=1, le=4)
+    mode: str = "latest"  # "latest"=每类取最新 N 份；"range"=按季度区间
+    latest_count: int = Field(default=1, ge=1, le=5)
+    start_year: int | None = Field(default=None, ge=1994, le=2100)
+    start_quarter: int | None = Field(default=None, ge=1, le=4)
     to_latest: bool = True
     end_year: int | None = Field(default=None, ge=1994, le=2100)
     end_quarter: int | None = Field(default=None, ge=1, le=4)
@@ -43,25 +45,34 @@ async def download(req: DownloadRequest) -> Response:
     if not EMAIL_RE.match(req.email.strip()):
         raise edgar.EdgarError(400, "请输入有效邮箱（SEC 要求提供真实联系方式）")
 
-    forms: list[str] = []
+    form_groups: list[tuple[str, ...]] = []
     if "quarterly" in req.report_types:
-        forms += list(edgar.QUARTER_FORMS)
+        form_groups.append(edgar.QUARTER_FORMS)
     if "annual" in req.report_types:
-        forms += list(edgar.ANNUAL_FORMS)
-    if not forms:
+        form_groups.append(edgar.ANNUAL_FORMS)
+    if not form_groups:
         raise edgar.EdgarError(400, "请至少选择一种下载类型")
 
-    dstart = edgar.quarter_start(req.start_year, req.start_quarter)
-    if req.to_latest or req.end_year is None:
-        dend = date.today()
-    else:
-        dend = edgar.quarter_end(req.end_year, req.end_quarter or 4)
-    if dend < dstart:
-        raise edgar.EdgarError(400, "结束时间早于开始时间")
-
-    data, count = await edgar.build_zip(req.ticker, req.email.strip(), forms, dstart, dend)
     ticker = req.ticker.strip().upper()
-    filename = f"{ticker}_filings_{dstart:%Y%m%d}-{dend:%Y%m%d}.zip"
+
+    if req.mode == "latest":
+        data, count = await edgar.build_zip_latest(
+            ticker, req.email.strip(), form_groups, req.latest_count
+        )
+        filename = f"{ticker}_latest{req.latest_count}.zip"
+    else:
+        if req.start_year is None or req.start_quarter is None:
+            raise edgar.EdgarError(400, "自定义范围模式需要提供开始年份和季度")
+        forms = [f for group in form_groups for f in group]
+        dstart = edgar.quarter_start(req.start_year, req.start_quarter)
+        if req.to_latest or req.end_year is None:
+            dend = date.today()
+        else:
+            dend = edgar.quarter_end(req.end_year, req.end_quarter or 4)
+        if dend < dstart:
+            raise edgar.EdgarError(400, "结束时间早于开始时间")
+        data, count = await edgar.build_zip(ticker, req.email.strip(), forms, dstart, dend)
+        filename = f"{ticker}_filings_{dstart:%Y%m%d}-{dend:%Y%m%d}.zip"
     return Response(
         content=data,
         media_type="application/zip",

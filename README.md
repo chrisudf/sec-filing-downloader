@@ -10,7 +10,8 @@
 - 🔍 **代码查询**：ticker → CIK 自动映射（SEC 全量 1 万+ 上市主体，每日缓存）
 - 🏢 **公司信息卡**：公司名、交易所、官网、投资者网站、最新年报/季报日期
 - 📥 **批量下载**：任选季报（10-Q / 6-K）、年报（10-K / 20-F），支持中概股等外国发行人
-- 🗓️ **时间范围**：按「季度 + 年份」起止筛选（按报告期 reportDate 过滤），可勾选"到最新"
+- 📌 **快捷模式（默认）**：「最新一份 / 最新两份」——每种选中类型各取最新 N 份；估值场景通常这就够了（一份 10-K 自带 3 年利润表对比）
+- 🗓️ **自定义范围**：按「季度 + 年份」起止筛选（按报告期 reportDate 过滤），可勾选"到最新"，用于拉长期历史
 - 🏷️ **自动重命名**：`NVDA_10-K_2025-01-26.htm` 这样的可排序文件名，重名自动去重
 - 📦 **打包下载**：zip 内附 `manifest.csv`（表单、报告期、提交日、原始 URL 溯源）
 - ✅ **SEC 合规**：User-Agent 携带联系邮箱；请求间隔 0.12s（限速 10 req/s 之内）
@@ -94,11 +95,16 @@ python -m venv .venv
   "ticker": "NVDA",
   "email": "you@example.com",
   "report_types": ["quarterly", "annual"],
+  "mode": "latest",
+  "latest_count": 1,
   "start_year": 2023, "start_quarter": 1,
   "to_latest": true,
   "end_year": null, "end_quarter": null
 }
 ```
+
+`mode: "latest"`（默认）时每种类型各取最新 `latest_count` 份，忽略时间范围字段；
+`mode: "range"` 时按 `start_*` / `end_*` / `to_latest` 的季度区间过滤。
 
 返回 `application/zip`（响应头 `X-File-Count` 为文件数），zip 内含重命名后的财报 + `manifest.csv`。
 

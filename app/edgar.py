@@ -156,44 +156,79 @@ async def build_zip(
             raise EdgarError(
                 400, f"匹配到 {len(picked)} 个文件，超过单次 {MAX_FILES} 个上限，请缩小时间范围"
             )
+        return await _pack(client, cik, ticker, picked)
 
-        buf = io.BytesIO()
-        manifest: list[dict] = []
-        used: set[str] = set()
-        with zipfile.ZipFile(buf, "w", zipfile.ZIP_DEFLATED) as zf:
-            for row in picked:
-                acc = row["accessionNumber"].replace("-", "")
-                # 早期文件没有 primaryDocument，退回完整提交文本
-                doc = row["primaryDocument"] or f"{row['accessionNumber']}.txt"
-                url = DOC_URL.format(cik=cik, acc=acc, doc=doc)
 
-                await asyncio.sleep(REQUEST_GAP)
-                resp = await client.get(url)
-                resp.raise_for_status()
+async def build_zip_latest(
+    ticker: str, email: str, form_groups: list[tuple[str, ...]], count: int
+) -> tuple[bytes, int]:
+    """每组表单（季报组/年报组）各取最新 count 份，打包返回。
 
-                period = row["reportDate"] or row["filingDate"]
-                ext = "." + doc.rsplit(".", 1)[-1] if "." in doc else ".txt"
-                name = f"{ticker}_{row['form'].replace('/', '')}_{period}{ext}"
-                if name in used:
-                    name = f"{ticker}_{row['form'].replace('/', '')}_{period}_{acc[-6:]}{ext}"
-                used.add(name)
+    按报告期倒序取，10-K/20-F、10-Q/6-K 同组互斥（美国公司只会有前者，
+    外国发行人只会有后者），所以组内直接取最新即可。
+    注意：6-K 里最新的一份未必是业绩公告（可能是新闻稿），智能过滤在路线图里。
+    """
+    ticker = ticker.strip().upper()
+    async with _client(email) as client:
+        cik, subs = await _submissions(client, ticker)
+        rows = _rows(subs["filings"]["recent"])
 
-                zf.writestr(name, resp.content)
-                manifest.append(
-                    {
-                        "file": name,
-                        "form": row["form"],
-                        "reportDate": row["reportDate"],
-                        "filingDate": row["filingDate"],
-                        "accessionNumber": row["accessionNumber"],
-                        "sourceUrl": url,
-                    }
-                )
+        picked: list[dict] = []
+        seen: set[str] = set()
+        for group in form_groups:
+            matches = [r for r in rows if r["form"] in group]
+            matches.sort(key=lambda r: r["reportDate"] or r["filingDate"], reverse=True)
+            for row in matches[:count]:
+                if row["accessionNumber"] not in seen:
+                    seen.add(row["accessionNumber"])
+                    picked.append(row)
 
-            out = io.StringIO()
-            writer = csv.DictWriter(out, fieldnames=list(manifest[0].keys()))
-            writer.writeheader()
-            writer.writerows(manifest)
-            zf.writestr("manifest.csv", out.getvalue())
+        if not picked:
+            raise EdgarError(404, "没有找到符合条件的财报文件")
+        picked.sort(key=lambda r: r["reportDate"] or r["filingDate"])
+        return await _pack(client, cik, ticker, picked)
+
+
+async def _pack(
+    client: httpx.AsyncClient, cik: int, ticker: str, picked: list[dict]
+) -> tuple[bytes, int]:
+    buf = io.BytesIO()
+    manifest: list[dict] = []
+    used: set[str] = set()
+    with zipfile.ZipFile(buf, "w", zipfile.ZIP_DEFLATED) as zf:
+        for row in picked:
+            acc = row["accessionNumber"].replace("-", "")
+            # 早期文件没有 primaryDocument，退回完整提交文本
+            doc = row["primaryDocument"] or f"{row['accessionNumber']}.txt"
+            url = DOC_URL.format(cik=cik, acc=acc, doc=doc)
+
+            await asyncio.sleep(REQUEST_GAP)
+            resp = await client.get(url)
+            resp.raise_for_status()
+
+            period = row["reportDate"] or row["filingDate"]
+            ext = "." + doc.rsplit(".", 1)[-1] if "." in doc else ".txt"
+            name = f"{ticker}_{row['form'].replace('/', '')}_{period}{ext}"
+            if name in used:
+                name = f"{ticker}_{row['form'].replace('/', '')}_{period}_{acc[-6:]}{ext}"
+            used.add(name)
+
+            zf.writestr(name, resp.content)
+            manifest.append(
+                {
+                    "file": name,
+                    "form": row["form"],
+                    "reportDate": row["reportDate"],
+                    "filingDate": row["filingDate"],
+                    "accessionNumber": row["accessionNumber"],
+                    "sourceUrl": url,
+                }
+            )
+
+        out = io.StringIO()
+        writer = csv.DictWriter(out, fieldnames=list(manifest[0].keys()))
+        writer.writeheader()
+        writer.writerows(manifest)
+        zf.writestr("manifest.csv", out.getvalue())
 
     return buf.getvalue(), len(picked)

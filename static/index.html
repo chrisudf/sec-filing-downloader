@@ -79,6 +79,21 @@
   .type-card .t { font-weight: 700; font-size: 14px; margin-top: 8px; }
   .type-card .d { color: var(--muted); font-size: 13px; margin-top: 2px; }
   .type-card.selected { border-color: var(--accent); background: var(--accent-dim); }
+  .mode-chips { display: flex; gap: 8px; margin-bottom: 12px; }
+  .mode-chip {
+    flex: 1;
+    background: var(--card2);
+    border: 1px solid var(--border);
+    border-radius: 10px;
+    color: var(--text);
+    font-size: 13px;
+    padding: 10px 6px;
+    text-align: center;
+    cursor: pointer;
+    user-select: none;
+    transition: border-color .15s, background .15s;
+  }
+  .mode-chip.selected { border-color: var(--accent); background: var(--accent-dim); font-weight: 700; }
   .range { display: flex; align-items: center; gap: 8px; flex-wrap: wrap; }
   .range select { width: auto; padding: 10px 8px; }
   .range .arrow { color: var(--muted); }
@@ -157,7 +172,12 @@
   </div>
 
   <label class="section">时间范围</label>
-  <div class="range">
+  <div class="mode-chips">
+    <div class="mode-chip selected" id="modeL1">📌 最新一份</div>
+    <div class="mode-chip" id="modeL2">📑 最新两份</div>
+    <div class="mode-chip" id="modeRange">🗓️ 自定义范围</div>
+  </div>
+  <div class="range" id="rangeRow" style="display:none">
     <select id="startQ"></select>
     <select id="startY"></select>
     <span class="arrow">→</span>
@@ -204,6 +224,19 @@ for (const card of document.querySelectorAll(".type-card")) {
   card.addEventListener("click", () => { card.classList.toggle("selected"); refreshSummary(); });
 }
 
+// ---- 下载模式：最新 N 份 / 自定义范围 ----
+const modeState = { mode: "latest", count: 1 };
+const MODE_CHIPS = { modeL1: ["latest", 1], modeL2: ["latest", 2], modeRange: ["range", 0] };
+for (const [id, [mode, count]] of Object.entries(MODE_CHIPS)) {
+  $(id).addEventListener("click", () => {
+    modeState.mode = mode;
+    modeState.count = count;
+    for (const cid of Object.keys(MODE_CHIPS)) $(cid).classList.toggle("selected", cid === id);
+    $("rangeRow").style.display = mode === "range" ? "flex" : "none";
+    refreshSummary();
+  });
+}
+
 // ---- 时间范围 ----
 function refreshRange() {
   const latest = $("toLatest").checked;
@@ -215,9 +248,13 @@ $("toLatest").addEventListener("change", refreshRange);
 for (const id of ["startQ", "startY", "endQ", "endY"]) $(id).addEventListener("change", refreshSummary);
 
 function refreshSummary() {
+  const types = selectedTypes().map(t => t === "quarterly" ? "季报" : "年报").join("+") || "（未选类型）";
+  if (modeState.mode === "latest") {
+    $("summary").textContent = `将下载最新 ${modeState.count} 份${types}文件（每种类型各 ${modeState.count} 份）`;
+    return;
+  }
   const latest = $("toLatest").checked;
   const endTxt = latest ? "最新" : `${$("endY").value} Q${$("endQ").value}`;
-  const types = selectedTypes().map(t => t === "quarterly" ? "季报" : "年报").join("+") || "（未选类型）";
   $("summary").textContent = `将下载 ${$("startY").value} Q${$("startQ").value} → ${endTxt} 的${types}文件`;
 }
 function selectedTypes() {
@@ -283,6 +320,8 @@ $("btn").addEventListener("click", async () => {
     ticker,
     email,
     report_types: selectedTypes(),
+    mode: modeState.mode,
+    latest_count: modeState.count || 1,
     start_year: +$("startY").value,
     start_quarter: +$("startQ").value,
     to_latest: $("toLatest").checked,
