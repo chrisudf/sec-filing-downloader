@@ -95,14 +95,34 @@ async def _run(cmd: list[str], cwd: Path, timeout: int = 300) -> str:
     return out.decode("utf-8", "ignore")
 
 
+def _find_claude() -> str:
+    """服务进程的 PATH 可能不含 npm 全局目录，按候选路径兜底。
+    只能用 .cmd/.exe（子进程 shell 是 cmd.exe，跑不了 .ps1 垫片）。"""
+    if os.environ.get("CLAUDE_CLI_PATH"):
+        return os.environ["CLAUDE_CLI_PATH"]
+    exe = shutil.which("claude")
+    if exe and exe.lower().endswith(".ps1"):
+        cmd_sibling = exe[:-4] + ".cmd"
+        exe = cmd_sibling if Path(cmd_sibling).exists() else None
+    if exe:
+        return exe
+    for cand in (
+        Path(os.environ.get("APPDATA", "")) / "npm" / "claude.cmd",
+        Path.home() / ".local" / "bin" / "claude.exe",
+        Path(os.environ.get("LOCALAPPDATA", "")) / "Programs" / "claude" / "claude.exe",
+    ):
+        if cand.exists():
+            return str(cand)
+    raise RuntimeError(
+        "找不到 claude CLI：请在终端跑 (Get-Command claude).Source 找到路径，"
+        "然后设置环境变量 CLAUDE_CLI_PATH 指向 claude.cmd/claude.exe")
+
+
 async def _claude(prompt: str) -> str:
     # VALUATION_JUDGMENT_CMD 可替换判断层命令（测试注入 / 将来切 Anthropic API）
     cmd = os.environ.get("VALUATION_JUDGMENT_CMD")
     if not cmd:
-        exe = shutil.which("claude")
-        if not exe:
-            raise RuntimeError("找不到 claude CLI，请确认本机已安装 Claude Code")
-        cmd = f'"{exe}" -p --model sonnet'
+        cmd = f'"{_find_claude()}" -p --model sonnet'
     proc = await asyncio.create_subprocess_shell(
         cmd, stdin=asyncio.subprocess.PIPE,
         stdout=asyncio.subprocess.PIPE, stderr=asyncio.subprocess.PIPE,
