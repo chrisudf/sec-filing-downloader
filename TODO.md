@@ -26,18 +26,22 @@
 
 ## 📊 v0.3 — 财务数据提取（估值的地基）
 
-- [ ] 接 SEC XBRL companyfacts API（`/api/xbrl/companyfacts/CIK##.json`），免解析 HTML 直接拿结构化数据
-- [ ] 提取核心科目时间序列：营收、毛利、营业利润、净利、EPS、经营现金流、CapEx、股本数
-- [ ] 计算派生指标：FCF、毛利率/净利率趋势、营收 YoY/CAGR
-- [ ] 导出 Excel（每公司一个 workbook：原始数据 + 指标表）
+- [x] 接 SEC XBRL companyfacts API：`valuation/fetch_facts.py`（2026-07-17 实装）
+      —— 多标签合并（公司会换标签）、Q4 自动推导、TTM（损益=四季加总；现金流=年度+YTD差额）
+- [x] 核心科目时间序列：营收/营业利润/净利/EPS/CFO/CapEx/现金/债务/股本
 - [ ] 数据缓存（SQLite），避免重复请求 SEC
+- [ ] 分部数据自动提取（目前由判断层从 10-K/10-Q Segment 附注人工提取）
 
 ## 💰 v0.4 — 估值分析
 
-- [ ] DCF 模板：FCF 预测（增长率假设可调）、WACC 输入、终值、敏感性表（增长率 × 折现率）
+- [x] 估值引擎 `valuation/engine.py`：PE 法 + 十年两段式 FCFF DCF + SOTP/倍数法 +
+      反向 DCF + WACC×永续g 敏感性；bear/base/bull 三情景（2026-07-17 实装）
+- [x] 六表 Excel 报告 `valuation/build_report.py`（摘要/情景假设/DCF/SOTP/历史数据/出处，
+      假设全部为可调黄色格、公式联动）+ `verify_report.py` 独立复算验证
+- [x] 用户级 Claude Code skill `/valuation TICKER` 串起全流程（LLM 只做判断层：定假设+注出处）
+- [x] 已产出样例：META / NVDA / MU（reports/，不入库）
 - [ ] 相对估值：PE / PS / EV-EBITDA 历史分位 + 同行对比
-- [ ] 反向 DCF：由当前股价倒推隐含增长率
-- [ ] 估值结果页 / 报告导出（PDF or Excel）
+- [ ] 报告 PDF 导出
 
 ## 🚀 v0.5 — 部署与产品化
 

@@ -55,6 +55,8 @@ sec-filing-downloader/
 │   └── edgar.py       # SEC EDGAR 客户端：查询、过滤、下载、重命名、打包
 ├── static/
 │   └── index.html     # 深色主题单页前端（原生 JS，无构建步骤）
+├── valuation/         # 估值引擎（XBRL 取数 → 三情景 PE/DCF/SOTP → Excel 报告）
+│   └── README.md      # 流水线用法与 config schema
 ├── requirements.txt
 ├── README.md
 └── TODO.md            # 路线图
