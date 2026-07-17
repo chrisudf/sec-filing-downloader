@@ -13,8 +13,12 @@
 
 ## 📦 v0.2 — 文件体验增强
 
+- [x] 6-K 附件自动下载（业绩正文常在 EX-99 里，主文档只是封面；2026-07-17 实装）
+- [x] 6-K 智能挑选 v1：同报告期取最大文件 + 精确季度末优先（TSM 类 reportDate=季度末的发行人已可用）
+- [ ] 6-K 智能挑选 v2：BABA 类发行人 reportDate=发布日、垃圾公告又大又多，需接 EDGAR 全文搜索
+      API（efts.sec.gov）按 "Results Announcement" 等关键词识别业绩 6-K
 - [ ] HTML 财报转 PDF（参考站的卖点；可用 headless Chromium / weasyprint）
-- [ ] 附件下载选项：财务报表 Exhibit（EX-99 等）、XBRL 原始文件
+- [ ] XBRL 原始文件下载选项
 - [ ] 包含修正版（10-K/A、10-Q/A）的开关
 - [ ] 下载进度条（服务端 SSE 或 websocket 推送逐文件进度）
 - [ ] 批量输入多个 ticker，一次打包

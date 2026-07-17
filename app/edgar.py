@@ -23,6 +23,8 @@ import httpx
 TICKERS_URL = "https://www.sec.gov/files/company_tickers.json"
 SUBMISSIONS_URL = "https://data.sec.gov/submissions/{name}"
 DOC_URL = "https://www.sec.gov/Archives/edgar/data/{cik}/{acc}/{doc}"
+INDEX_URL = "https://www.sec.gov/Archives/edgar/data/{cik}/{acc}/index.json"
+MAX_EXHIBITS = 8
 
 QUARTER_FORMS = ("10-Q", "6-K")   # 季报（6-K 为中概股等外国发行人）
 ANNUAL_FORMS = ("10-K", "20-F")   # 年报（20-F 为外国发行人）
@@ -86,8 +88,34 @@ def quarter_end(year: int, quarter: int) -> date:
 
 
 def _rows(block: dict) -> list[dict]:
-    keys = ("accessionNumber", "form", "filingDate", "reportDate", "primaryDocument")
+    keys = ("accessionNumber", "form", "filingDate", "reportDate", "primaryDocument", "size")
     return [{k: block[k][i] for k in keys} for i in range(len(block["form"]))]
+
+
+def _is_quarter_end(d: str) -> bool:
+    """精确的季度末日（3/6/9/12 月最后一天）。TSM 类发行人的业绩 6-K
+    reportDate 就是季度末；BABA 类用发布日，识别它们需要全文搜索（见 TODO）。"""
+    try:
+        dt = date.fromisoformat(d)
+    except (ValueError, TypeError):
+        return False
+    return dt.month in (3, 6, 9, 12) and (dt + timedelta(days=1)).month != dt.month
+
+
+def _pick_latest_6k(matches: list[dict], count: int) -> list[dict]:
+    """6-K 智能挑选：外国发行人把新闻稿、人事公告、月度营收都按 6-K 提交，
+    真正的季度业绩 6-K 特征是：报告期=季度末 + 文件体积远大于杂项公告。
+    同一报告期只留最大的一份，优先季度末报告期。"""
+    by_period: dict[str, dict] = {}
+    for r in matches:
+        key = r["reportDate"] or r["filingDate"]
+        if key not in by_period or (r.get("size") or 0) > (by_period[key].get("size") or 0):
+            by_period[key] = r
+    candidates = list(by_period.values())
+    qend = [r for r in candidates if _is_quarter_end(r["reportDate"])]
+    pool = qend if qend else candidates
+    pool.sort(key=lambda r: r["reportDate"] or r["filingDate"], reverse=True)
+    return pool[:count]
 
 
 async def company_info(ticker: str, email: str) -> dict:
@@ -177,8 +205,13 @@ async def build_zip_latest(
         seen: set[str] = set()
         for group in form_groups:
             matches = [r for r in rows if r["form"] in group]
-            matches.sort(key=lambda r: r["reportDate"] or r["filingDate"], reverse=True)
-            for row in matches[:count]:
+            six_k = [r for r in matches if r["form"] == "6-K"]
+            if six_k and len(six_k) == len(matches):
+                top = _pick_latest_6k(six_k, count)
+            else:
+                matches.sort(key=lambda r: r["reportDate"] or r["filingDate"], reverse=True)
+                top = matches[:count]
+            for row in top:
                 if row["accessionNumber"] not in seen:
                     seen.add(row["accessionNumber"])
                     picked.append(row)
@@ -187,6 +220,24 @@ async def build_zip_latest(
             raise EdgarError(404, "没有找到符合条件的财报文件")
         picked.sort(key=lambda r: r["reportDate"] or r["filingDate"])
         return await _pack(client, cik, ticker, picked)
+
+
+async def _6k_exhibits(client: httpx.AsyncClient, cik: int, acc: str, primary: str) -> list[str]:
+    """6-K 的正文往往只是封面信，季度业绩在同一提交的 EX-99 附件里，
+    从 index.json 把附件 htm 一并带上（跳过图片/XBRL 等资源文件）。"""
+    try:
+        idx = await _get_json(client, INDEX_URL.format(cik=cik, acc=acc))
+        items = idx.get("directory", {}).get("item", [])
+    except Exception:
+        return []
+    out = []
+    for it in items:
+        name = it.get("name", "")
+        low = name.lower()
+        if name == primary or "index" in low or not low.endswith((".htm", ".html")):
+            continue
+        out.append(name)
+    return out[:MAX_EXHIBITS]
 
 
 async def _pack(
@@ -224,6 +275,29 @@ async def _pack(
                     "sourceUrl": url,
                 }
             )
+
+            if row["form"] == "6-K" and row["primaryDocument"]:
+                for ex in await _6k_exhibits(client, cik, acc, row["primaryDocument"]):
+                    ex_url = DOC_URL.format(cik=cik, acc=acc, doc=ex)
+                    await asyncio.sleep(REQUEST_GAP)
+                    ex_resp = await client.get(ex_url)
+                    if ex_resp.status_code != 200:
+                        continue
+                    ex_name = f"{ticker}_6-K_{period}_ex_{ex.rsplit('/', 1)[-1]}"
+                    if ex_name in used:
+                        continue
+                    used.add(ex_name)
+                    zf.writestr(ex_name, ex_resp.content)
+                    manifest.append(
+                        {
+                            "file": ex_name,
+                            "form": "6-K (exhibit)",
+                            "reportDate": row["reportDate"],
+                            "filingDate": row["filingDate"],
+                            "accessionNumber": row["accessionNumber"],
+                            "sourceUrl": ex_url,
+                        }
+                    )
 
         out = io.StringIO()
         writer = csv.DictWriter(out, fieldnames=list(manifest[0].keys()))
