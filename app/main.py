@@ -84,5 +84,9 @@ async def download(req: DownloadRequest) -> Response:
     )
 
 
+from . import valuation_service  # noqa: E402 —— 需在静态挂载前注册路由
+
+app.include_router(valuation_service.router)
+
 STATIC_DIR = Path(__file__).resolve().parent.parent / "static"
 app.mount("/", StaticFiles(directory=str(STATIC_DIR), html=True), name="static")

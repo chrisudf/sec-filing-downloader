@@ -113,6 +113,7 @@
   }
   button.download:hover { filter: brightness(1.08); }
   button.download:disabled { opacity: .5; cursor: wait; }
+  button.download.val { background: #2e7d5b; margin-top: 8px; }
   .status { margin-top: 14px; font-size: 13px; min-height: 18px; }
   .status.err { color: var(--err); }
   .status.ok { color: var(--ok); }
@@ -189,6 +190,12 @@
 
   <button class="download" id="btn">下载 SEC 文件</button>
   <div class="status" id="status"></div>
+
+  <label class="section">估值报告（AI 定假设 · 引擎算数字）</label>
+  <button class="download val" id="valBtn">📊 生成三情景估值报告 (Excel)</button>
+  <div class="status" id="valStatus"></div>
+  <div class="hint">bear/base/bull 三情景：PE 法 + 十年 DCF + SOTP + 反向 DCF。AI 只负责定假设并注明财报出处，
+    所有数字由确定性引擎计算并经公式复算验证。全程约 2-4 分钟，产出 zip（财报原件 + Excel 报告 + 假设留档）。</div>
 
   <div class="foot">
     数据来自 <a href="https://www.sec.gov/cgi-bin/browse-edgar" target="_blank">SEC EDGAR</a>，
@@ -362,6 +369,57 @@ function setStatus(cls, msg) {
   const status = $("status");
   status.className = "status " + cls;
   status.textContent = msg;
+}
+
+// ---- 估值报告 ----
+$("valBtn").addEventListener("click", async () => {
+  const ticker = $("ticker").value.trim().toUpperCase();
+  const email = $("email").value.trim();
+  if (!ticker) return setValStatus("err", "请输入股票代码");
+  if (!/^[^@\s]+@[^@\s]+\.[^@\s]+$/.test(email)) return setValStatus("err", "请输入有效邮箱");
+
+  $("valBtn").disabled = true;
+  setValStatus("busy", "提交任务…");
+  try {
+    const res = await fetch("/api/valuation", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ ticker, email }),
+    });
+    if (!res.ok) {
+      const body = await res.json().catch(() => ({}));
+      throw new Error(body.detail || `提交失败（HTTP ${res.status}）`);
+    }
+    const { job_id } = await res.json();
+    while (true) {
+      await new Promise(r => setTimeout(r, 4000));
+      const st = await (await fetch(`/api/valuation/${job_id}`)).json();
+      if (st.status === "failed") throw new Error(st.error || "任务失败");
+      if (st.status === "done") {
+        const parts = Object.entries(st.summary || {}).map(
+          ([k, v]) => `${k} $${v.blend}（${(v.upside * 100).toFixed(0)}%）`);
+        const blob = await (await fetch(`/api/valuation/${job_id}/result`)).blob();
+        const a = document.createElement("a");
+        a.href = URL.createObjectURL(blob);
+        a.download = `${ticker}_valuation_bundle.zip`;
+        a.click();
+        URL.revokeObjectURL(a.href);
+        setValStatus("ok", `完成！综合目标价：${parts.join("， ")}。已下载 zip（报告+财报+假设留档）`);
+        break;
+      }
+      setValStatus("busy", st.step_label || st.step);
+    }
+  } catch (e) {
+    setValStatus("err", e.message);
+  } finally {
+    $("valBtn").disabled = false;
+  }
+});
+
+function setValStatus(cls, msg) {
+  const el = $("valStatus");
+  el.className = "status " + cls;
+  el.textContent = msg;
 }
 
 refreshRange();

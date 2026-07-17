@@ -4,5 +4,6 @@ __pycache__/
 *.zip
 downloads/
 reports/
+jobs/
 .claude/
 .DS_Store
