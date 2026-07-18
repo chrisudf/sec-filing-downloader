@@ -8,6 +8,7 @@
 """
 import json
 import sys
+import time
 from datetime import date, timedelta
 
 import httpx
@@ -50,10 +51,20 @@ def resolve_cik(ticker: str) -> int:
 
 
 CIK = resolve_cik(TICKER)
-_all = httpx.get(f"https://data.sec.gov/api/xbrl/companyfacts/CIK{CIK:010d}.json",
-                 headers=H, timeout=90).json()["facts"]
+# 缺 us-gaap 时重试一次排除偶发坏响应，再区分两种真实原因给出可诊断的报错
+for _attempt in range(2):
+    _resp = httpx.get(f"https://data.sec.gov/api/xbrl/companyfacts/CIK{CIK:010d}.json",
+                      headers=H, timeout=90).json()
+    _all = _resp["facts"]
+    if "us-gaap" in _all:
+        break
+    time.sleep(2)
 if "us-gaap" not in _all:
-    raise SystemExit(f"{TICKER} 没有 us-gaap 数据（可能按 IFRS 申报——ifrs-full 暂不支持）")
+    raise SystemExit(
+        f"{TICKER}（CIK {CIK}，{_resp.get('entityName', '?')}）没有 us-gaap 数据。两种常见原因：\n"
+        f"- 外国发行人按 IFRS 申报（ifrs-full 暂不支持，如 TSM）\n"
+        f"- ticker 映射指向重组后的新实体（如控股公司架构调整），历史财务留在旧 CIK 下——"
+        f"可在 https://www.sec.gov/cgi-bin/browse-edgar 按公司名搜旧实体确认")
 facts = _all["us-gaap"]
 
 
@@ -151,3 +162,35 @@ q = out["revenue_quarterly"]
 print(f"{TICKER} (CIK {CIK}): 年度 {len(out['revenue_annual'])} 期, 季度 {len(q)} 期, "
       f"最新 {list(q)[-1] if q else '-'}")
 print("TTM:", {k: v.get("value") for k, v in ttm.items()})
+
+# ---- 发行人适配性诊断：当前框架假设"美国本土 + 非金融 + 申报 OperatingIncomeLoss"----
+# 实测 25 只样本中 16 只不满足（全部银行/券商/保险、能源巨头 XOM、REIT 部分、外国发行人）。
+# 数据写完再退出：单独取数仍可拿到部分 facts，流水线则拿到分类后的人话原因。
+problems = []
+_latest = lambda d: max(d) if d else ""
+op_latest = max(_latest(out["op_income_annual"]), _latest(out["op_income_quarterly"]))
+rev_latest = max(_latest(out["revenue_annual"]), _latest(out["revenue_quarterly"]))
+is_financial = "RevenuesNetOfInterestExpense" in facts or "InterestIncomeExpenseNet" in facts
+if not op_latest or (rev_latest and
+        (date.fromisoformat(rev_latest) - date.fromisoformat(op_latest)).days > 400):
+    if is_financial:
+        problems.append("金融类发行人（银行/券商/保险口径）：不申报营业利润，且 CFO 含贷款投放、"
+                        "FCF=CFO-Capex 无意义——需要 financials 模式（P/E + P/TBV×ROTE）")
+    else:
+        problems.append(f"OperatingIncomeLoss 缺失或停报（最新 {op_latest or '无'}，"
+                        "能源/REIT 等行业常见），OPM 情景与 SOTP 无法计算")
+if is_financial and out["revenue_annual"]:
+    rn = pick(["RevenuesNetOfInterestExpense"], "annual")
+    if rn:
+        a_val = sorted(out["revenue_annual"].items())[-1][1]
+        rn_val = sorted(rn.items())[-1][1]
+        if a_val < 0.8 * rn_val:
+            problems.append(f"营收 tag 只覆盖部分收入（{a_val/1e9:.1f}B，总净收入应为 {rn_val/1e9:.1f}B）"
+                            "——静默错误风险，金融类应改用 RevenuesNetOfInterestExpense")
+if len(q) < 4:
+    problems.append("季度营收不足 4 期（外国发行人 6-K 通常无 XBRL 季度数据），TTM 无法计算")
+if problems:
+    print(f"\n{TICKER} 不适配当前估值框架：", file=sys.stderr)
+    for p in problems:
+        print(f"- {p}", file=sys.stderr)
+    sys.exit(1)
