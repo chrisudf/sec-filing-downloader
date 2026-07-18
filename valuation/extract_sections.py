@@ -21,11 +21,17 @@ CTX_BEFORE, CTX_AFTER, MAX_HITS, MAX_TOTAL = 150, 900, 3, 45_000
 
 out = {}
 total = 0
-for path in sys.argv[2:]:
+files = sys.argv[2:]
+# 预算按文件平分（总量不变）：全局先到先得会让排序靠前的文件挤占后面的——
+# 两份财报打不满 45k，但 6-K 多附件场景（最多 1+8 个文件）会让后面的文件拿不到配额，
+# 而判断层的净现金规则恰恰优先要最新 10-Q 的流动性章节
+per_file = MAX_TOTAL // max(1, len(files))
+for path in files:
     with open(path, encoding="utf-8", errors="ignore") as f:
         soup = BeautifulSoup(f.read(), "lxml")
     text = re.sub(r"\s+", " ", soup.get_text(" ", strip=True))
     hits = []
+    file_total = 0
     for kw in KEYWORDS:
         for i, m in enumerate(re.finditer(re.escape(kw), text, re.IGNORECASE)):
             if i >= MAX_HITS:
@@ -36,11 +42,12 @@ for path in sys.argv[2:]:
             if any(snippet[:200] == h["text"][:200] for h in hits):
                 continue
             hits.append({"keyword": kw, "text": snippet})
-            total += len(snippet)
-            if total > MAX_TOTAL:
+            file_total += len(snippet)
+            if file_total > per_file:
                 break
-        if total > MAX_TOTAL:
+        if file_total > per_file:
             break
+    total += file_total
     out[path.replace("\\", "/").rsplit("/", 1)[-1]] = hits
 
 json.dump(out, open(sys.argv[1], "w", encoding="utf-8"), ensure_ascii=False, indent=1)
