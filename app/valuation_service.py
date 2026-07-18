@@ -62,6 +62,14 @@ def _validate_judgment(d: dict) -> None:
             raise ValueError(f"缺少字段 {k}")
     if not 0 <= d["seg1_share"] <= 1:
         raise ValueError("seg1_share 必须在 0-1")
+    # build_report.py 直接取这些 rationale 键，缺了会在花完 LLM 调用后才崩，这里提前拒绝
+    if not isinstance(d["rationale"], dict):
+        raise ValueError("rationale 必须是对象")
+    for k in ("g", "opm", "pe", "m1", "rl", "wacc"):
+        if k not in d["rationale"]:
+            raise ValueError(f"rationale 缺少 {k}")
+    if not isinstance(d["notes"], list) or not d["notes"]:
+        raise ValueError("notes 必须是非空数组")
     for sc in ("bear", "base", "bull"):
         if sc not in d["scenarios"]:
             raise ValueError(f"缺少情景 {sc}")
@@ -71,6 +79,8 @@ def _validate_judgment(d: dict) -> None:
                 raise ValueError(f"{sc} 缺少 {k}")
         if len(s["margins"]) != 10:
             raise ValueError(f"{sc}.margins 必须恰好 10 个值")
+        if not all(isinstance(m, (int, float)) and -1 < m < 1 for m in s["margins"]):
+            raise ValueError(f"{sc}.margins 必须是 (-1,1) 内的数字")
         if not 0.05 <= s["wacc"] <= 0.2:
             raise ValueError(f"{sc}.wacc 越界")
         if s["wacc"] - s["tg"] < 0.045:
@@ -181,6 +191,16 @@ async def _pipeline(job: dict, ticker: str, email: str) -> None:
     job["step"] = "facts"
     await _run([PY, str(VAL / "fetch_facts.py"), ticker, str(wd / "facts.json"), email], wd)
     facts = json.loads((wd / "facts.json").read_text(encoding="utf-8"))
+    # 数据不全时在花 LLM 调用之前失败，给出可读的原因（engine.py 只会抛 TypeError/KeyError）
+    ttm = facts.get("ttm", {})
+    missing = [k for k in ("revenue", "op_income", "net_income", "cfo", "capex")
+               if (ttm.get(k) or {}).get("value") is None]
+    if missing or not facts.get("shares_diluted_quarterly"):
+        raise RuntimeError(
+            f"XBRL 数据不完整（缺 TTM: {', '.join(missing) or '—'}"
+            f"{'；缺稀释股本' if not facts.get('shares_diluted_quarterly') else ''}），"
+            "无法估值。常见原因：外国发行人按 IFRS 申报（fetch_facts 目前只读 us-gaap），"
+            "或该公司季度数据不连续")
 
     job["step"] = "price"
     def _price():
