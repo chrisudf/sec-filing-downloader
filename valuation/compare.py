@@ -85,10 +85,13 @@ for sc in ("bear", "base", "bull"):
 print(f"  现价 {old['meta']['price']} → {new['meta']['price']}"
       f"（{new['meta']['price']/old['meta']['price']-1:+.1%}）")
 
-base_move = abs(new["scenarios"]["base"]["blend"] / old["scenarios"]["base"]["blend"] - 1)
+moves = {sc: abs(new["scenarios"][sc]["blend"] / old["scenarios"][sc]["blend"] - 1)
+         for sc in ("bear", "base", "bull") if old["scenarios"][sc]["blend"]}
+worst_sc = max(moves, key=moves.get) if moves else None
 rev_move = (abs(new["ttm"]["revenue"] / old["ttm"]["revenue"] - 1)
             if old["ttm"].get("revenue") and new["ttm"].get("revenue") else 0)
-if base_move > 0.10 and rev_move < 0.03:
-    print(f"\n⚠️  base 目标价变动 {base_move:.0%} 但 TTM 营收仅变 {rev_move:.1%}："
+if worst_sc and moves[worst_sc] > 0.10 and rev_move < 0.03:
+    print(f"\n⚠️  {worst_sc} 目标价变动 {moves[worst_sc]:.0%} 但 TTM 营收仅变 {rev_move:.1%}："
           "变化主要来自判断层假设而非新财报事实——先核对②里改了什么、rationale 是否有新证据，"
-          "谨防把 LLM 运行间噪声当成基本面信号（NVDA 实验：同输入 5 次采样 base 目标价 CV≈3.5%）")
+          "谨防把 LLM 运行间噪声当成基本面信号"
+          "（NVDA 实验：同输入 5 次采样 base 目标价 CV≈3.5%，bear CV≈12%）")

@@ -16,6 +16,9 @@ KEYWORDS = [
     "effective tax rate", "one-time", "Other income (expense), net",
     "capital expenditures", "Cash, cash equivalents, and marketable securities",
     "Cash and marketable investments", "repurchase", "guidance", "expect revenue",
+    # 基本面恶化信号——价值投资场景下判断层必须看到这些（若存在）
+    "impairment", "restructuring", "going concern", "material weakness",
+    "provision for credit losses", "covenant",
 ]
 CTX_BEFORE, CTX_AFTER, MAX_HITS, MAX_TOTAL = 150, 900, 3, 45_000
 
