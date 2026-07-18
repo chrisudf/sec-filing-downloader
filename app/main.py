@@ -1,7 +1,6 @@
 """FastAPI 入口：两个 API + 静态前端。"""
 from __future__ import annotations
 
-import re
 from datetime import date
 from pathlib import Path
 
@@ -14,12 +13,9 @@ from . import edgar
 
 app = FastAPI(title="SEC Filing Downloader", version="0.1.0")
 
-EMAIL_RE = re.compile(r"^[^@\s]+@[^@\s]+\.[^@\s]+$")
-
 
 class DownloadRequest(BaseModel):
     ticker: str
-    email: str
     report_types: list[str]  # "quarterly" 和/或 "annual"
     mode: str = "latest"  # "latest"=每类取最新 N 份；"range"=按季度区间
     latest_count: int = Field(default=1, ge=1, le=5)
@@ -36,15 +32,13 @@ async def edgar_error_handler(_: Request, exc: edgar.EdgarError) -> JSONResponse
 
 
 @app.get("/api/company/{ticker}")
-async def company(ticker: str, email: str = "anonymous@example.com"):
-    return await edgar.company_info(ticker, email)
+async def company(ticker: str):
+    return await edgar.company_info(ticker, edgar.contact_email())
 
 
 @app.post("/api/download")
 async def download(req: DownloadRequest) -> Response:
-    if not EMAIL_RE.match(req.email.strip()):
-        raise edgar.EdgarError(400, "请输入有效邮箱（SEC 要求提供真实联系方式）")
-
+    email = edgar.contact_email()
     form_groups: list[tuple[str, ...]] = []
     if "quarterly" in req.report_types:
         form_groups.append(edgar.QUARTER_FORMS)
@@ -57,7 +51,7 @@ async def download(req: DownloadRequest) -> Response:
 
     if req.mode == "latest":
         data, count = await edgar.build_zip_latest(
-            ticker, req.email.strip(), form_groups, req.latest_count
+            ticker, email, form_groups, req.latest_count
         )
         filename = f"{ticker}_latest{req.latest_count}.zip"
     else:
@@ -71,7 +65,7 @@ async def download(req: DownloadRequest) -> Response:
             dend = edgar.quarter_end(req.end_year, req.end_quarter or 4)
         if dend < dstart:
             raise edgar.EdgarError(400, "结束时间早于开始时间")
-        data, count = await edgar.build_zip(ticker, req.email.strip(), forms, dstart, dend)
+        data, count = await edgar.build_zip(ticker, email, forms, dstart, dend)
         filename = f"{ticker}_filings_{dstart:%Y%m%d}-{dend:%Y%m%d}.zip"
     return Response(
         content=data,

@@ -14,9 +14,11 @@ from __future__ import annotations
 import asyncio
 import csv
 import io
+import os
 import time
 import zipfile
 from datetime import date, timedelta
+from pathlib import Path
 
 import httpx
 
@@ -43,6 +45,23 @@ class EdgarError(Exception):
         self.status = status
         self.msg = msg
         super().__init__(msg)
+
+
+def contact_email() -> str:
+    """SEC 要求自动化请求的 User-Agent 携带真实联系方式。
+    读取顺序：环境变量 SEC_EMAIL → 项目根目录 .sec_email 文件（gitignore）。"""
+    email = os.environ.get("SEC_EMAIL", "").strip()
+    if not email:
+        f = Path(__file__).resolve().parent.parent / ".sec_email"
+        if f.exists():
+            email = f.read_text(encoding="utf-8").strip()
+    if "@" not in email:
+        raise EdgarError(
+            500,
+            "未配置 SEC 联系邮箱：请设置环境变量 SEC_EMAIL，"
+            "或在项目根目录创建 .sec_email 文件写入邮箱（SEC 合规要求）",
+        )
+    return email
 
 
 def _client(email: str) -> httpx.AsyncClient:

@@ -50,7 +50,6 @@ _running = False
 
 class ValuationRequest(BaseModel):
     ticker: str
-    email: str
 
 
 def _validate_judgment(d: dict) -> None:
@@ -276,12 +275,13 @@ async def create_valuation(req: ValuationRequest):
     ticker = req.ticker.strip().upper()
     if not re.match(r"^[A-Z.\-]{1,10}$", ticker):
         raise edgar.EdgarError(400, "股票代码格式不对")
+    email = edgar.contact_email()
     job_id = uuid.uuid4().hex[:12]
     wd = JOBS / f"{ticker}_{job_id}"
     wd.mkdir(parents=True, exist_ok=True)
     _jobs[job_id] = dict(status="running", step="facts", ticker=ticker, dir=str(wd))
     _running = True
-    asyncio.get_running_loop().create_task(_run_job(job_id, ticker, req.email.strip()))
+    asyncio.get_running_loop().create_task(_run_job(job_id, ticker, email))
     return {"job_id": job_id}
 
 

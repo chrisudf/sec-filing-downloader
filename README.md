@@ -8,7 +8,7 @@
 ## ✨ 功能
 
 - 🔍 **代码查询**：ticker → CIK 自动映射（SEC 全量 1 万+ 上市主体，每日缓存）
-- 🏢 **公司信息卡**：公司名、交易所、官网、投资者网站、最新年报/季报日期
+- 🏢 **公司信息卡**：公司名、交易所、最新年报/季报日期
 - 📥 **批量下载**：任选季报（10-Q / 6-K）、年报（10-K / 20-F），支持中概股等外国发行人
 - 📌 **快捷模式（默认）**：「最新一份 / 最新两份」——每种选中类型各取最新 N 份；估值场景通常这就够了（一份 10-K 自带 3 年利润表对比）
 - 🗓️ **自定义范围**：按「季度 + 年份」起止筛选（按报告期 reportDate 过滤），可勾选"到最新"，用于拉长期历史
@@ -95,13 +95,16 @@ git clone https://github.com/chrisudf/sec-filing-downloader.git
 cd sec-filing-downloader
 python -m venv .venv
 .venv\Scripts\pip install -r requirements.txt
+# SEC 合规：配置联系邮箱（二选一）
+$env:SEC_EMAIL = "you@example.com"          # 环境变量
+"you@example.com" | Out-File .sec_email     # 或项目根目录文件（已 gitignore）
 .venv\Scripts\python -m uvicorn app.main:app --port 8756
 # 打开 http://127.0.0.1:8756
 ```
 
 ## 🔌 API
 
-### `GET /api/company/{ticker}?email=you@example.com`
+### `GET /api/company/{ticker}`
 
 ```json
 {
@@ -109,8 +112,6 @@ python -m venv .venv
   "cik": 1045810,
   "name": "NVIDIA CORP",
   "exchanges": ["Nasdaq"],
-  "website": "https://www.nvidia.com",
-  "investorWebsite": "https://investor.nvidia.com",
   "fiscalYearEnd": "0126",
   "latest": { "10-K": { "filingDate": "...", "reportDate": "..." }, "10-Q": { "..." : "..." } }
 }
@@ -121,7 +122,6 @@ python -m venv .venv
 ```json
 {
   "ticker": "NVDA",
-  "email": "you@example.com",
   "report_types": ["quarterly", "annual"],
   "mode": "latest",
   "latest_count": 1,
@@ -138,7 +138,7 @@ python -m venv .venv
 
 ### `POST /api/valuation` → `{job_id}`
 
-`{"ticker": "NVDA", "email": "you@example.com"}` 提交估值任务（单并发）。
+`{"ticker": "NVDA"}` 提交估值任务（单并发）。
 判断层默认走本机 Claude Code（`claude -p`，需先 `claude /login`；路径可用 `CLAUDE_CLI_PATH` 覆盖，
 整个判断层命令可用 `VALUATION_JUDGMENT_CMD` 替换成任何"stdin 进 prompt、stdout 出 JSON"的程序）。
 
@@ -148,7 +148,8 @@ python -m venv .venv
 
 ## ⚠️ SEC 使用注意
 
-- SEC 要求所有自动化请求的 **User-Agent 包含真实联系方式**（本项目放的是页面里填的邮箱），不填或乱填可能被 403
+- SEC 要求所有自动化请求的 **User-Agent 包含真实联系方式**——通过环境变量 `SEC_EMAIL` 或项目根目录
+  `.sec_email` 文件配置（服务端统一使用，页面无需填写），不配置会返回明确报错，乱填可能被 SEC 403
 - 限速 **10 请求/秒**，本项目单线程顺序下载并留 0.12s 间隔，请勿改成高并发
 - 单次打包上限 60 个文件，防止误选超大范围拖垮下载
 

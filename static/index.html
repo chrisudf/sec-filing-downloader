@@ -141,22 +141,10 @@
       <div><span class="k">公司</span><span id="coName">—</span></div>
     </div>
     <div class="info-box">
-      <span class="icon">🌐</span>
-      <div><span class="k">公司官网</span><span id="coSite">未提供</span></div>
-    </div>
-    <div class="info-box">
-      <span class="icon">📈</span>
-      <div><span class="k">投资者网站</span><span id="coIR">未提供</span></div>
-    </div>
-    <div class="info-box">
       <span class="icon">🗓️</span>
       <div><span class="k">最新财报</span><span id="coLatest">—</span></div>
     </div>
   </div>
-
-  <label class="section" for="email">您的邮箱</label>
-  <input type="email" id="email" placeholder="your@email.com">
-  <div class="hint">SEC 要求请求方提供真实联系邮箱（放在 User-Agent 里），不会发送任何邮件</div>
 
   <label class="section">下载类型（可多选）</label>
   <div class="types">
@@ -222,10 +210,6 @@ $("startY").value = CUR_Y - 3;
 $("endQ").value = CUR_Q;
 $("endY").value = CUR_Y;
 
-// ---- 邮箱记忆 ----
-$("email").value = localStorage.getItem("edgar_email") || "";
-$("email").addEventListener("change", () => localStorage.setItem("edgar_email", $("email").value.trim()));
-
 // ---- 下载类型切换 ----
 for (const card of document.querySelectorAll(".type-card")) {
   card.addEventListener("click", () => { card.classList.toggle("selected"); refreshSummary(); });
@@ -279,8 +263,7 @@ async function lookup() {
   const ticker = $("ticker").value.trim().toUpperCase();
   if (!ticker) { $("companyInfo").style.display = "none"; return; }
   try {
-    const email = $("email").value.trim() || "anonymous@example.com";
-    const res = await fetch(`/api/company/${encodeURIComponent(ticker)}?email=${encodeURIComponent(email)}`);
+    const res = await fetch(`/api/company/${encodeURIComponent(ticker)}`);
     if (!res.ok) {
       const body = await res.json().catch(() => ({}));
       showCompanyError(body.detail || `未找到 ${ticker}`);
@@ -289,10 +272,6 @@ async function lookup() {
     const info = await res.json();
     state.company = info;
     $("coName").textContent = `${info.name}（CIK ${info.cik}${info.exchanges.length ? " · " + info.exchanges.join("/") : ""}）`;
-    $("coSite").innerHTML = info.website
-      ? `<a href="${info.website}" target="_blank">${info.website}</a>` : "未提供";
-    $("coIR").innerHTML = info.investorWebsite
-      ? `<a href="${info.investorWebsite}" target="_blank">${info.investorWebsite}</a>` : "未提供";
     const parts = [];
     for (const [form, d] of Object.entries(info.latest)) {
       parts.push(`${form}：报告期 ${d.reportDate || "?"}（${d.filingDate} 提交）`);
@@ -306,8 +285,6 @@ async function lookup() {
 function showCompanyError(msg) {
   state.company = null;
   $("coName").textContent = msg;
-  $("coSite").textContent = "—";
-  $("coIR").textContent = "—";
   $("coLatest").textContent = "—";
   $("companyInfo").style.display = "block";
 }
@@ -315,17 +292,14 @@ function showCompanyError(msg) {
 // ---- 下载 ----
 $("btn").addEventListener("click", async () => {
   const ticker = $("ticker").value.trim().toUpperCase();
-  const email = $("email").value.trim();
   const status = $("status");
   status.className = "status";
 
   if (!ticker) return setStatus("err", "请输入股票代码");
-  if (!/^[^@\s]+@[^@\s]+\.[^@\s]+$/.test(email)) return setStatus("err", "请输入有效邮箱");
   if (selectedTypes().length === 0) return setStatus("err", "请至少选择一种下载类型");
 
   const payload = {
     ticker,
-    email,
     report_types: selectedTypes(),
     mode: modeState.mode,
     latest_count: modeState.count || 1,
@@ -374,9 +348,7 @@ function setStatus(cls, msg) {
 // ---- 估值报告 ----
 $("valBtn").addEventListener("click", async () => {
   const ticker = $("ticker").value.trim().toUpperCase();
-  const email = $("email").value.trim();
   if (!ticker) return setValStatus("err", "请输入股票代码");
-  if (!/^[^@\s]+@[^@\s]+\.[^@\s]+$/.test(email)) return setValStatus("err", "请输入有效邮箱");
 
   $("valBtn").disabled = true;
   setValStatus("busy", "提交任务…");
@@ -384,7 +356,7 @@ $("valBtn").addEventListener("click", async () => {
     const res = await fetch("/api/valuation", {
       method: "POST",
       headers: { "Content-Type": "application/json" },
-      body: JSON.stringify({ ticker, email }),
+      body: JSON.stringify({ ticker }),
     });
     if (!res.ok) {
       const body = await res.json().catch(() => ({}));
