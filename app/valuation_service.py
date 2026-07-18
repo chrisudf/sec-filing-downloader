@@ -354,9 +354,15 @@ async def _pipeline(job: dict, ticker: str, email: str) -> None:
         caliber += (f"\n口径说明：申报货币 {facts['currency']}，FACTS 已按现汇 "
                     f"{facts.get('fx_to_usd', 1):.5f} 折算美元（恒定汇率）；"
                     "历史增长率不受影响，绝对值以美元理解。")
+    stale_days = 0
     if facts.get("data_latest"):
+        stale_days = (date.today() - date.fromisoformat(facts["data_latest"])).days
         caliber += (f"\nXBRL 结构化数据最新期末为 {facts['data_latest']}；"
                     "若 SECTIONS 财报原文里有更新的季度数字，以原文为准做前瞻判断。")
+        if stale_days > 550 and mode == "standard":
+            caliber += ("数据已严重滞后：你必须按财报原文推出真实 TTM 营收，"
+                        "输出 ttm_revenue_override（$M）与 ttm_revenue_note（出处），"
+                        "并把所有 g 锚定在该基准上——缺失会被拒绝重试。")
     prompt = (f"{base_prompt}\n\n# 服务器注入的元数据（不要输出这些字段）\n"
               f"ticker={ticker} name={info['name']} date={today} price={price:.2f} "
               f"mcap={mcap/1e6:,.0f}M$ shares={shares}M股{caliber}\n\n"
@@ -371,6 +377,13 @@ async def _pipeline(job: dict, ticker: str, email: str) -> None:
         try:
             judgment = _parse_json(raw)
             _validate_judgment(judgment, mode)
+            # 陈旧 XBRL（外国发行人 6-K 无季度框架）下，没有原文重锚的 TTM 会让
+            # 全部情景锚在多年前的营收基准上——硬性要求判断层给 override
+            if (mode == "standard" and stale_days > 550
+                    and not judgment.get("ttm_revenue_override")):
+                raise ValueError(
+                    f"XBRL 数据滞后（最新期末 {facts.get('data_latest')}）："
+                    "必须按财报原文提供 ttm_revenue_override（TTM 营收 $M）与 ttm_revenue_note")
             break
         except (ValueError, json.JSONDecodeError, TypeError, KeyError) as e:
             # TypeError/KeyError：LLM 把数字写成字符串、scenarios 不是对象等畸形输出，

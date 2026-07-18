@@ -76,7 +76,8 @@ TAGS_IFRS = {
     "eps_diluted": ["DilutedEarningsLossPerShare"],
     "cfo": ["CashFlowsFromUsedInOperatingActivities"],
     "capex": ["PurchaseOfPropertyPlantAndEquipmentClassifiedAsInvestingActivities",
-              "PurchaseOfPropertyPlantAndEquipment"],
+              "PurchaseOfPropertyPlantAndEquipment",
+              "PurchaseOfPropertyPlantAndEquipmentIntangibleAssetsOtherThanGoodwillInvestmentPropertyAndOtherNoncurrentAssets"],
     "cash": ["CashAndCashEquivalents"],
     "lt_debt": ["NoncurrentBorrowings", "LongtermBorrowings"],
     "current_debt": ["CurrentBorrowings", "ShorttermBorrowings"],
@@ -104,9 +105,21 @@ for _attempt in range(2):
         break
     time.sleep(2)
 
-if "us-gaap" in _all:
+# 税则按"谁的营收数据更新"选择：SONY/TM 等公司中途从 US GAAP 切换到 IFRS，
+# companyfacts 里两个税则并存，无脑取 us-gaap 会拿到停更多年的旧数据
+def _tax_newest(tax, tags):
+    if tax not in _all:
+        return ""
+    g = _all[tax]
+    return max((f.get("end", "") for t in tags if t in g
+                for u in g[t]["units"].values() for f in u), default="")
+
+
+_gaap_newest = _tax_newest("us-gaap", TAGS_STANDARD["revenue"] + TAGS_FINANCIALS["revenue"])
+_ifrs_newest = _tax_newest("ifrs-full", TAGS_IFRS["revenue"])
+if _gaap_newest and _gaap_newest >= _ifrs_newest:
     facts, TAXONOMY = _all["us-gaap"], "us-gaap"
-elif "ifrs-full" in _all:
+elif _ifrs_newest:
     facts, TAXONOMY = _all["ifrs-full"], "ifrs-full"
 else:
     raise SystemExit(
@@ -276,7 +289,8 @@ problems = []
 warnings = []
 if any((ttm.get(k) or {}).get("value") is None for k in INCOME_ITEMS):
     missing = [k for k in INCOME_ITEMS if (ttm.get(k) or {}).get("value") is None]
-    problems.append(f"核心损益科目无数据：{', '.join(missing)}（保险/REIT 等行业的科目体系暂不支持）")
+    problems.append(f"核心损益科目无数据：{', '.join(missing)}"
+                    "（该发行人未申报对应科目——保险/部分能源与REIT/外国银行的科目体系暂不支持）")
 if MODE == "financials" and not out.get("equity_instant"):
     problems.append("缺股东权益时点数据，P/TBV 法无法计算")
 if out["data_latest"]:
