@@ -58,6 +58,249 @@ def put(ws, cell, value, font=BLACK, fmt=None, fill=None, border=True, wrap=Fals
 S = d["scenarios"]
 R = d["rationale"]
 FWD = d["meta"]["fwd_label"]
+MODE = d.get("mode", "standard")
+
+if MODE == "financials":
+    # ============================================================
+    # 金融股工作簿：摘要 / 情景假设 / PTBV敏感性 / 历史数据 / 出处
+    # 方法 = PE 法 + P/TBV 法（Gordon justified P/TBV 作参考列）
+    # ============================================================
+    FM_X2 = '0.00"x"'
+    M = d["meta"]
+
+    # ---------- 情景假设 ----------
+    ws = wb.active
+    ws.title = "情景假设"
+    ws.column_dimensions["A"].width = 30
+    for col in "BCD":
+        ws.column_dimensions[col].width = 13
+    ws.column_dimensions["E"].width = 66
+    put(ws, "A1", f"{T} 情景假设与关键事实（金融股模式）", TITLE, border=False)
+    put(ws, "A2", "黄色格 = 可调整的假设（改动后全表自动重算）；黑字 = 公式；出处见「出处」表",
+        GREEN, border=False)
+    for cell, v in [("A3", "参数"), ("B3", "悲观 Bear"), ("C3", "合理 Base"),
+                    ("D3", "乐观 Bull"), ("E3", "依据（判断层，可人工复核）")]:
+        put(ws, cell, v, BOLD, fill=HDRFILL)
+    params = [
+        (f"{FWD} 总净收入增速 (vs TTM)", "g", FM_PCT, R["g"]),
+        (f"{FWD} 净利率（净利/总净收入）", "nm", FM_PCT, R["nm"]),
+        (f"目标 PE (对 {FWD} EPS)", "pe", '0"x"', R["pe"]),
+        ("目标 P/TBV", "ptbv", FM_X2, R["ptbv"]),
+        ("股权资本成本 WACC", "wacc", FM_PCT, R["wacc"]),
+        ("永续增长率", "tg", FM_PCT, "长期名义 GDP 附近；用于 justified P/TBV"),
+    ]
+    r = 4
+    for label, key, fmt, note in params:   # 行号：g=4 nm=5 pe=6 ptbv=7 wacc=8 tg=9
+        put(ws, f"A{r}", label, BOLD)
+        for col, sc in zip("BCD", ("bear", "base", "bull")):
+            put(ws, f"{col}{r}", S[sc]["assumptions"][key], BLUE, fmt=fmt, fill=YELLOW)
+        put(ws, f"E{r}", note, GREEN)
+        r += 1
+    put(ws, "A11", "下一财年稀释股本 (M)", BOLD)
+    put(ws, "B11", M["fwd_shares"], BLUE, fmt="#,##0", fill=YELLOW)
+    put(ws, "E11", "三情景共用", GREEN)
+
+    put(ws, "A13", "关键事实（SEC XBRL / 财报原文，勿改）", H2, border=False)
+    facts_rows = [
+        ("TTM 总净收入 ($M)", d["ttm"]["revenue"], "含净利息收入的总净收入口径"),
+        ("TTM 税前利润 ($M)", d["ttm"]["pretax_income"], "银行不申报营业利润，以税前利润代之"),
+        ("TTM 报告净利 ($M)", d["ttm"]["net_income"], "含一次性项目的账面口径"),
+        ("TTM 调整后净利 ($M)", d["adj_ni"], d["adj_note"]),
+        ("有形账面价值 TBV ($M)", M["tbv"],
+         f"股东权益−商誉−无形资产（XBRL {M['tbv_asof']} 时点）"),
+        ("稀释股本 (M)", M["shares"], "最新期加权稀释股数"),
+    ]
+    r = 14   # 行号：rev=14 pretax=15 ni=16 adj=17 tbv=18 shares=19
+    for label, v, note in facts_rows:
+        put(ws, f"A{r}", label, BOLD)
+        put(ws, f"B{r}", v, BLUE, fmt=FM_M if "股本" not in label else "#,##0")
+        put(ws, f"E{r}", note, GREEN, wrap=True)
+        r += 1
+    put(ws, "A20", "TTM 调整后 EPS", BOLD)
+    put(ws, "B20", "=B17/B19", BLACK, fmt=FM_EPS)
+    put(ws, "A21", "每股 TBV", BOLD)
+    put(ws, "B21", "=B18/B19", BLACK, fmt=FM_PX)
+    put(ws, "A22", "TTM ROTE（调整后）", BOLD)
+    put(ws, "B22", "=B17/B18", BLACK, fmt=FM_PCT)
+
+    put(ws, "A24", "情景计算（公式）", H2, border=False)
+    calc_rows = [
+        (f"{FWD} 总净收入 ($M)", "=$B$14*(1+{c}4)", FM_M),
+        (f"{FWD} 净利 ($M)", "={c}25*{c}5", FM_M),
+        (f"{FWD} EPS", "={c}26/$B$11", FM_EPS),
+        ("PE 法目标价", "={c}27*{c}6", FM_PX),
+        (f"{FWD} ROTE", "={c}26/$B$18", FM_PCT),
+        ("justified P/TBV = (ROTE−g)/(WACC−g)", "=({c}29-{c}9)/({c}8-{c}9)", FM_X2),
+        ("P/TBV 法目标价", "=$B$21*{c}7", FM_PX),
+        ("justified 参考价", "=$B$21*{c}30", FM_PX),
+    ]
+    for j, (label, f, fmt) in enumerate(calc_rows):   # 行号 25-32
+        rr = 25 + j
+        put(ws, f"A{rr}", label, BOLD)
+        for col in "BCD":
+            put(ws, f"{col}{rr}", f.format(c=col), BLACK, fmt=fmt)
+
+    # ---------- PTBV 敏感性 ----------
+    ws = wb.create_sheet("PTBV敏感性")
+    ws.column_dimensions["A"].width = 16
+    for col in "BCDEF":
+        ws.column_dimensions[col].width = 12
+    put(ws, "A1", f"{T} justified P/TBV 参考价 = f(WACC, 永续g)（合理情景 ROTE）", TITLE, border=False)
+    put(ws, "A2", "注：由 Python 估值引擎离线计算（每股 TBV × (ROTE−g)/(WACC−g)）；"
+                  "改假设后以「情景假设」公式区为准", GREEN, border=False)
+    sens = d["sensitivity"]
+    gs = sorted({g for row in sens.values() for g in row})
+    put(ws, "A4", "WACC \\ 永续g", BOLD, fill=HDRFILL)
+    for j, g in enumerate(gs):
+        put(ws, f"{'BCDEF'[j]}4", float(g), BOLD, fmt=FM_PCT, fill=HDRFILL)
+    for i, (w, row) in enumerate(sorted(sens.items())):
+        put(ws, f"A{5+i}", float(w), BOLD, fmt=FM_PCT, fill=HDRFILL)
+        for j, g in enumerate(gs):
+            put(ws, f"{'BCDEF'[j]}{5+i}", row[g], BLUE, fmt=FM_PX)
+
+    # ---------- 历史数据 ----------
+    ws = wb.create_sheet("历史数据")
+    ws.column_dimensions["A"].width = 22
+    for i in range(2, 11):
+        ws.column_dimensions[get_column_letter(i)].width = 12
+    put(ws, "A1", f"{T} 历史财务数据（SEC XBRL companyfacts）", TITLE, border=False)
+    ha = d["history"]["annual"]
+    n = len(ha["labels"])
+    put(ws, "A3", "财年(期末) ($M)", BOLD, fill=HDRFILL)
+    for j, lab in enumerate(ha["labels"]):
+        put(ws, f"{get_column_letter(2+j)}3", lab, BOLD, fill=HDRFILL)
+    for r_i, (label, key, fmt) in enumerate(
+            [("总净收入", "rev", FM_M), ("税前利润", "op", FM_M),
+             ("净利润", "ni", FM_M), ("稀释 EPS", "eps", FM_EPS)], start=4):
+        put(ws, f"A{r_i}", label, BOLD)
+        for j in range(n):
+            v = ha[key][j]
+            put(ws, f"{get_column_letter(2+j)}{r_i}", v if v is not None else "-", BLUE, fmt=fmt)
+    put(ws, "A8", "净利率", BOLD)
+    put(ws, "A9", "总净收入 YoY", BOLD)
+    for j in range(n):
+        col = get_column_letter(2 + j)
+        put(ws, f"{col}8", f"={col}6/{col}4", BLACK, fmt=FM_PCT)
+        if j > 0:
+            put(ws, f"{col}9", f"={col}4/{get_column_letter(1+j)}4-1", BLACK, fmt=FM_PCT)
+    hq = d["history"]["quarterly"]
+    nq = len(hq["labels"])
+    put(ws, "A12", "近八个季度 ($M)", BOLD, fill=HDRFILL)
+    for j, lab in enumerate(hq["labels"]):
+        put(ws, f"{get_column_letter(2+j)}12", lab, BOLD, fill=HDRFILL)
+    for r_i, (label, key) in enumerate(
+            [("总净收入", "rev"), ("税前利润", "op"), ("净利润", "ni")], start=13):
+        put(ws, f"A{r_i}", label, BOLD)
+        for j in range(nq):
+            put(ws, f"{get_column_letter(2+j)}{r_i}", hq[key][j], BLUE, fmt=FM_M)
+    put(ws, "A16", "净利率", BOLD)
+    for j in range(nq):
+        col = get_column_letter(2 + j)
+        put(ws, f"{col}16", f"={col}15/{col}13", BLACK, fmt=FM_PCT)
+    put(ws, "A18", "注：Q4 为年度减前三季推算；净利率波动大的季度多为拨备/一次性项目，见「摘要」注记。",
+        GREEN, border=False)
+
+    # ---------- 摘要 ----------
+    ws = wb.create_sheet("摘要", 0)
+    ws.column_dimensions["A"].width = 27
+    for col in "BCDEF":
+        ws.column_dimensions[col].width = 14
+    ws.column_dimensions["H"].width = 72
+    put(ws, "A1", f"{d['name']} / {T} 估值分析（金融股模式）", TITLE, border=False)
+    put(ws, "A2", f"sec-filing-downloader + SEC XBRL · {d['date']} · 分析工具输出，不构成投资建议",
+        GREEN, border=False)
+    caliber = "方法：PE 法 + P/TBV 法（金融股不适用 FCFF DCF）"
+    if M.get("adr_multiple", 1.0) != 1.0:
+        caliber += f"；价格为 ADR（1 ADR = {M['adr_multiple']:g} 普通股，股本已折算）"
+    if M.get("currency", "USD") != "USD":
+        caliber += f"；申报货币 {M['currency']}，已按现汇折算美元"
+    put(ws, "A3", caliber, GREEN, border=False)
+
+    put(ws, "A4", "现价（黄色可改，全表联动）", BOLD)
+    put(ws, "B4", M["price"], BLUE, fmt=FM_PX, fill=YELLOW)
+    put(ws, "A5", "市值 ($M)", BOLD)
+    put(ws, "B5", "=B4*'情景假设'!$B$19", BLACK, fmt=FM_M)
+    put(ws, "A6", "每股 TBV", BOLD)
+    put(ws, "B6", "='情景假设'!$B$21", GREEN, fmt=FM_PX)
+    put(ws, "A7", "TTM ROTE（调整后）", BOLD)
+    put(ws, "B7", "='情景假设'!$B$22", GREEN, fmt=FM_PCT)
+
+    put(ws, "A9", "关键指标", H2, border=False)
+    for cell, v in [("A10", "指标"), ("B10", "数值"), ("H10", "说明")]:
+        put(ws, cell, v, BOLD, fill=HDRFILL)
+    metrics = [
+        ("TTM 调整后 EPS", "='情景假设'!$B$20", FM_EPS, d["adj_note"]),
+        ("调整后 Trailing PE", "=B4/B11", FM_X, "现价 / TTM 调整后 EPS"),
+        (f"{FWD} EPS（合理）", "='情景假设'!$C$27", FM_EPS, "合理情景假设下的下一财年 EPS"),
+        ("Forward PE（合理）", "=B4/B13", FM_X, ""),
+        ("当前 P/TBV", "=B4/'情景假设'!$B$21", FM_X2, "现价 / 每股有形账面价值"),
+        ("justified P/TBV（合理）", "='情景假设'!$C$30", FM_X2,
+         "(前瞻ROTE−永续g)/(WACC−永续g)，Gordon 公式交叉参考"),
+    ]
+    r = 11
+    for label, v, fmt, note in metrics:
+        put(ws, f"A{r}", label, BOLD)
+        put(ws, f"B{r}", v, BLACK, fmt=fmt)
+        put(ws, f"H{r}", note, GREEN, wrap=True)
+        r += 1
+
+    put(ws, "A19", "投资情景（两种方法 + 综合）", H2, border=False)
+    for j, h in enumerate(["投资情景", "PE 法目标价", "P/TBV 法目标价",
+                           "综合目标价", "距现价", "一年后目标价"]):
+        put(ws, f"{get_column_letter(1+j)}20", h, BOLD, fill=HDRFILL)
+    scen_rows = [("🚀 乐观 (Bull)", "D"), ("⚖️ 合理 (Base)", "C"), ("🛡️ 悲观 (Bear)", "B")]
+    r = 21   # 行号：bull=21 base=22 bear=23
+    for label, ac in scen_rows:
+        put(ws, f"A{r}", label, BOLD)
+        put(ws, f"B{r}", f"='情景假设'!${ac}$28", GREEN, fmt=FM_PX)
+        put(ws, f"C{r}", f"='情景假设'!${ac}$31", GREEN, fmt=FM_PX)
+        c = put(ws, f"D{r}", f"=AVERAGE(B{r}:C{r})", BLACK, fmt=FM_PX)
+        c.fill = GREENFILL if r != 23 else REDFILL
+        c.font = Font(name="Arial", bold=True, size=10)
+        put(ws, f"E{r}", f"=D{r}/$B$4-1", BLACK, fmt=FM_PCT)
+        put(ws, f"F{r}", f"=D{r}*(1+'情景假设'!${ac}$8)", BLACK, fmt=FM_PX)
+        r += 1
+    from openpyxl.formatting.rule import CellIsRule  # noqa: E402
+    ws.conditional_formatting.add(
+        "E21:E23", CellIsRule(operator="lessThan", formula=["0"],
+                              font=Font(name="Arial", color="CC0000", bold=True)))
+    ws.conditional_formatting.add(
+        "E21:E23", CellIsRule(operator="greaterThan", formula=["0"],
+                              font=Font(name="Arial", color="008000", bold=True)))
+    put(ws, "A24", "注：一年后目标价 = 综合目标价 × (1+该情景 WACC)；justified P/TBV 为交叉参考不入综合",
+        GREEN, border=False)
+    put(ws, "A26", "判断层注记（均有财报原文出处）：", H2, border=False)
+    for j, note in enumerate(d["notes"]):
+        put(ws, f"A{27+j}", note, GREEN, border=False)
+
+    # ---------- 出处 ----------
+    ws = wb.create_sheet("出处")
+    ws.column_dimensions["A"].width = 30
+    ws.column_dimensions["B"].width = 105
+    put(ws, "A1", "数据出处与调整口径", TITLE, border=False)
+    sources = [
+        ("下载器 manifest", d["manifest"].strip()),
+        ("XBRL companyfacts", f"https://data.sec.gov/api/xbrl/companyfacts/CIK*.json（{T}）"
+                              "—— 总净收入/税前利润/净利/EPS/股东权益/商誉/无形资产/股本"),
+        ("现价", f"yfinance {T} fast_info，{d['date']}：${M['price']}，市值 ${M['mcap']:,}M"),
+        ("TTM 口径", "损益类=最近四个离散季度加总（Q4=年度-前三季）；无季度 XBRL 时退回最新财年"),
+        ("调整后净利", d["adj_note"]),
+        ("TBV 口径", f"股东权益−商誉−无形资产，XBRL {M['tbv_asof']} 时点"),
+        ("估值方法", "PE 法 + P/TBV 法（银行/券商 CFO 含贷款投放，FCFF DCF 不适用）；"
+                    "justified P/TBV=(ROTE−g)/(WACC−g) 仅作交叉参考"),
+        ("免责声明", "本报告为 sec-filing-downloader 项目的数据分析输出，"
+                    "所有估值结果由假设驱动，不构成任何投资建议。"),
+    ]
+    r = 3
+    for label, note in sources:
+        put(ws, f"A{r}", label, BOLD)
+        put(ws, f"B{r}", note, BLACK, wrap=True)
+        r += 1
+
+    os.makedirs(os.path.dirname(OUT) or ".", exist_ok=True)
+    wb.save(OUT)
+    print("saved:", OUT)
+    sys.exit(0)
 
 # ============================================================ 情景假设
 ws = wb.active
