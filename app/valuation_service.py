@@ -163,9 +163,13 @@ def _compact_facts(facts: dict) -> str:
         lines.append(f"  {k}: {facts['revenue_quarterly'][k]/1e6:,.0f} / {op/1e6:,.0f} / "
                      f"{ni/1e6:,.0f} | {ratio}")
     lines.append(f"TTM: { {k: (v.get('value') or 0)/1e6 for k, v in facts['ttm'].items()} }")
-    lines.append(f"资产负债时点(XBRL,可能滞后): 现金 {list(facts['cash_instant'].items())[-1]}, "
-                 f"短期证券 {list(facts['st_securities_instant'].items())[-1] if facts['st_securities_instant'] else '无'}, "
-                 f"长期债务 {list(facts['lt_debt_instant'].items())[-1] if facts['lt_debt_instant'] else '无'}")
+    bs = []
+    for label, key in (("现金", "cash_instant"), ("短期证券", "st_securities_instant"),
+                       ("长期有价证券", "lt_securities_instant"), ("长期债务", "lt_debt_instant"),
+                       ("流动债务", "current_debt_instant"), ("商业票据", "commercial_paper_instant")):
+        d = facts.get(key) or {}
+        bs.append(f"{label} {list(d.items())[-1] if d else '无'}")
+    lines.append("资产负债时点(XBRL,可能滞后,净现金以10-Q原文优先): " + ", ".join(bs))
     return "\n".join(lines)
 
 

@@ -281,11 +281,12 @@ put(ws, "A21", "注：期末日为各自财年/财季末；Q4 为年度减前三
 # ============================================================ 摘要
 ws = wb.create_sheet("摘要", 0)
 ws.column_dimensions["A"].width = 27
-for col in "BDEF":
-    ws.column_dimensions[col].width = 15
-ws.column_dimensions["C"].width = 68
+for col in "BCDEFG":
+    ws.column_dimensions[col].width = 14
+ws.column_dimensions["H"].width = 72
 put(ws, "A1", f"{d['name']} / {T} 估值分析", TITLE, border=False)
 put(ws, "A2", f"sec-filing-downloader + SEC XBRL · {d['date']} · 分析工具输出，不构成投资建议", GREEN, border=False)
+put(ws, "A3", "目标价口径：综合目标价 = 当前公允价值（锚定下一财年盈利与 DCF 现值，≈未来12个月视角）", GREEN, border=False)
 
 put(ws, "A4", "现价（黄色可改，全表联动）", BOLD)
 put(ws, "B4", d["meta"]["price"], BLUE, fmt=FM_PX, fill=YELLOW)
@@ -297,7 +298,7 @@ put(ws, "A7", "稀释股本 (M)", BOLD)
 put(ws, "B7", "='情景假设'!$B$27", GREEN, fmt="#,##0")
 
 put(ws, "A9", "关键指标", H2, border=False)
-for cell, v in [("A10", "指标"), ("B10", "数值"), ("C10", "说明")]:
+for cell, v in [("A10", "指标"), ("B10", "数值"), ("H10", "说明")]:
     put(ws, cell, v, BOLD, fill=HDRFILL)
 metrics = [
     ("TTM 调整后 EPS", "='情景假设'!$B$28", FM_EPS, d["adj_note"]),
@@ -313,11 +314,12 @@ r = 11
 for label, v, fmt, note in metrics:
     put(ws, f"A{r}", label, BOLD)
     put(ws, f"B{r}", v, BLUE if isinstance(v, float) else BLACK, fmt=fmt)
-    put(ws, f"C{r}", note, GREEN, wrap=True)
+    put(ws, f"H{r}", note, GREEN, wrap=True)
     r += 1
 
 put(ws, "A20", "投资情景（三种方法 + 综合）", H2, border=False)
-for j, h in enumerate(["投资情景", "PE 法目标价", "DCF 每股价值", "SOTP 每股价值", "综合目标价", "距现价"]):
+for j, h in enumerate(["投资情景", "PE 法目标价", "DCF 每股价值", "SOTP 每股价值",
+                       "综合目标价", "距现价", "一年后目标价"]):
     put(ws, f"{get_column_letter(1+j)}21", h, BOLD, fill=HDRFILL)
 scen_rows = [
     ("🚀 乐观 (Bull)", "D", "=DCF!$B$48", "=SOTP!$E$12"),
@@ -334,11 +336,22 @@ for label, ac, dcf_f, sotp_f in scen_rows:
     c.fill = GREENFILL if r != 24 else REDFILL
     c.font = Font(name="Arial", bold=True, size=10)
     put(ws, f"F{r}", f"=E{r}/$B$4-1", BLACK, fmt=FM_PCT)
+    put(ws, f"G{r}", f"=E{r}*(1+'情景假设'!${ac}$10)", BLACK, fmt=FM_PX)
     r += 1
+from openpyxl.formatting.rule import CellIsRule  # noqa: E402
 
-put(ws, "A26", "判断层注记（均有财报原文出处）：", H2, border=False)
+ws.conditional_formatting.add(
+    "F22:F24", CellIsRule(operator="lessThan", formula=["0"],
+                          font=Font(name="Arial", color="CC0000", bold=True)))
+ws.conditional_formatting.add(
+    "F22:F24", CellIsRule(operator="greaterThan", formula=["0"],
+                          font=Font(name="Arial", color="008000", bold=True)))
+put(ws, "A25", "注：一年后目标价 = 综合目标价 × (1+该情景 WACC)，即公允价值按要求回报率滚动一年（未扣股息）",
+    GREEN, border=False)
+
+put(ws, "A27", "判断层注记（均有财报原文出处）：", H2, border=False)
 for j, note in enumerate(d["notes"]):
-    put(ws, f"A{27+j}", note, GREEN, border=False)
+    put(ws, f"A{28+j}", note, GREEN, border=False)
 
 # ============================================================ 出处
 ws = wb.create_sheet("出处")

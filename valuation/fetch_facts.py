@@ -28,10 +28,17 @@ TAGS = {
     "cash": ["CashAndCashEquivalentsAtCarryingValue"],
     "st_securities": ["MarketableSecuritiesCurrent", "ShortTermInvestments",
                       "AvailableForSaleSecuritiesDebtSecuritiesCurrent"],
+    # 长期有价证券：AAPL 这类公司大头在这里，漏掉会把净现金算成净负债
+    "lt_securities": ["MarketableSecuritiesNoncurrent",
+                      "AvailableForSaleSecuritiesDebtSecuritiesNoncurrent",
+                      "LongTermInvestments"],
     "lt_debt": ["LongTermDebtNoncurrent", "LongTermDebt"],
+    # 短期债务两个口径分开给（相互不可加总合并），判断层参考后以 10-Q 原文为准
+    "current_debt": ["DebtCurrent", "LongTermDebtCurrent"],
+    "commercial_paper": ["CommercialPaper"],
     "shares_diluted": ["WeightedAverageNumberOfDilutedSharesOutstanding"],
 }
-INSTANT = {"cash", "st_securities", "lt_debt"}
+INSTANT = {"cash", "st_securities", "lt_securities", "lt_debt", "current_debt", "commercial_paper"}
 
 
 def resolve_cik(ticker: str) -> int:

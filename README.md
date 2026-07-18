@@ -15,51 +15,77 @@
 - 🏷️ **自动重命名**：`NVDA_10-K_2025-01-26.htm` 这样的可排序文件名，重名自动去重
 - 📦 **打包下载**：zip 内附 `manifest.csv`（表单、报告期、提交日、原始 URL 溯源）
 - ✅ **SEC 合规**：User-Agent 携带联系邮箱；请求间隔 0.12s（限速 10 req/s 之内）
+- 📊 **一键估值报告**：输入代码 → bear/base/bull 三情景 Excel（PE 法 + 十年 FCFF DCF + SOTP +
+  反向 DCF + 敏感性），**AI 只定假设并注明财报出处，数字全部由确定性引擎计算并经公式复算验证**
 
 ## 🏗️ 架构
 
 ```mermaid
-flowchart LR
+flowchart TB
     subgraph Browser["浏览器（static/index.html 单页）"]
-        UI["输入代码/邮箱/类型/时间范围"]
+        UI["下载 SEC 文件"]
+        VB["生成估值报告（进度轮询）"]
     end
     subgraph Server["FastAPI (app/)"]
-        M["main.py<br/>路由 + 参数校验"]
+        M["main.py 路由"]
         E["edgar.py<br/>EDGAR 客户端"]
+        VS["valuation_service.py<br/>估值任务管道"]
     end
-    subgraph SEC["SEC 官方接口"]
-        T["company_tickers.json<br/>代码→CIK"]
-        S["data.sec.gov/submissions<br/>提交记录"]
-        A["sec.gov/Archives<br/>财报原件"]
+    subgraph VAL["valuation/ 确定性计算层（零 LLM）"]
+        FF["fetch_facts.py<br/>XBRL 取数+TTM"]
+        EX["extract_sections.py<br/>财报关键章节定位"]
+        EN["engine.py<br/>PE/DCF/SOTP/反向DCF"]
+        BR["build_report.py<br/>六表 Excel"]
+        VR["verify_report.py<br/>公式复算验证"]
     end
-    UI -- "GET /api/company/{ticker}" --> M
-    UI -- "POST /api/download" --> M
-    M --> E
-    E --> T
-    E --> S
-    E --> A
-    E -- "重命名 + zip + manifest.csv" --> M
-    M -- "application/zip" --> UI
+    J["判断层 LLM（claude -p 无头 /<br/>VALUATION_JUDGMENT_CMD 可切 API）<br/>只输出假设 JSON+出处"]
+    SEC["SEC 官方接口<br/>tickers / submissions / Archives / XBRL companyfacts"]
+    UI -- "POST /api/download" --> M --> E --> SEC
+    VB -- "POST /api/valuation" --> VS
+    VS --> FF --> SEC
+    VS --> E
+    VS --> EX --> J
+    J -- "假设 config（schema 硬校验）" --> VS
+    VS --> EN --> BR --> VR
+    VS -- "zip：财报+Excel+假设留档" --> VB
 ```
 
-**数据流**：ticker → `company_tickers.json` 查 CIK → `submissions/CIK##########.json` 拿全部提交记录
-（超出最近 1000 条时自动拉分页）→ 按表单类型 + 报告期过滤 → 逐个下载 primaryDocument →
-统一重命名 → 内存中打 zip 返回。全程无数据库、无 API key，只依赖 SEC 公开接口。
+**下载数据流**：ticker → `company_tickers.json` 查 CIK → `submissions/CIK##########.json` 拿提交记录
+（超出最近 1000 条自动拉分页）→ 按表单类型 + 报告期过滤（6-K 智能挑选 + 自动带 EX-99 附件）→
+统一重命名 → zip 返回。全程无数据库，只依赖 SEC 公开接口。
+
+**估值三层分工**（防幻觉的核心设计）：
+1. **数据层**（零 LLM）：XBRL companyfacts 结构化取数——多标签合并、Q4 推导、
+   TTM（损益=四季加总；现金流=年度+YTD差额）
+2. **判断层**（LLM，唯一的 AI 环节）：读代码定位好的财报章节摘录，只输出假设 config
+   （增速/利润率/倍数/WACC/FCF路径 + 每条依据与出处）；服务器注入价格/股本等事实并做
+   schema 硬校验，不合格自动重试——**LLM 永远不碰算术**
+3. **计算层**（确定性 Python）：引擎算出全部数字 → Excel 里所有结果是引用黄色假设格的活公式 →
+   `formulas` 包独立复算 16 个关键单元格与引擎交叉核对，全部一致才交付
 
 ## 📁 目录结构
 
 ```
 sec-filing-downloader/
 ├── app/
-│   ├── main.py        # FastAPI 入口：/api/company、/api/download、静态托管
-│   └── edgar.py       # SEC EDGAR 客户端：查询、过滤、下载、重命名、打包
+│   ├── main.py                # FastAPI 入口：/api/company、/api/download、静态托管
+│   ├── edgar.py               # SEC EDGAR 客户端：查询、过滤、下载、重命名、打包
+│   └── valuation_service.py   # 估值任务管道：/api/valuation 提交/轮询/下载
 ├── static/
-│   └── index.html     # 深色主题单页前端（原生 JS，无构建步骤）
-├── valuation/         # 估值引擎（XBRL 取数 → 三情景 PE/DCF/SOTP → Excel 报告）
-│   └── README.md      # 流水线用法与 config schema
+│   └── index.html             # 深色主题单页前端（原生 JS，无构建步骤）
+├── valuation/                 # 估值确定性计算层 + 判断层提示词
+│   ├── fetch_facts.py         # XBRL companyfacts 取数（多标签合并/Q4推导/TTM）
+│   ├── extract_sections.py    # 财报关键章节定位（分部/税率/capex/流动性）
+│   ├── judgment_prompt.md     # 判断层提示词（假设 schema + 检查清单）
+│   ├── engine.py              # PE 法 / 十年 FCFF DCF / SOTP / 反向 DCF / 敏感性
+│   ├── build_report.py        # 六表 Excel（假设=黄色活格，全表公式联动）
+│   ├── verify_report.py       # formulas 包独立复算，16 项交叉核对
+│   └── README.md              # 流水线用法与 config schema
+├── jobs/                      # 估值任务工作目录（gitignore）
+├── reports/                   # 手动生成的报告（gitignore）
 ├── requirements.txt
 ├── README.md
-└── TODO.md            # 路线图
+└── TODO.md                    # 路线图
 ```
 
 ## 🚀 快速开始（Windows）
@@ -109,6 +135,16 @@ python -m venv .venv
 `mode: "range"` 时按 `start_*` / `end_*` / `to_latest` 的季度区间过滤。
 
 返回 `application/zip`（响应头 `X-File-Count` 为文件数），zip 内含重命名后的财报 + `manifest.csv`。
+
+### `POST /api/valuation` → `{job_id}`
+
+`{"ticker": "NVDA", "email": "you@example.com"}` 提交估值任务（单并发）。
+判断层默认走本机 Claude Code（`claude -p`，需先 `claude /login`；路径可用 `CLAUDE_CLI_PATH` 覆盖，
+整个判断层命令可用 `VALUATION_JUDGMENT_CMD` 替换成任何"stdin 进 prompt、stdout 出 JSON"的程序）。
+
+### `GET /api/valuation/{job_id}` / `GET /api/valuation/{job_id}/result`
+
+轮询进度（九个步骤逐步显示）；完成后下载 zip（财报原件 + manifest + 估值 Excel + 假设留档 config.json）。
 
 ## ⚠️ SEC 使用注意
 
