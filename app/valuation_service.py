@@ -89,6 +89,11 @@ def _validate_judgment(d: dict, mode: str = "standard") -> None:
             raise ValueError(f"rationale 缺少 {k}")
     if not isinstance(d["notes"], list) or not d["notes"]:
         raise ValueError("notes 必须是非空数组")
+    if "ttm_revenue_override" in d:
+        if not isinstance(d["ttm_revenue_override"], (int, float)) or d["ttm_revenue_override"] <= 0:
+            raise ValueError("ttm_revenue_override 必须是正数（$M）")
+        if not d.get("ttm_revenue_note"):
+            raise ValueError("提供 ttm_revenue_override 时必须附 ttm_revenue_note（出处）")
     for sc in ("bear", "base", "bull"):
         if sc not in d["scenarios"]:
             raise ValueError(f"缺少情景 {sc}")

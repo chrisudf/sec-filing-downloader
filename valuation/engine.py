@@ -122,6 +122,14 @@ if MODE == "financials":
 ttm_m = {k: round(ttm[k]["value"] / 1e6) for k in ("revenue", "op_income", "net_income", "cfo", "capex")}
 ttm_m["fcf"] = ttm_m["cfo"] - ttm_m["capex"]
 
+# XBRL 严重滞后时（外国发行人 6-K 无季度 XBRL），判断层可从财报原文提取真实 TTM 营收
+# 作为基准覆盖（与 net_cash/adj_ni 同属"LLM 提取事实并注明出处"，非算术）
+rev0_note = ""
+if cfg.get("ttm_revenue_override"):
+    rev0 = float(cfg["ttm_revenue_override"])
+    ttm_m["revenue"] = round(rev0)   # Excel 公式区与引擎共用同一基准
+    rev0_note = cfg.get("ttm_revenue_note", "判断层按财报原文修正的 TTM 营收基准")
+
 out = dict(
     ticker=cfg["ticker"], name=cfg["name"], date=cfg["date"], mode="standard",
     meta=dict(price=cfg["price"], mcap=cfg["mcap"], shares=cfg["shares"],
@@ -131,7 +139,7 @@ out = dict(
     ttm=ttm_m, adj_ni=cfg["adj_ni"], adj_eps=round(cfg["adj_ni"] / cfg["shares"], 2),
     notes=cfg["notes"], rationale=cfg["rationale"],
     net_cash_note=cfg["net_cash_note"], adj_note=cfg["adj_note"],
-    other_income=cfg["other_income"], scenarios={}, manifest=manifest,
+    other_income=cfg["other_income"], rev0_note=rev0_note, scenarios={}, manifest=manifest,
 )
 
 for name, s in cfg["scenarios"].items():

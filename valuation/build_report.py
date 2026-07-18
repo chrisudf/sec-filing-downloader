@@ -346,7 +346,8 @@ put(ws, "E16", f"主分部={d['meta']['seg1']}；次分部={d['meta']['seg2']}",
 
 put(ws, "A18", "关键事实（SEC XBRL / 财报原文，勿改）", H2, border=False)
 facts_rows = [
-    ("TTM 营收 ($M)", d["ttm"]["revenue"], "XBRL 最近四个离散季度加总"),
+    ("TTM 营收 ($M)", d["ttm"]["revenue"],
+     d.get("rev0_note") or "XBRL 最近四个离散季度加总"),
     ("TTM 营业利润 ($M)", d["ttm"]["op_income"], "同上"),
     ("TTM 报告净利 ($M)", d["ttm"]["net_income"], "含一次性项目的账面口径"),
     ("TTM 调整后净利 ($M)", d["adj_ni"], d["adj_note"]),
@@ -529,7 +530,12 @@ for col in "BCDEFG":
 ws.column_dimensions["H"].width = 72
 put(ws, "A1", f"{d['name']} / {T} 估值分析", TITLE, border=False)
 put(ws, "A2", f"sec-filing-downloader + SEC XBRL · {d['date']} · 分析工具输出，不构成投资建议", GREEN, border=False)
-put(ws, "A3", "目标价口径：综合目标价 = 当前公允价值（锚定下一财年盈利与 DCF 现值，≈未来12个月视角）", GREEN, border=False)
+_caliber = "目标价口径：综合目标价 = 当前公允价值（锚定下一财年盈利与 DCF 现值，≈未来12个月视角）"
+if d["meta"].get("adr_multiple", 1.0) != 1.0:
+    _caliber += f"；价格为 ADR（1 ADR = {d['meta']['adr_multiple']:g} 普通股，股本已折算）"
+if d["meta"].get("currency", "USD") != "USD":
+    _caliber += f"；申报货币 {d['meta']['currency']}，已按现汇折算美元"
+put(ws, "A3", _caliber, GREEN, border=False)
 
 put(ws, "A4", "现价（黄色可改，全表联动）", BOLD)
 put(ws, "B4", d["meta"]["price"], BLUE, fmt=FM_PX, fill=YELLOW)
@@ -616,6 +622,6 @@ for label, note in sources:
     put(ws, f"B{r}", note, BLACK, wrap=True)
     r += 1
 
-os.makedirs(os.path.dirname(OUT), exist_ok=True)
+os.makedirs(os.path.dirname(OUT) or ".", exist_ok=True)
 wb.save(OUT)
 print("saved:", OUT)

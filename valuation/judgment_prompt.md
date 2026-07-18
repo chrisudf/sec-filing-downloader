@@ -27,6 +27,9 @@
 
 {
   "fwd_shares": <下一财年稀释股本估计,百万股,考虑回购趋势>,
+  "ttm_revenue_override": <可选！仅当元数据提示 XBRL 数据滞后时提供：按财报原文（6-K/最新季报）
+    推出的真实 TTM 营收 $M，g 的基准将以此为准>,
+  "ttm_revenue_note": "<提供 override 时必填：推导口径与出处>",
   "net_cash": <净现金 $M>, "net_cash_note": "<口径与出处>",
   "adj_ni": <TTM调整后净利 $M>, "adj_note": "<调整口径>",
   "other_income": <年化其他收益 $M,正常化>,
