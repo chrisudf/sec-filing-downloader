@@ -14,6 +14,7 @@ import os
 import re
 import shutil
 import sys
+import time
 import uuid
 import zipfile
 from datetime import date
@@ -46,6 +47,20 @@ STEP_LABELS = {
 router = APIRouter()
 _jobs: dict[str, dict] = {}
 _running = False
+JOB_TTL = 3 * 24 * 3600  # 任务留 3 天供回看，之后连工作目录一起清
+
+
+def _cleanup_jobs() -> None:
+    """jobs/ 目录与 _jobs 字典此前无限增长；每次新任务前清一次过期任务。
+    按目录 mtime 清理也能带走服务重启后失去登记的孤儿目录。"""
+    cutoff = time.time() - JOB_TTL
+    for jid, job in list(_jobs.items()):
+        if job.get("status") in ("done", "failed") and job.get("created", 0) < cutoff:
+            _jobs.pop(jid, None)
+    if JOBS.exists():
+        for d in JOBS.iterdir():
+            if d.is_dir() and d.stat().st_mtime < cutoff:
+                shutil.rmtree(d, ignore_errors=True)
 
 
 class ValuationRequest(BaseModel):
@@ -306,10 +321,12 @@ async def create_valuation(req: ValuationRequest):
     if not re.match(r"^[A-Z.\-]{1,10}$", ticker):
         raise edgar.EdgarError(400, "股票代码格式不对")
     email = edgar.contact_email()
+    _cleanup_jobs()
     job_id = uuid.uuid4().hex[:12]
     wd = JOBS / f"{ticker}_{job_id}"
     wd.mkdir(parents=True, exist_ok=True)
-    _jobs[job_id] = dict(status="running", step="facts", ticker=ticker, dir=str(wd))
+    _jobs[job_id] = dict(status="running", step="facts", ticker=ticker, dir=str(wd),
+                         created=time.time())
     _running = True
     asyncio.get_running_loop().create_task(_run_job(job_id, ticker, email))
     return {"job_id": job_id}
@@ -320,7 +337,7 @@ async def valuation_status(job_id: str):
     job = _jobs.get(job_id)
     if not job:
         raise edgar.EdgarError(404, "任务不存在")
-    return {k: v for k, v in job.items() if k != "dir"} | {
+    return {k: v for k, v in job.items() if k not in ("dir", "created")} | {
         "step_label": STEP_LABELS.get(job["step"], job["step"])}
 
 
