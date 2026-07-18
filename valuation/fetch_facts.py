@@ -174,7 +174,12 @@ if CURRENCY != "USD":
 _UNIT_PRIORITY = (CURRENCY, f"{CURRENCY}/shares", "shares")
 
 
-def pick(tag_names, kind):
+def pick(tag_names, kind, prefer_max=False):
+    """多候选 tag 合并：同期取 filed 最新值。
+
+    prefer_max（仅营收使用）：同期同 filed 日打平时取较大者——总营收 tag 与其
+    分项 tag（合同收入）可能同时申报（CRCL：Revenues $2,747M vs
+    RevenueFromContractWithCustomer $110M），总营收 ⊇ 分项，取小值是静默错误。"""
     rows = {}
     for tag in tag_names:
         if tag not in facts:
@@ -199,8 +204,11 @@ def pick(tag_names, kind):
                 if kind == "quarterly" and not 80 <= days <= 100:
                     continue
                 key = (start, end) if kind == "ytd" else end
-            if key not in rows or f.get("filed", "") > rows[key]["filed"]:
-                rows[key] = {"val": f["val"] * scale, "filed": f.get("filed", "")}
+            filed = f.get("filed", "")
+            val = f["val"] * scale
+            if (key not in rows or filed > rows[key]["filed"]
+                    or (prefer_max and filed == rows[key]["filed"] and val > rows[key]["val"])):
+                rows[key] = {"val": val, "filed": filed}
     return {k: v["val"] for k, v in sorted(rows.items())}
 
 
@@ -237,8 +245,8 @@ for name in TAGS:
     if name in INSTANT:
         out[name + "_instant"] = pick(TAGS[name], "instant")
         continue
-    annual = pick(TAGS[name], "annual")
-    quarterly = pick(TAGS[name], "quarterly")
+    annual = pick(TAGS[name], "annual", prefer_max=(name == "revenue"))
+    quarterly = pick(TAGS[name], "quarterly", prefer_max=(name == "revenue"))
     if name in DERIVE_Q4:
         for a_end, a_val in annual.items():
             ae = date.fromisoformat(a_end)
