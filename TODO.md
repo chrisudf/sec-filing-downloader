@@ -43,6 +43,16 @@
 - [ ] 相对估值：PE / PS / EV-EBITDA 历史分位 + 同行对比
 - [ ] 报告 PDF 导出
 
+## 🤖 判断层多 LLM 支持
+
+- [ ] 现状：`VALUATION_JUDGMENT_CMD` 钩子已支持任何「stdin 进 prompt、stdout 出 JSON」的命令，
+      `VALUATION_MODEL` 可切 claude 的 sonnet/opus/fable；schema 硬校验 + 自动重试对所有模型通用
+- [ ] 接入 Codex CLI（`codex exec` 无头模式）、Gemini CLI（`gemini -p`）
+- [ ] 接入中国模型：DeepSeek / Qwen / Kimi / GLM 均有 OpenAI 兼容 API，写通用包装脚本
+      `judge_openai_compat.py`（base_url / api_key / model 三个参数），一个脚本通吃
+- [ ] 正式化：`VALUATION_PROVIDER` 配置（claude-cli | openai-compatible | 自定义命令）+
+      前端模型下拉框；不同判断层跑同一公司做质量对比（重点看一次性项目识别能力）
+
 ## 🚀 v0.5 — 部署与产品化
 
 - [ ] 部署到 Railway / Fly.io（参考站即 Railway）
