@@ -120,9 +120,11 @@ def _find_claude() -> str:
 
 async def _claude(prompt: str) -> str:
     # VALUATION_JUDGMENT_CMD 可替换判断层命令（测试注入 / 将来切 Anthropic API）
+    # VALUATION_MODEL 可换判断层模型：sonnet(默认) / opus / fable，或完整模型 ID
     cmd = os.environ.get("VALUATION_JUDGMENT_CMD")
     if not cmd:
-        cmd = f'"{_find_claude()}" -p --model sonnet'
+        model = os.environ.get("VALUATION_MODEL", "sonnet")
+        cmd = f'"{_find_claude()}" -p --model {model}'
     proc = await asyncio.create_subprocess_shell(
         cmd, stdin=asyncio.subprocess.PIPE,
         stdout=asyncio.subprocess.PIPE, stderr=asyncio.subprocess.PIPE,
