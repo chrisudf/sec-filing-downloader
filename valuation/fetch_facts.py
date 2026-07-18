@@ -50,8 +50,11 @@ def resolve_cik(ticker: str) -> int:
 
 
 CIK = resolve_cik(TICKER)
-facts = httpx.get(f"https://data.sec.gov/api/xbrl/companyfacts/CIK{CIK:010d}.json",
-                  headers=H, timeout=90).json()["facts"]["us-gaap"]
+_all = httpx.get(f"https://data.sec.gov/api/xbrl/companyfacts/CIK{CIK:010d}.json",
+                 headers=H, timeout=90).json()["facts"]
+if "us-gaap" not in _all:
+    raise SystemExit(f"{TICKER} 没有 us-gaap 数据（可能按 IFRS 申报——ifrs-full 暂不支持）")
+facts = _all["us-gaap"]
 
 
 def pick(tag_names, kind):
@@ -91,17 +94,23 @@ def ttm_via_ytd(tag_names, annual):
     ytd = pick(tag_names, "ytd")
     cur = [(s, e, v) for (s, e), v in ytd.items()
            if 0 <= (date.fromisoformat(s) - a_end).days <= 8 and e > a_end_s]
+    # 刚发完 10-K、尚无本财年 10-Q 时没有 YTD 可用——此刻 TTM 恰好等于最新年度，
+    # 返回 None 会让整条估值流水线在这 ~3 个月里崩掉
     if not cur:
-        return None
+        return {"value": a_val, "note": f"= FY({a_end_s})（尚无本财年 YTD）"}
     s, e, v_cur = max(cur, key=lambda x: x[1])
     span = (date.fromisoformat(e) - date.fromisoformat(s)).days
     prior = [v for (ps, pe), v in ytd.items()
              if abs((date.fromisoformat(e) - date.fromisoformat(pe)).days - 364) <= 10
              and abs((date.fromisoformat(pe) - date.fromisoformat(ps)).days - span) <= 10]
     if not prior:
-        return None
+        return {"value": a_val, "note": f"= FY({a_end_s})（缺上年同期 YTD，退回最新年度口径）"}
     return {"value": a_val + v_cur - prior[0], "note": f"FY({a_end_s}) + YTD至{e} - 上年同期YTD"}
 
+
+# Q4 = 年度 - 前三季 只对可加总的流量科目成立；加权平均股数/EPS 不可加总
+# （FY 加权股数 ≈ 四季平均而非加总，硬推会得到大负数并被当成最新股数消费）
+DERIVE_Q4 = {"revenue", "op_income", "net_income"}
 
 out = {"ticker": TICKER, "cik": CIK}
 for name in TAGS:
@@ -110,12 +119,13 @@ for name in TAGS:
         continue
     annual = pick(TAGS[name], "annual")
     quarterly = pick(TAGS[name], "quarterly")
-    for a_end, a_val in annual.items():
-        ae = date.fromisoformat(a_end)
-        in_year = {k: v for k, v in quarterly.items()
-                   if timedelta(days=0) < ae - date.fromisoformat(k) < timedelta(days=340)}
-        if len(in_year) == 3 and a_end not in quarterly:
-            quarterly[a_end] = a_val - sum(in_year.values())
+    if name in DERIVE_Q4:
+        for a_end, a_val in annual.items():
+            ae = date.fromisoformat(a_end)
+            in_year = {k: v for k, v in quarterly.items()
+                       if timedelta(days=0) < ae - date.fromisoformat(k) < timedelta(days=340)}
+            if len(in_year) == 3 and a_end not in quarterly:
+                quarterly[a_end] = a_val - sum(in_year.values())
     out[name + "_annual"] = annual
     out[name + "_quarterly"] = dict(sorted(quarterly.items()))
 
