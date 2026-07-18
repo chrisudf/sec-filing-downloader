@@ -88,7 +88,8 @@ async def _ticker_map(client: httpx.AsyncClient) -> dict[str, dict]:
 
 async def _submissions(client: httpx.AsyncClient, ticker: str) -> tuple[int, dict]:
     mapping = await _ticker_map(client)
-    entry = mapping.get(ticker)
+    # SEC 映射表对分级股用连字符（BRK-B / BF-B），用户习惯输入 BRK.B
+    entry = mapping.get(ticker) or mapping.get(ticker.replace(".", "-"))
     if entry is None:
         raise EdgarError(404, f"SEC EDGAR 中未找到股票代码 {ticker}")
     cik = int(entry["cik_str"])
@@ -176,9 +177,11 @@ async def _list_filings(
             rows += _rows(older)
 
     picked = []
+    seen_acc: set[str] = set()
     for row in rows:
-        if row["form"] not in forms:
+        if row["form"] not in forms or row["accessionNumber"] in seen_acc:
             continue
+        seen_acc.add(row["accessionNumber"])
         basis = row["reportDate"] or row["filingDate"]
         try:
             d = date.fromisoformat(basis)
@@ -306,6 +309,9 @@ async def _pack(
                     if ex_resp.status_code != 200:
                         continue
                     ex_name = f"{ticker}_6-K_{period}_ex_{ex.rsplit('/', 1)[-1]}"
+                    if ex_name in used:
+                        # 不同提交的附件可能同名（如 ex99-1.htm），加 accession 后缀而不是丢弃
+                        ex_name = f"{ticker}_6-K_{period}_{acc[-6:]}_ex_{ex.rsplit('/', 1)[-1]}"
                     if ex_name in used:
                         continue
                     used.add(ex_name)
