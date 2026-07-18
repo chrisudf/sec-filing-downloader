@@ -9,9 +9,12 @@ standard 模式：PE 法（下一财年 EPS × 目标 PE）、十年两段式 FC
 financials 模式（银行/券商/fintech）：PE 法 + P/TBV 法（附 Gordon 公式
 justified P/TBV = (ROTE−g)/(WACC−g) 交叉参考）；DCF/SOTP 对金融股不适用。
 """
+import csv
+import io
 import json
 import os
 import sys
+from datetime import date
 
 cfg = json.load(open(sys.argv[1], encoding="utf-8"))
 facts = json.load(open(sys.argv[2], encoding="utf-8"))
@@ -19,6 +22,23 @@ OUT = sys.argv[3]
 manifest = open(sys.argv[4], encoding="utf-8").read() if len(sys.argv) > 4 else ""
 
 MODE = cfg.get("mode", facts.get("mode", "standard"))
+
+
+def _vintage(manifest_text, run_date):
+    """从 manifest 提取"这份估值基于哪个报告期"——价值投资的第一个检查项就是数据新鲜度。"""
+    try:
+        rows = [r for r in csv.DictReader(io.StringIO(manifest_text)) if r.get("reportDate")]
+        if not rows:
+            return {}
+        latest = max(rows, key=lambda r: r["reportDate"])
+        age = (date.fromisoformat(run_date) - date.fromisoformat(latest["reportDate"])).days
+        return {"report_end": latest["reportDate"], "filed": latest["filingDate"],
+                "age_days": age}
+    except Exception:
+        return {}
+
+
+VINTAGE = _vintage(manifest, cfg["date"])
 
 
 def dcf(rev0, g0, gN, margins, wacc, tg, net_cash, shares, years=10):
@@ -60,7 +80,7 @@ if MODE == "financials":
                   fwd_shares=cfg["fwd_shares"], fwd_label=cfg["fwd_label"],
                   tbv=tbv, tbv_ps=round(tbv_ps, 2), tbv_asof=eq_end,
                   adr_multiple=cfg.get("adr_multiple", 1.0),
-                  currency=cfg.get("currency", "USD")),
+                  currency=cfg.get("currency", "USD"), vintage=VINTAGE),
         ttm=ttm_m, adj_ni=cfg["adj_ni"], adj_eps=round(cfg["adj_ni"] / cfg["shares"], 2),
         rote_ttm=round(cfg["adj_ni"] / tbv, 4),
         notes=cfg["notes"], rationale=cfg["rationale"], adj_note=cfg["adj_note"],
@@ -83,6 +103,8 @@ if MODE == "financials":
             justified_ps=round(tbv_ps * justified, 1),
             blend=round(blend, 1), upside=round(blend / cfg["price"] - 1, 4),
             fwd_pe=round(cfg["price"] / eps1, 1),
+            method_spread=round(max(pe_ps, ptbv_ps) / min(pe_ps, ptbv_ps), 2)
+            if min(pe_ps, ptbv_ps) > 0 else None,
         )
 
     # 敏感性：base 口径 justified P/TBV 每股价值 = f(WACC, 永续g)
@@ -135,7 +157,8 @@ out = dict(
     meta=dict(price=cfg["price"], mcap=cfg["mcap"], shares=cfg["shares"],
               fwd_shares=cfg["fwd_shares"], net_cash=cfg["net_cash"], fwd_label=cfg["fwd_label"],
               seg1=cfg["seg1"], seg2=cfg["seg2"], seg1_share=cfg["seg1_share"],
-              adr_multiple=cfg.get("adr_multiple", 1.0), currency=cfg.get("currency", "USD")),
+              adr_multiple=cfg.get("adr_multiple", 1.0), currency=cfg.get("currency", "USD"),
+              vintage=VINTAGE),
     ttm=ttm_m, adj_ni=cfg["adj_ni"], adj_eps=round(cfg["adj_ni"] / cfg["shares"], 2),
     notes=cfg["notes"], rationale=cfg["rationale"],
     net_cash_note=cfg["net_cash_note"], adj_note=cfg["adj_note"],
@@ -160,6 +183,8 @@ for name, s in cfg["scenarios"].items():
         dcf_ps=round(dcf_ps, 1), sotp_ps=round(sotp_ps, 1),
         blend=round(blend, 1), upside=round(blend / cfg["price"] - 1, 4),
         fwd_pe=round(cfg["price"] / eps1, 1),
+        method_spread=round(max(pe_target, dcf_ps, sotp_ps) / min(pe_target, dcf_ps, sotp_ps), 2)
+        if min(pe_target, dcf_ps, sotp_ps) > 0 else None,
     )
 
 # 反向 DCF：base 口径下现价隐含的起始增速

@@ -225,6 +225,19 @@ if MODE == "financials":
     put(ws, "A7", "TTM ROTE（调整后）", BOLD)
     put(ws, "B7", "='情景假设'!$B$22", GREEN, fmt=FM_PCT)
 
+    _vin = M.get("vintage") or {}
+    if _vin:
+        put(ws, "D4", "数据时效（价值投资第一检查项）", BOLD, fill=HDRFILL)
+        put(ws, "E4", "", BOLD, fill=HDRFILL)
+        put(ws, "D5", "最新报告期末", BOLD)
+        put(ws, "E5", _vin["report_end"], BLACK)
+        put(ws, "D6", "提交于", BOLD)
+        put(ws, "E6", _vin["filed"], BLACK)
+        put(ws, "D7", "距报告期(天)", BOLD)
+        _c = put(ws, "E7", _vin["age_days"], BLACK, fmt="#,##0")
+        if _vin["age_days"] > 120:
+            _c.font = Font(name="Arial", color="CC0000", bold=True)
+
     put(ws, "A9", "关键指标", H2, border=False)
     for cell, v in [("A10", "指标"), ("B10", "数值"), ("H10", "说明")]:
         put(ws, cell, v, BOLD, fill=HDRFILL)
@@ -269,6 +282,10 @@ if MODE == "financials":
                               font=Font(name="Arial", color="008000", bold=True)))
     put(ws, "A24", "注：一年后目标价 = 综合目标价 × (1+该情景 WACC)；justified P/TBV 为交叉参考不入综合",
         GREEN, border=False)
+    _spread = " / ".join(f"{sc} {d['scenarios'][sc].get('method_spread') or '—'}x"
+                         for sc in ("bear", "base", "bull"))
+    put(ws, "A25", f"方法离散度（PE法 vs P/TBV法 max/min）：{_spread}——离散大时两法分歧大，"
+                   "综合可信度降低", GREEN, border=False)
     put(ws, "A26", "判断层注记（均有财报原文出处）：", H2, border=False)
     for j, note in enumerate(d["notes"]):
         put(ws, f"A{27+j}", note, GREEN, border=False)
@@ -546,6 +563,19 @@ put(ws, "B6", "='情景假设'!$B$26", GREEN, fmt=FM_M)
 put(ws, "A7", "稀释股本 (M)", BOLD)
 put(ws, "B7", "='情景假设'!$B$27", GREEN, fmt="#,##0")
 
+_vin = d["meta"].get("vintage") or {}
+if _vin:
+    put(ws, "D4", "数据时效（价值投资第一检查项）", BOLD, fill=HDRFILL)
+    put(ws, "E4", "", BOLD, fill=HDRFILL)
+    put(ws, "D5", "最新报告期末", BOLD)
+    put(ws, "E5", _vin["report_end"], BLACK)
+    put(ws, "D6", "提交于", BOLD)
+    put(ws, "E6", _vin["filed"], BLACK)
+    put(ws, "D7", "距报告期(天)", BOLD)
+    _c = put(ws, "E7", _vin["age_days"], BLACK, fmt="#,##0")
+    if _vin["age_days"] > 120:
+        _c.font = Font(name="Arial", color="CC0000", bold=True)
+
 put(ws, "A9", "关键指标", H2, border=False)
 for cell, v in [("A10", "指标"), ("B10", "数值"), ("H10", "说明")]:
     put(ws, cell, v, BOLD, fill=HDRFILL)
@@ -597,6 +627,10 @@ ws.conditional_formatting.add(
                           font=Font(name="Arial", color="008000", bold=True)))
 put(ws, "A25", "注：一年后目标价 = 综合目标价 × (1+该情景 WACC)，即公允价值按要求回报率滚动一年（未扣股息）",
     GREEN, border=False)
+_spread = " / ".join(f"{sc} {d['scenarios'][sc].get('method_spread') or '—'}x"
+                     for sc in ("bear", "base", "bull"))
+put(ws, "A26", f"方法离散度（同情景三法 max/min）：{_spread}——离散大说明三法分歧大，"
+               "综合目标价可信度降低，应分别看三法并参考反向 DCF", GREEN, border=False)
 
 put(ws, "A27", "判断层注记（均有财报原文出处）：", H2, border=False)
 for j, note in enumerate(d["notes"]):
