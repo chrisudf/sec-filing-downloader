@@ -46,6 +46,7 @@ STEP_LABELS = {
 
 router = APIRouter()
 _jobs: dict[str, dict] = {}
+_bg_tasks: set = set()  # 事件循环对 task 只持弱引用，不留强引用可能被 GC 后 _running 永远卡 True
 _running = False
 JOB_TTL = 3 * 24 * 3600  # 任务留 3 天供回看，之后连工作目录一起清
 
@@ -115,7 +116,10 @@ async def _run(cmd: list[str], cwd: Path, timeout: int = 300) -> str:
         proc.kill()
         raise RuntimeError(f"{cmd[1] if len(cmd) > 1 else cmd[0]} 超时（{timeout}s）")
     if proc.returncode != 0:
-        raise RuntimeError((err or out).decode("utf-8", "ignore")[-800:])
+        # verify_report 的 FAIL 明细在 stdout，而 formulas 包把进度条打在 stderr——
+        # 只取 (err or out) 会让用户看到一串进度条而不是哪个单元格不一致
+        detail = b"\n".join(x for x in (err, out) if x).decode("utf-8", "ignore")
+        raise RuntimeError(detail[-800:])
     return out.decode("utf-8", "ignore")
 
 
@@ -267,8 +271,10 @@ async def _pipeline(job: dict, ticker: str, email: str) -> None:
             judgment = _parse_json(raw)
             _validate_judgment(judgment)
             break
-        except (ValueError, json.JSONDecodeError) as e:
-            last_err = str(e)
+        except (ValueError, json.JSONDecodeError, TypeError, KeyError) as e:
+            # TypeError/KeyError：LLM 把数字写成字符串、scenarios 不是对象等畸形输出，
+            # 同样应该带着原因重试而不是让整个任务崩掉
+            last_err = repr(e)
             judgment = None
     if judgment is None:
         raise RuntimeError(f"判断层输出两次校验失败：{last_err}")
@@ -328,7 +334,9 @@ async def create_valuation(req: ValuationRequest):
     _jobs[job_id] = dict(status="running", step="facts", ticker=ticker, dir=str(wd),
                          created=time.time())
     _running = True
-    asyncio.get_running_loop().create_task(_run_job(job_id, ticker, email))
+    task = asyncio.get_running_loop().create_task(_run_job(job_id, ticker, email))
+    _bg_tasks.add(task)
+    task.add_done_callback(_bg_tasks.discard)
     return {"job_id": job_id}
 
 
