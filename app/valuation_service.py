@@ -197,7 +197,7 @@ async def _pipeline(job: dict, ticker: str, email: str) -> None:
     fdir = wd / "filings"
     with zipfile.ZipFile(wd / "filings.zip") as zf:
         zf.extractall(fdir)
-    htms = sorted(str(p) for p in fdir.glob("*.htm"))
+    htms = sorted(str(p) for p in fdir.iterdir() if p.suffix.lower() in (".htm", ".html"))
     manifest = (fdir / "manifest.csv").read_text(encoding="utf-8")
 
     job["step"] = "sections"
