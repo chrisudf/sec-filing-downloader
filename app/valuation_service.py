@@ -106,7 +106,7 @@ async def _run(cmd: list[str], cwd: Path, timeout: int = 300) -> str:
 
 def _find_claude() -> str:
     """服务进程的 PATH 可能不含 npm 全局目录，按候选路径兜底。
-    只能用 .cmd/.exe（子进程 shell 是 cmd.exe，跑不了 .ps1 垫片）。"""
+    Windows 只能用 .cmd/.exe（子进程 shell 是 cmd.exe，跑不了 .ps1 垫片）。"""
     if os.environ.get("CLAUDE_CLI_PATH"):
         return os.environ["CLAUDE_CLI_PATH"]
     exe = shutil.which("claude")
@@ -115,16 +115,25 @@ def _find_claude() -> str:
         exe = cmd_sibling if Path(cmd_sibling).exists() else None
     if exe:
         return exe
-    for cand in (
-        Path(os.environ.get("APPDATA", "")) / "npm" / "claude.cmd",
-        Path.home() / ".local" / "bin" / "claude.exe",
-        Path(os.environ.get("LOCALAPPDATA", "")) / "Programs" / "claude" / "claude.exe",
-    ):
+    if os.name == "nt":
+        candidates = (
+            Path(os.environ.get("APPDATA", "")) / "npm" / "claude.cmd",
+            Path.home() / ".local" / "bin" / "claude.exe",
+            Path(os.environ.get("LOCALAPPDATA", "")) / "Programs" / "claude" / "claude.exe",
+        )
+        hint = "请在终端跑 (Get-Command claude).Source 找到路径"
+    else:
+        candidates = (
+            Path.home() / ".local" / "bin" / "claude",
+            Path("/opt/homebrew/bin/claude"),
+            Path("/usr/local/bin/claude"),
+            Path.home() / ".npm-global" / "bin" / "claude",
+        )
+        hint = "请在终端跑 which claude 找到路径"
+    for cand in candidates:
         if cand.exists():
             return str(cand)
-    raise RuntimeError(
-        "找不到 claude CLI：请在终端跑 (Get-Command claude).Source 找到路径，"
-        "然后设置环境变量 CLAUDE_CLI_PATH 指向 claude.cmd/claude.exe")
+    raise RuntimeError(f"找不到 claude CLI：{hint}，然后设置环境变量 CLAUDE_CLI_PATH 指向它")
 
 
 async def _claude(prompt: str) -> str:
@@ -207,7 +216,8 @@ async def _pipeline(job: dict, ticker: str, email: str) -> None:
         import yfinance as yf
         fi = yf.Ticker(ticker).fast_info
         return float(fi["lastPrice"]), float(fi["marketCap"])
-    price, mcap = await asyncio.to_thread(_price)
+    # yfinance 无超时：Yahoo 卡住会永久占死唯一的任务槽（_running 不复位）
+    price, mcap = await asyncio.wait_for(asyncio.to_thread(_price), timeout=60)
     info = await edgar.company_info(ticker, email)
 
     job["step"] = "filings"
