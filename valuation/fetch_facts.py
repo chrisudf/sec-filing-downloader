@@ -212,24 +212,32 @@ def pick(tag_names, kind, prefer_max=False):
     return {k: v["val"] for k, v in sorted(rows.items())}
 
 
-def ttm_via_ytd(tag_names, annual):
+def ttm_via_ytd(tag_names, annual, fy_end=""):
     if not annual:
         return None
     a_end_s, a_val = sorted(annual.items())[-1]
     a_end = date.fromisoformat(a_end_s)
+    # AMZN 类公司按季直接申报 twelve-months-ended：该期间会通过"年度"过滤器并把
+    # a_end 顶到最新季度末——此时 a_val 本身就是真实 TTM（原版在这里因找不到
+    # "财年后的 YTD"返回 None，导致 engine KeyError: cfo）
+    direct_ttm = bool(fy_end) and a_end_s > fy_end
     ytd = pick(tag_names, "ytd")
     cur = [(s, e, v) for (s, e), v in ytd.items()
            if 0 <= (date.fromisoformat(s) - a_end).days <= 8 and e > a_end_s]
     # 刚发完年报、尚无本财年 YTD 时，TTM 恰好等于最新年度
     if not cur:
-        return {"value": a_val, "note": f"= FY({a_end_s})（尚无本财年 YTD）"}
+        note = (f"公司直接申报的 TTM（twelve months ended {a_end_s}）" if direct_ttm
+                else f"= FY({a_end_s})（尚无本财年 YTD）")
+        return {"value": a_val, "note": note}
     s, e, v_cur = max(cur, key=lambda x: x[1])
     span = (date.fromisoformat(e) - date.fromisoformat(s)).days
     prior = [v for (ps, pe), v in ytd.items()
              if abs((date.fromisoformat(e) - date.fromisoformat(pe)).days - 364) <= 10
              and abs((date.fromisoformat(pe) - date.fromisoformat(ps)).days - span) <= 10]
     if not prior:
-        return {"value": a_val, "note": f"= FY({a_end_s})（缺上年同期 YTD，退回最新年度口径）"}
+        note = (f"公司直接申报的 TTM（twelve months ended {a_end_s}）" if direct_ttm
+                else f"= FY({a_end_s})（缺上年同期 YTD，退回最新年度口径）")
+        return {"value": a_val, "note": note}
     return {"value": a_val + v_cur - prior[0], "note": f"FY({a_end_s}) + YTD至{e} - 上年同期YTD"}
 
 
@@ -278,7 +286,8 @@ for name in INCOME_ITEMS:
 if MODE == "standard":
     for name in ("cfo", "capex"):
         if name in TAGS:
-            r = ttm_via_ytd(TAGS[name], out[name + "_annual"])
+            r = ttm_via_ytd(TAGS[name], out[name + "_annual"],
+                            max(out["revenue_annual"], default=""))
             if r:
                 ttm[name] = r
 out["ttm"] = ttm
