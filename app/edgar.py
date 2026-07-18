@@ -166,9 +166,12 @@ async def _list_filings(
 ) -> list[dict]:
     rows = _rows(subs["filings"]["recent"])
 
-    # recent 只含最近约 1000 条，更早的按需拉分页文件
+    # recent 只含最近约 1000 条，更早的按需拉分页文件。
+    # 分页按 filingDate 索引，而下面按 reportDate 过滤：财报在报告期结束后才提交
+    # （10-K 可晚 2-3 个月），窗口需向后放宽，否则报告期在区间尾部的老财报会被漏掉
+    fetch_until = (dend + timedelta(days=400)).isoformat()
     for extra in subs["filings"].get("files", []):
-        if extra["filingTo"] >= dstart.isoformat() and extra["filingFrom"] <= dend.isoformat():
+        if extra["filingTo"] >= dstart.isoformat() and extra["filingFrom"] <= fetch_until:
             older = await _get_json(client, SUBMISSIONS_URL.format(name=extra["name"]))
             rows += _rows(older)
 
