@@ -68,8 +68,11 @@ class ValuationRequest(BaseModel):
     ticker: str
 
 
-def _validate_judgment(d: dict) -> None:
+def _validate_judgment(d: dict, mode: str = "standard") -> None:
     """LLM 输出的硬校验：结构、边界、margins 长度。不合格直接拒绝重试。"""
+    if mode == "financials":
+        _validate_judgment_financials(d)
+        return
     need = ("fwd_shares", "net_cash", "net_cash_note", "adj_ni", "adj_note",
             "other_income", "fwd_label", "seg1", "seg2", "seg1_share",
             "scenarios", "rationale", "notes")
@@ -103,6 +106,38 @@ def _validate_judgment(d: dict) -> None:
             raise ValueError(f"{sc}: wacc-tg 需 >= 0.045")
         if not 0 < s["opm"] < 0.95 or not 0 <= s["tax"] < 0.5:
             raise ValueError(f"{sc}: opm/tax 越界")
+
+
+def _validate_judgment_financials(d: dict) -> None:
+    """金融股（银行/券商/fintech）判断层校验：P/E + P/TBV 假设集，无 DCF margins。"""
+    need = ("fwd_shares", "adj_ni", "adj_note", "fwd_label", "scenarios", "rationale", "notes")
+    for k in need:
+        if k not in d:
+            raise ValueError(f"缺少字段 {k}")
+    if not isinstance(d["rationale"], dict):
+        raise ValueError("rationale 必须是对象")
+    for k in ("g", "nm", "pe", "ptbv", "wacc"):
+        if k not in d["rationale"]:
+            raise ValueError(f"rationale 缺少 {k}")
+    if not isinstance(d["notes"], list) or not d["notes"]:
+        raise ValueError("notes 必须是非空数组")
+    for sc in ("bear", "base", "bull"):
+        if sc not in d["scenarios"]:
+            raise ValueError(f"缺少情景 {sc}")
+        s = d["scenarios"][sc]
+        for k in ("g", "nm", "pe", "ptbv", "wacc", "tg"):
+            if k not in s or not isinstance(s[k], (int, float)):
+                raise ValueError(f"{sc} 缺少数值字段 {k}")
+        if not -0.5 < s["g"] < 1.5:
+            raise ValueError(f"{sc}.g 越界")
+        if not 0 < s["nm"] < 0.6:
+            raise ValueError(f"{sc}.nm（净利率）需在 (0, 0.6)")
+        if not 1 <= s["pe"] <= 60 or not 0.2 <= s["ptbv"] <= 8:
+            raise ValueError(f"{sc}: pe/ptbv 越界")
+        if not 0.05 <= s["wacc"] <= 0.25:
+            raise ValueError(f"{sc}.wacc 越界")
+        if s["wacc"] - s["tg"] < 0.045:
+            raise ValueError(f"{sc}: wacc-tg 需 >= 0.045")
 
 
 async def _run(cmd: list[str], cwd: Path, timeout: int = 300) -> str:
@@ -186,6 +221,8 @@ def _parse_json(text: str) -> dict:
 
 def _compact_facts(facts: dict) -> str:
     """给判断层的事实摘要：年度尾6 + 季度尾8（含 净利/营业利润 比，暴露一次性项目）。"""
+    if facts.get("mode") == "financials":
+        return _compact_facts_financials(facts)
     lines = []
     ann = list(facts["revenue_annual"].items())[-6:]
     lines.append("年度 (期末: 营收/营业利润/净利/稀释EPS, $M):")
@@ -212,6 +249,40 @@ def _compact_facts(facts: dict) -> str:
     return "\n".join(lines)
 
 
+def _compact_facts_financials(facts: dict) -> str:
+    """金融股事实摘要：总净收入/税前/净利 + 净利率轨迹 + 权益/商誉/无形（TBV 原料）。"""
+    lines = []
+    ann = list(facts["revenue_annual"].items())[-6:]
+    lines.append("年度 (期末: 总净收入/税前利润/净利/稀释EPS, $M | 净利率):")
+    for k, _ in ann:
+        rev = facts["revenue_annual"].get(k, 0)
+        ni = facts["net_income_annual"].get(k, 0)
+        nm = f"{ni/rev:.1%}" if rev else "n/a"
+        lines.append(f"  {k}: {rev/1e6:,.0f} / "
+                     f"{facts['pretax_income_annual'].get(k, 0)/1e6:,.0f} / "
+                     f"{ni/1e6:,.0f} / {facts['eps_diluted_annual'].get(k, '?')} | {nm}")
+    lines.append("季度尾8 (期末: 总净收入/税前/净利 | 净利率——观察拨备/一次性项目导致的波动):")
+    for k in list(facts["revenue_quarterly"])[-8:]:
+        rev = facts["revenue_quarterly"].get(k, 0)
+        ni = facts["net_income_quarterly"].get(k, 0)
+        nm = f"{ni/rev:.1%}" if rev else "n/a"
+        lines.append(f"  {k}: {rev/1e6:,.0f} / "
+                     f"{facts['pretax_income_quarterly'].get(k, 0)/1e6:,.0f} / "
+                     f"{ni/1e6:,.0f} | {nm}")
+    lines.append(f"TTM: { {k: (v.get('value') or 0)/1e6 for k, v in facts['ttm'].items()} }")
+    eq = facts.get("equity_instant") or {}
+    gw = facts.get("goodwill_instant") or {}
+    it = facts.get("intangibles_instant") or {}
+    if eq:
+        k, v = list(eq.items())[-1]
+        gv = list(gw.values())[-1] if gw else 0
+        iv = list(it.values())[-1] if it else 0
+        lines.append(f"资本（{k} 时点, $M）: 股东权益 {v/1e6:,.0f}, 商誉 {gv/1e6:,.0f}, "
+                     f"无形资产 {iv/1e6:,.0f} → 有形账面价值 TBV {(v-gv-iv)/1e6:,.0f}"
+                     "（引擎按此确定性计算，勿输出）")
+    return "\n".join(lines)
+
+
 async def _pipeline(job: dict, ticker: str, email: str) -> None:
     wd = Path(job["dir"])
     today = date.today().isoformat()
@@ -219,16 +290,18 @@ async def _pipeline(job: dict, ticker: str, email: str) -> None:
     job["step"] = "facts"
     await _run([PY, str(VAL / "fetch_facts.py"), ticker, str(wd / "facts.json"), email], wd)
     facts = json.loads((wd / "facts.json").read_text(encoding="utf-8"))
+    mode = facts.get("mode", "standard")
     # 数据不全时在花 LLM 调用之前失败，给出可读的原因（engine.py 只会抛 TypeError/KeyError）
     ttm = facts.get("ttm", {})
-    missing = [k for k in ("revenue", "op_income", "net_income", "cfo", "capex")
-               if (ttm.get(k) or {}).get("value") is None]
-    if missing or not facts.get("shares_diluted_quarterly"):
+    need = (("revenue", "net_income") if mode == "financials"
+            else ("revenue", "op_income", "net_income", "cfo", "capex"))
+    missing = [k for k in need if (ttm.get(k) or {}).get("value") is None]
+    # 外国发行人常只有年度股数（20-F 无季度 XBRL），退回年度序列
+    shares_series = facts.get("shares_diluted_quarterly") or facts.get("shares_diluted_annual")
+    if missing or not shares_series:
         raise RuntimeError(
             f"XBRL 数据不完整（缺 TTM: {', '.join(missing) or '—'}"
-            f"{'；缺稀释股本' if not facts.get('shares_diluted_quarterly') else ''}），"
-            "无法估值。常见原因：外国发行人按 IFRS 申报（fetch_facts 目前只读 us-gaap），"
-            "或该公司季度数据不连续")
+            f"{'；缺稀释股本' if not shares_series else ''}），无法估值")
 
     job["step"] = "price"
     def _price():
@@ -254,11 +327,34 @@ async def _pipeline(job: dict, ticker: str, email: str) -> None:
     sections = (wd / "sections.json").read_text(encoding="utf-8")
 
     job["step"] = "judgment"
-    shares = round(list(facts["shares_diluted_quarterly"].values())[-1] / 1e6)
-    base_prompt = (VAL / "judgment_prompt.md").read_text(encoding="utf-8")
+    shares_ord = list(shares_series.values())[-1] / 1e6  # 普通股口径（百万股）
+    # ADR 换算：yfinance 价格是 ADR，XBRL 股数是普通股。用 mcap÷普通股数反推每普通股
+    # 隐含价，price/隐含价 即 ADR 比例（TSM 1:5）；接近 1 则视为无 ADR（股数口径误差）
+    implied = mcap / (shares_ord * 1e6)
+    adr_multiple = price / implied if implied > 0 else 1.0
+    snapped = round(adr_multiple)
+    if abs(adr_multiple - 1) < 0.08:
+        adr_multiple = 1.0
+    elif snapped >= 2 and abs(adr_multiple / snapped - 1) < 0.08:
+        adr_multiple = float(snapped)
+    shares = round(shares_ord / adr_multiple)  # ADR 等效股数：mcap ≈ price × shares
+    prompt_file = ("judgment_prompt_financials.md" if mode == "financials"
+                   else "judgment_prompt.md")
+    base_prompt = (VAL / prompt_file).read_text(encoding="utf-8")
+    caliber = ""
+    if adr_multiple != 1.0:
+        caliber += (f"\n口径说明：价格为 ADR 价（1 ADR = {adr_multiple:g} 普通股），"
+                    f"shares 已折为 ADR 等效股数；你输出的 fwd_shares 也用 ADR 等效口径。")
+    if facts.get("currency", "USD") != "USD":
+        caliber += (f"\n口径说明：申报货币 {facts['currency']}，FACTS 已按现汇 "
+                    f"{facts.get('fx_to_usd', 1):.5f} 折算美元（恒定汇率）；"
+                    "历史增长率不受影响，绝对值以美元理解。")
+    if facts.get("data_latest"):
+        caliber += (f"\nXBRL 结构化数据最新期末为 {facts['data_latest']}；"
+                    "若 SECTIONS 财报原文里有更新的季度数字，以原文为准做前瞻判断。")
     prompt = (f"{base_prompt}\n\n# 服务器注入的元数据（不要输出这些字段）\n"
               f"ticker={ticker} name={info['name']} date={today} price={price:.2f} "
-              f"mcap={mcap/1e6:,.0f}M$ shares={shares}M股\n\n"
+              f"mcap={mcap/1e6:,.0f}M$ shares={shares}M股{caliber}\n\n"
               f"# FACTS（SEC XBRL）\n{_compact_facts(facts)}\n\n"
               f"# MANIFEST（本次分析的财报文件）\n{manifest}\n\n"
               f"# SECTIONS（财报关键章节摘录 JSON）\n{sections}\n")
@@ -269,7 +365,7 @@ async def _pipeline(job: dict, ticker: str, email: str) -> None:
                             prompt + f"\n\n# 上次输出被拒绝，原因：{last_err}\n请修正后重新只输出 JSON。")
         try:
             judgment = _parse_json(raw)
-            _validate_judgment(judgment)
+            _validate_judgment(judgment, mode)
             break
         except (ValueError, json.JSONDecodeError, TypeError, KeyError) as e:
             # TypeError/KeyError：LLM 把数字写成字符串、scenarios 不是对象等畸形输出，
@@ -280,7 +376,9 @@ async def _pipeline(job: dict, ticker: str, email: str) -> None:
         raise RuntimeError(f"判断层输出两次校验失败：{last_err}")
 
     cfg = dict(judgment, ticker=ticker, name=info["name"], date=today,
-               price=round(price, 2), mcap=round(mcap / 1e6), shares=shares)
+               price=round(price, 2), mcap=round(mcap / 1e6), shares=shares,
+               mode=mode, adr_multiple=adr_multiple,
+               currency=facts.get("currency", "USD"))
     (wd / "config.json").write_text(json.dumps(cfg, ensure_ascii=False, indent=1), encoding="utf-8")
 
     job["step"] = "engine"
