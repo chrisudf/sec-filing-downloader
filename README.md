@@ -88,19 +88,45 @@ sec-filing-downloader/
 └── TODO.md                    # 路线图
 ```
 
-## 🚀 快速开始（Windows）
+## 🚀 快速开始
+
+> **依赖全部声明在 `requirements.txt`**（FastAPI/uvicorn/httpx/openpyxl/formulas/yfinance/beautifulsoup4/lxml），
+> 干净 venv 里 `pip install -r requirements.txt` 一次装齐即可。
+> 每个估值步骤都是独立子进程运行，务必**用 venv 的 Python 启动服务器**（子进程继承它的解释器）——
+> 别用系统/pyenv 的 python 起服务，否则子进程找不到这些包。
+
+### macOS / Linux
+
+```bash
+git clone https://github.com/chrisudf/sec-filing-downloader.git
+cd sec-filing-downloader
+python3 -m venv .venv
+.venv/bin/python -m pip install -r requirements.txt
+# SEC 合规：配置联系邮箱（二选一，推荐用文件——持久且已 gitignore）
+echo "you@example.com" > .sec_email          # 项目根目录文件
+export SEC_EMAIL="you@example.com"           # 或环境变量（仅当前终端会话有效）
+.venv/bin/python -m uvicorn app.main:app --port 8756
+# 打开 http://127.0.0.1:8756
+```
+
+### Windows (PowerShell)
 
 ```powershell
 git clone https://github.com/chrisudf/sec-filing-downloader.git
 cd sec-filing-downloader
 python -m venv .venv
-.venv\Scripts\pip install -r requirements.txt
+.venv\Scripts\python -m pip install -r requirements.txt
 # SEC 合规：配置联系邮箱（二选一）
-$env:SEC_EMAIL = "you@example.com"          # 环境变量
-"you@example.com" | Out-File .sec_email     # 或项目根目录文件（已 gitignore）
+"you@example.com" | Out-File -Encoding ascii .sec_email  # 项目根目录文件（已 gitignore，推荐）
+$env:SEC_EMAIL = "you@example.com"                       # 或环境变量（仅当前会话）
 .venv\Scripts\python -m uvicorn app.main:app --port 8756
 # 打开 http://127.0.0.1:8756
 ```
+
+> **一键估值报告**额外依赖判断层 LLM：默认调用本机 **Claude Code CLI**（`claude -p` 无头模式），
+> 需先装好 `claude` 并 `claude /login` 登录；路径可用 `CLAUDE_CLI_PATH` 覆盖，
+> 整个判断层命令可用 `VALUATION_JUDGMENT_CMD` 换成任意"stdin 收 prompt、stdout 出 JSON"的程序。
+> 只用"下载财报"功能则**不需要** claude CLI。
 
 ## 🔌 API
 
