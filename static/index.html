@@ -374,8 +374,10 @@ $("valBtn").addEventListener("click", async () => {
         st = await stRes.json();
         pollErrors = 0;
       } catch (e) {
-        // 偶发网络抖动容忍 3 次，任务丢失（404）直接终止
-        if (e.message.includes("任务已丢失") || ++pollErrors >= 3) throw e;
+        // 偶发网络抖动容忍 3 次，任务丢失（404）直接终止。
+        // 抛出值可能不是 Error（个别环境 fetch 的拒绝原因），先归一化再读文本
+        const msg = (e && e.message) || String(e);
+        if (msg.includes("任务已丢失") || ++pollErrors >= 3) throw new Error(msg);
         continue;
       }
       if (st.status === "failed") throw new Error(st.error || "任务失败");
@@ -396,7 +398,7 @@ $("valBtn").addEventListener("click", async () => {
       setValStatus("busy", st.step_label || st.step);
     }
   } catch (e) {
-    setValStatus("err", e.message);
+    setValStatus("err", (e && e.message) || String(e));
   } finally {
     $("valBtn").disabled = false;
   }

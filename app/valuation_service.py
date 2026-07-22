@@ -298,9 +298,12 @@ async def _pipeline(job: dict, ticker: str, email: str) -> None:
     mode = facts.get("mode", "standard")
     # 数据不全时在花 LLM 调用之前失败，给出可读的原因（engine.py 只会抛 TypeError/KeyError）
     ttm = facts.get("ttm", {})
-    need = (("revenue", "net_income") if mode == "financials"
+    # need 必须与 engine.py 对应分支实际读取的 ttm 键一致（金融股分支还读 pretax_income）
+    need = (("revenue", "pretax_income", "net_income") if mode == "financials"
             else ("revenue", "op_income", "net_income", "cfo", "capex"))
     missing = [k for k in need if (ttm.get(k) or {}).get("value") is None]
+    if mode == "financials" and not facts.get("equity_instant"):
+        missing.append("股东权益（TBV 原料）")
     # 外国发行人常只有年度股数（20-F 无季度 XBRL），退回年度序列
     shares_series = facts.get("shares_diluted_quarterly") or facts.get("shares_diluted_annual")
     if missing or not shares_series:

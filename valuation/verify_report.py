@@ -23,7 +23,12 @@ def get(sheet, cell):
     try:
         return float(v[0][0])
     except Exception:
-        return v
+        # 标量结果（含 numpy 整型/浮点）不可下标，float() 归一化后再比较；
+        # 真正的非数值（XlError、字符串）保持原样，由 isinstance 判 FAIL
+        try:
+            return float(v)
+        except Exception:
+            return v
 
 
 S = d["scenarios"]
@@ -48,7 +53,7 @@ if d.get("mode") == "financials":
     fails = 0
     for name, (sheet, cell), expected, tol in checks:
         got = get(sheet, cell)
-        ok = isinstance(got, float) and abs(got - expected) <= tol
+        ok = isinstance(got, (int, float)) and abs(float(got) - expected) <= tol
         fails += 0 if ok else 1
         print(f"{'OK ' if ok else 'FAIL'} {T} {name:14s} 表内={got}  引擎={expected}")
     print(f"\n{T} 结果:", "全部一致 ✓" if fails == 0 else f"{fails} 项不一致 ✗")
@@ -75,7 +80,7 @@ checks = [
 fails = 0
 for name, (sheet, cell), expected, tol in checks:
     got = get(sheet, cell)
-    ok = isinstance(got, float) and abs(got - expected) <= tol
+    ok = isinstance(got, (int, float)) and abs(float(got) - expected) <= tol
     fails += 0 if ok else 1
     print(f"{'OK ' if ok else 'FAIL'} {T} {name:12s} 表内={got}  引擎={expected}")
 print(f"\n{T} 结果:", "全部一致 ✓" if fails == 0 else f"{fails} 项不一致 ✗")

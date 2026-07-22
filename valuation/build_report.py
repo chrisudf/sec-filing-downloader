@@ -149,11 +149,12 @@ if MODE == "financials":
     put(ws, "A2", "注：由 Python 估值引擎离线计算（每股 TBV × (ROTE−g)/(WACC−g)）；"
                   "改假设后以「情景假设」公式区为准", GREEN, border=False)
     sens = d["sensitivity"]
-    gs = sorted({g for row in sens.values() for g in row})
+    # JSON 键是字符串，负 g（低永续增长情景）下字典序 ≠ 数值序，必须按 float 排
+    gs = sorted({g for row in sens.values() for g in row}, key=float)
     put(ws, "A4", "WACC \\ 永续g", BOLD, fill=HDRFILL)
     for j, g in enumerate(gs):
         put(ws, f"{'BCDEF'[j]}4", float(g), BOLD, fmt=FM_PCT, fill=HDRFILL)
-    for i, (w, row) in enumerate(sorted(sens.items())):
+    for i, (w, row) in enumerate(sorted(sens.items(), key=lambda kv: float(kv[0]))):
         put(ws, f"A{5+i}", float(w), BOLD, fmt=FM_PCT, fill=HDRFILL)
         for j, g in enumerate(gs):
             put(ws, f"{'BCDEF'[j]}{5+i}", row[g], BLUE, fmt=FM_PX)
@@ -452,11 +453,12 @@ for name, acol, key, r0 in SCEN:
 put(ws, "A52", "敏感性分析（合理情景）：每股价值 = f(WACC, 永续增长率)", H2, border=False)
 put(ws, "A53", "注：由 Python 估值引擎离线计算（同一公式）；改假设后以上方公式区为准", GREEN, border=False)
 sens = d["sensitivity"]
-gs = sorted({g for row in sens.values() for g in row})
+# 同金融股分支：JSON 字符串键按 float 排，防负 g 时字典序错位
+gs = sorted({g for row in sens.values() for g in row}, key=float)
 put(ws, "A54", "WACC \\ 永续g", BOLD, fill=HDRFILL)
 for j, g in enumerate(gs):
     put(ws, f"{'BCDEF'[j]}54", float(g), BOLD, fmt=FM_PCT, fill=HDRFILL)
-for i, (w, row) in enumerate(sorted(sens.items())):
+for i, (w, row) in enumerate(sorted(sens.items(), key=lambda kv: float(kv[0]))):
     put(ws, f"A{55+i}", float(w), BOLD, fmt=FM_PCT, fill=HDRFILL)
     for j, g in enumerate(gs):
         put(ws, f"{'BCDEF'[j]}{55+i}", row[g], BLUE, fmt=FM_PX)

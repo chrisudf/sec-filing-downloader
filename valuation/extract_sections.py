@@ -35,6 +35,7 @@ for path in files:
     text = re.sub(r"\s+", " ", soup.get_text(" ", strip=True))
     hits = []
     file_total = 0
+    full = False
     for kw in KEYWORDS:
         for i, m in enumerate(re.finditer(re.escape(kw), text, re.IGNORECASE)):
             if i >= MAX_HITS:
@@ -44,11 +45,14 @@ for path in files:
             snippet = text[s:e]
             if any(snippet[:200] == h["text"][:200] for h in hits):
                 continue
+            # 配额在追加前检查：追加后再查会让每个文件超额最多一个 snippet，
+            # 多附件场景下累计突破 MAX_TOTAL
+            if file_total + len(snippet) > per_file:
+                full = True
+                break
             hits.append({"keyword": kw, "text": snippet})
             file_total += len(snippet)
-            if file_total > per_file:
-                break
-        if file_total > per_file:
+        if full:
             break
     total += file_total
     out[path.replace("\\", "/").rsplit("/", 1)[-1]] = hits
