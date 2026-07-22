@@ -68,8 +68,26 @@ class ValuationRequest(BaseModel):
     ticker: str
 
 
-def _validate_judgment(d: dict, mode: str = "standard") -> None:
-    """LLM 输出的硬校验：结构、边界、margins 长度。不合格直接拒绝重试。"""
+def _scenario_eps(d: dict, s: dict, rev0: float) -> float:
+    """与 engine.py 同式的情景 FY(下一财年) EPS——一致性规则用，不做估值。"""
+    ni = (rev0 * (1 + s["g"]) * s["opm"] + d["other_income"]) * (1 - s["tax"])
+    return ni / d["fwd_shares"]
+
+
+def _validate_judgment(d: dict, mode: str = "standard",
+                       rev0: float | None = None,
+                       fcf_margin: float | None = None) -> None:
+    """LLM 输出的硬校验：结构、边界、margins 长度。不合格直接拒绝重试。
+
+    v2（semantics_version=2, 2026-07-22）新增：
+    - 单参数边界（pe/m1/m2/g/g0/gN/margins）——standard 模式此前为零检查，
+      是实测跑间漂移（NVDA bear 综合 $29-$77）的直接放大器
+    - 跨情景排序（g/opm/pe/m1 须 bear<=base<=bull）
+    - 反双重计数：情景盈利已收缩(扩张)时禁止再叠加谷底(峰值)倍数——
+      市场对可修复的周期谷底给看穿周期的倍数；判断为永久受损时可设
+      permanent_impairment=true + impairment_note（原文出处）豁免
+    - margins 谷底下限 0.4×当前 TTM FCF 利润率（同一豁免）
+    rev0/fcf_margin 由调用方从 facts 传入；为 None 时跳过对应规则。"""
     if mode == "financials":
         _validate_judgment_financials(d)
         return
@@ -103,14 +121,62 @@ def _validate_judgment(d: dict, mode: str = "standard") -> None:
                 raise ValueError(f"{sc} 缺少 {k}")
         if len(s["margins"]) != 10:
             raise ValueError(f"{sc}.margins 必须恰好 10 个值")
-        if not all(isinstance(m, (int, float)) and -1 < m < 1 for m in s["margins"]):
-            raise ValueError(f"{sc}.margins 必须是 (-1,1) 内的数字")
+        if not all(isinstance(m, (int, float)) and -0.3 < m < 0.65 for m in s["margins"]):
+            raise ValueError(f"{sc}.margins 必须是 (-0.3, 0.65) 内的数字（FCF 利润率）")
         if not 0.05 <= s["wacc"] <= 0.2:
             raise ValueError(f"{sc}.wacc 越界")
         if s["wacc"] - s["tg"] < 0.045:
             raise ValueError(f"{sc}: wacc-tg 需 >= 0.045")
         if not 0 < s["opm"] < 0.95 or not 0 <= s["tax"] < 0.5:
             raise ValueError(f"{sc}: opm/tax 越界")
+        _imp = (s.get("permanent_impairment") is True
+                and str(s.get("impairment_note") or "").strip() != "")
+        if not (4 if _imp else 8) <= s["pe"] <= 60:
+            raise ValueError(f"{sc}.pe 需在 [8, 60]——低于 8x 的『目标 PE』属于崩盘/永久受损"
+                             "定价，须设 permanent_impairment=true + impairment_note（下限放宽至 4）")
+        if not 0 <= s["m1"] <= 60 or not 0 <= s["m2"] <= 60:
+            raise ValueError(f"{sc}.m1/m2 需在 [0, 60]")
+        for k in ("g", "g0"):
+            if not -0.35 < s[k] < 0.9:
+                raise ValueError(f"{sc}.{k} 需在 (-0.35, 0.9)")
+        if not 0 < s["gN"] <= 0.12:
+            raise ValueError(f"{sc}.gN 需在 (0, 0.12]")
+
+    # ---- v2 跨情景一致性（拦『所有参数同取极端』与周期双重计数）----
+    sb, ss, su = d["scenarios"]["bear"], d["scenarios"]["base"], d["scenarios"]["bull"]
+    for k in ("g", "opm", "pe", "m1"):
+        if not sb[k] <= ss[k] <= su[k]:
+            raise ValueError(f"情景排序：{k} 必须 bear <= base <= bull")
+
+    def _exempt(s):
+        return (s.get("permanent_impairment") is True
+                and str(s.get("impairment_note") or "").strip() != "")
+
+    if rev0:
+        eps = {n: _scenario_eps(d, d["scenarios"][n], rev0)
+               for n in ("bear", "base", "bull")}
+        if eps["base"] > 0:
+            r_bear, r_bull = eps["bear"] / eps["base"], eps["bull"] / eps["base"]
+            for key in ("pe", "m1"):
+                if (r_bear < 0.8 and sb[key] < 0.6 * ss[key] and not _exempt(sb)):
+                    raise ValueError(
+                        f"bear 双重计数：情景盈利已较 base 收缩至 {r_bear:.0%}，{key} 又 "
+                        f"< 0.6×base——谷底盈利×谷底倍数会把周期惩罚计两次。请上调 bear.{key}"
+                        "（市场对可修复的谷底给看穿周期的倍数），或判断为永久受损时设 "
+                        "permanent_impairment=true 并在 impairment_note 给原文出处")
+                if r_bull > 1.25 and su[key] > 1.4 * ss[key]:
+                    raise ValueError(
+                        f"bull 双重计数：情景盈利已较 base 扩张至 {r_bull:.0%}，{key} 又 "
+                        f"> 1.4×base——景气顶点市场收敛倍数而非扩张。请下调 bull.{key}")
+    if fcf_margin and fcf_margin > 0.02:
+        floor = 0.4 * fcf_margin
+        for n in ("bear", "base", "bull"):
+            s = d["scenarios"][n]
+            if min(s["margins"]) < floor and not _exempt(s):
+                raise ValueError(
+                    f"{n}.margins 谷底 {min(s['margins']):.0%} < 0.4×当前 TTM FCF 利润率"
+                    f"({fcf_margin:.0%})——比腰斩更深的常态化路径属于永久受损假设，"
+                    "请抬高谷底或设 permanent_impairment=true + impairment_note")
 
 
 def _validate_judgment_financials(d: dict) -> None:
@@ -392,14 +458,29 @@ async def _pipeline(job: dict, ticker: str, email: str) -> None:
               f"# FACTS（SEC XBRL）\n{_compact_facts(facts)}\n\n"
               f"# MANIFEST（本次分析的财报文件）\n{manifest}\n\n"
               f"# SECTIONS（财报关键章节摘录 JSON）\n{sections}{prev_section}\n")
+    # v2 一致性规则的事实输入：情景 EPS 用的营收基准与 TTM FCF 利润率
+    rev0_m = ttm["revenue"]["value"] / 1e6
+    fcfm = None
+    if mode == "standard":
+        fcfm = (ttm["cfo"]["value"] - ttm["capex"]["value"]) / ttm["revenue"]["value"]
     judgment = None
     last_err = ""
+    last_raw = ""
     for attempt in range(2):
-        raw = await _claude(prompt if not last_err else
-                            prompt + f"\n\n# 上次输出被拒绝，原因：{last_err}\n请修正后重新只输出 JSON。")
+        # v2：retry 必须带上次完整输出——只回传错误文本会让每轮变成独立重采样，
+        # 模型看不到自己上次给了什么就谈不上"最小修改"，漂移会从 retry 通道漏回来
+        if not last_err:
+            p = prompt
+        else:
+            p = (prompt + "\n\n# 你上一次的输出（在此基础上最小修改，其余字段保持原值）\n"
+                 + last_raw[:9000]
+                 + f"\n\n# 上次输出被拒绝，原因\n{last_err}\n只修正违规字段后重新输出完整 JSON。")
+        raw = await _claude(p)
         try:
             judgment = _parse_json(raw)
-            _validate_judgment(judgment, mode)
+            _validate_judgment(judgment, mode,
+                               rev0=float(judgment.get("ttm_revenue_override") or rev0_m),
+                               fcf_margin=fcfm)
             # 陈旧 XBRL（外国发行人 6-K 无季度框架）下，没有原文重锚的 TTM 会让
             # 全部情景锚在多年前的营收基准上——硬性要求判断层给 override
             if (mode == "standard" and stale_days > 550
@@ -412,14 +493,17 @@ async def _pipeline(job: dict, ticker: str, email: str) -> None:
             # TypeError/KeyError：LLM 把数字写成字符串、scenarios 不是对象等畸形输出，
             # 同样应该带着原因重试而不是让整个任务崩掉
             last_err = repr(e)
+            last_raw = raw
             judgment = None
     if judgment is None:
         raise RuntimeError(f"判断层输出两次校验失败：{last_err}")
 
+    # semantics_version=2（2026-07-22）：v2 一致性规则/诊断红旗/SOTP 降级口径。
+    # 连续性注入与 compare.py 依赖此字段区分新旧语义的倍数假设（不可跨版本直接复用）
     cfg = dict(judgment, ticker=ticker, name=info["name"], date=today,
                price=round(price, 2), mcap=round(mcap / 1e6), shares=shares,
                mode=mode, adr_multiple=adr_multiple,
-               currency=facts.get("currency", "USD"))
+               currency=facts.get("currency", "USD"), semantics_version=2)
     (wd / "config.json").write_text(json.dumps(cfg, ensure_ascii=False, indent=1), encoding="utf-8")
 
     job["step"] = "engine"
