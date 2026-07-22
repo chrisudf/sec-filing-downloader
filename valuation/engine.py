@@ -42,6 +42,9 @@ VINTAGE = _vintage(manifest, cfg["date"])
 
 
 def dcf(rev0, g0, gN, margins, wacc, tg, net_cash, shares, years=10):
+    """返回 (每股, 股权价值, diagnostics)。diagnostics 供 v2 合理性检查与报告红旗区
+    使用——第 N 年营收倍数 / 终值占比在此前是函数局部变量，服务层若自行重算会造出
+    第三份 DCF 实现（engine + Excel 公式区之外），口径必然漂移，因此由引擎唯一输出。"""
     growths = [g0 + (gN - g0) * i / (years - 1) for i in range(years)]
     rev, pv, fcf_last = rev0, 0.0, 0.0
     for i in range(years):
@@ -50,8 +53,12 @@ def dcf(rev0, g0, gN, margins, wacc, tg, net_cash, shares, years=10):
         pv += fcf / (1 + wacc) ** (i + 1)
         fcf_last = fcf
     tv = fcf_last * (1 + tg) / (wacc - tg)
-    equity = pv + tv / (1 + wacc) ** years + net_cash
-    return equity / shares, equity
+    tv_pv = tv / (1 + wacc) ** years
+    equity = pv + tv_pv + net_cash
+    diag = dict(yrN_rev_multiple=round(rev / rev0, 2) if rev0 else None,
+                tv_pv_share=round(tv_pv / (pv + tv_pv), 4) if pv + tv_pv > 0 else None,
+                pv_explicit=round(pv), tv_pv=round(tv_pv))
+    return equity / shares, equity, diag
 
 
 def tail(dic, n):
@@ -152,11 +159,19 @@ if cfg.get("ttm_revenue_override"):
     ttm_m["revenue"] = round(rev0)   # Excel 公式区与引擎共用同一基准
     rev0_note = cfg.get("ttm_revenue_note", "判断层按财报原文修正的 TTM 营收基准")
 
+# v2（semantics_version=2, 2026-07-22）：主分部利润占比 >= 0.85 时 SOTP 与 PE 法
+# 实为同一笔盈利乘两次倍数（无分部折价可解锁），退化为参考项不入综合——
+# 综合 = PE 法与 DCF 各 50%。占比 < 0.85 时维持三法均值。
+SOTP_SEG1_CAP = 0.85
+sotp_in_blend = cfg["seg1_share"] < SOTP_SEG1_CAP
+
 out = dict(
     ticker=cfg["ticker"], name=cfg["name"], date=cfg["date"], mode="standard",
+    semantics_version=cfg.get("semantics_version", 1),
     meta=dict(price=cfg["price"], mcap=cfg["mcap"], shares=cfg["shares"],
               fwd_shares=cfg["fwd_shares"], net_cash=cfg["net_cash"], fwd_label=cfg["fwd_label"],
               seg1=cfg["seg1"], seg2=cfg["seg2"], seg1_share=cfg["seg1_share"],
+              sotp_in_blend=sotp_in_blend,
               adr_multiple=cfg.get("adr_multiple", 1.0), currency=cfg.get("currency", "USD"),
               vintage=VINTAGE),
     ttm=ttm_m, adj_ni=cfg["adj_ni"], adj_eps=round(cfg["adj_ni"] / cfg["shares"], 2),
@@ -171,29 +186,62 @@ for name, s in cfg["scenarios"].items():
     ni1 = (op1 + cfg["other_income"]) * (1 - s["tax"])
     eps1 = ni1 / cfg["fwd_shares"]
     pe_target = eps1 * s["pe"]
-    dcf_ps, _ = dcf(rev0, s["g0"], s["gN"], s["margins"], s["wacc"], s["tg"],
-                    cfg["net_cash"], cfg["shares"])
+    dcf_ps, dcf_eq, ddiag = dcf(rev0, s["g0"], s["gN"], s["margins"], s["wacc"], s["tg"],
+                                cfg["net_cash"], cfg["shares"])
     sotp_eq = (op1 * cfg["seg1_share"] * s["m1"]
                + op1 * (1 - cfg["seg1_share"]) * s["m2"] + cfg["net_cash"])
     sotp_ps = sotp_eq / cfg["shares"]
-    blend = (pe_target + dcf_ps + sotp_ps) / 3
+    methods = [pe_target, dcf_ps] + ([sotp_ps] if sotp_in_blend else [])
+    blend = sum(methods) / len(methods)
+    spread = (round(max(methods) / min(methods), 2) if min(methods) > 0 else None)
+
+    # ---- v2 经济合理性诊断（red=假设可修复，服务层可据此打回判断层一次；
+    #      yellow=呈现层警示。全部随报告红旗区展示，不静默）----
+    warnings = []
+    if ddiag["yrN_rev_multiple"] and ddiag["yrN_rev_multiple"] > 8:
+        warnings.append(["red", f"DCF 第10年营收为 TTM 的 {ddiag['yrN_rev_multiple']:.1f} 倍"
+                                "（>8x，隐含 10 年 CAGR >23%）——增长路径过于激进"])
+    if ddiag["tv_pv_share"] and ddiag["tv_pv_share"] > 0.75:
+        warnings.append(["red", f"终值折现占 EV {ddiag['tv_pv_share']:.0%}（>75%）——"
+                                "估值几乎全押在永续段，对 wacc-tg 极端敏感"])
+    if ttm_m["fcf"] > 0.02 * ttm_m["revenue"]:
+        p_fcf = dcf_eq / ttm_m["fcf"]
+        ddiag["dcf_equity_over_ttm_fcf"] = round(p_fcf, 1)
+        if not 5 <= p_fcf <= 90:
+            warnings.append(["red", f"DCF 隐含股权价值为 TTM FCF 的 {p_fcf:.1f} 倍"
+                                    "（界外 [5,90]）——路径假设与当前现金流量级脱节"])
+    if cfg["adj_ni"] > 0:
+        p_ni = blend * cfg["shares"] / cfg["adj_ni"]
+        ddiag["blend_p_adjni"] = round(p_ni, 1)
+        if not 6 <= p_ni <= 60:
+            warnings.append(["yellow", f"综合目标价隐含 P/调整后净利 {p_ni:.1f}x（界外 [6,60]）"])
+    if spread and spread > 2:
+        warnings.append(["yellow", f"方法离散度 {spread}x（>2x）——各法分歧大，综合可信度降低"])
+
     out["scenarios"][name] = dict(
         assumptions=s, rev1=round(rev1), op1=round(op1), ni1=round(ni1),
         eps1=round(eps1, 2), pe_target=round(pe_target, 1),
         dcf_ps=round(dcf_ps, 1), sotp_ps=round(sotp_ps, 1),
         blend=round(blend, 1), upside=round(blend / cfg["price"] - 1, 4),
         fwd_pe=round(cfg["price"] / eps1, 1),
-        method_spread=round(max(pe_target, dcf_ps, sotp_ps) / min(pe_target, dcf_ps, sotp_ps), 2)
-        if min(pe_target, dcf_ps, sotp_ps) > 0 else None,
+        method_spread=spread, diagnostics=ddiag, warnings=warnings,
     )
+
+# base 锚检查：综合与市价偏离 >35% 本身不是错（估值可以偏离市价），
+# 但必须显式看到并辩护，而不是三档整队随 base 静默平移
+_dev = out["scenarios"]["base"]["blend"] / cfg["price"] - 1
+if abs(_dev) > 0.35:
+    out["scenarios"]["base"]["warnings"].append(
+        ["yellow", f"base 综合较现价偏离 {_dev:+.0%}（>±35%）——请核对 base 假设"
+                   "或在注记中显式说明为何与市场定价分歧"])
 
 # 反向 DCF：base 口径下现价隐含的起始增速
 s = cfg["scenarios"]["base"]
 lo, hi = -0.20, 0.80
 for _ in range(60):
     mid = (lo + hi) / 2
-    _, eq = dcf(rev0, mid, s["gN"], s["margins"], s["wacc"], s["tg"],
-                cfg["net_cash"], cfg["shares"])
+    _, eq, _d = dcf(rev0, mid, s["gN"], s["margins"], s["wacc"], s["tg"],
+                    cfg["net_cash"], cfg["shares"])
     if eq < cfg["mcap"]:
         lo = mid
     else:
@@ -205,8 +253,8 @@ sens = {}
 for w in (s["wacc"] - 0.01, s["wacc"] - 0.005, s["wacc"], s["wacc"] + 0.005, s["wacc"] + 0.01):
     row = {}
     for g in (s["tg"] - 0.01, s["tg"] - 0.005, s["tg"], s["tg"] + 0.005, s["tg"] + 0.01):
-        ps, _ = dcf(rev0, s["g0"], s["gN"], s["margins"], round(w, 4), round(g, 4),
-                    cfg["net_cash"], cfg["shares"])
+        ps, _, _d = dcf(rev0, s["g0"], s["gN"], s["margins"], round(w, 4), round(g, 4),
+                        cfg["net_cash"], cfg["shares"])
         row[round(g, 4)] = round(ps)
     sens[round(w, 4)] = row
 out["sensitivity"] = sens
@@ -226,10 +274,15 @@ out["history"] = dict(annual=hist_a, quarterly=hist_q)
 
 json.dump(out, open(OUT, "w", encoding="utf-8"), ensure_ascii=False, indent=1)
 
-print(f"===== {cfg['ticker']} @ ${cfg['price']} =====")
+print(f"===== {cfg['ticker']} @ ${cfg['price']} (semantics v{out['semantics_version']}) =====")
 print(f"TTM: rev {ttm_m['revenue']:,} op {ttm_m['op_income']:,} adjNI {cfg['adj_ni']:,} "
       f"adjEPS {out['adj_eps']} FCF {ttm_m['fcf']:,}")
-print(f"反向DCF隐含起始增速: {out['reverse_dcf']:.1%}")
+print(f"反向DCF隐含起始增速: {out['reverse_dcf']:.1%}（base 利润率/WACC 条件下）")
+if not sotp_in_blend:
+    print(f"SOTP 降级为参考项（主分部利润占比 {cfg['seg1_share']:.0%} >= 85%），综合 = PE/DCF 均值")
 for n, v in out["scenarios"].items():
     print(f"{n:5s}| EPS1 {v['eps1']:8.2f} | PE法 {v['pe_target']:9.1f} | DCF {v['dcf_ps']:9.1f} | "
-          f"SOTP {v['sotp_ps']:9.1f} | 综合 {v['blend']:9.1f} | {v['upside']:+.1%}")
+          f"SOTP {v['sotp_ps']:9.1f}{'*' if not sotp_in_blend else ' '}| "
+          f"综合 {v['blend']:9.1f} | {v['upside']:+.1%}")
+    for lv, msg in v["warnings"]:
+        print(f"      {'⛔' if lv == 'red' else '⚠️'} {msg}")
