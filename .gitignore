@@ -5,6 +5,7 @@ __pycache__/
 downloads/
 reports/
 jobs/
+prev_configs/
 .sec_email
 .claude/
 .DS_Store
