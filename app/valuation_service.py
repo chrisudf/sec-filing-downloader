@@ -35,7 +35,9 @@ JOBS = ROOT / "jobs"
 PREV_DIR = ROOT / "prev_configs"
 PY = sys.executable
 
-CLAUDE_TIMEOUT = 480
+# 判断层单次调用上限。默认模型 opus 后（v2, 2026-07-22）在 ~45k 字符 prompt 上比
+# sonnet 慢，且 v2 一次运行最多 3 次调用（schema retry + 经济复审），放宽到 600s
+CLAUDE_TIMEOUT = 600
 STEP_LABELS = {
     "facts": "① XBRL 取数中…",
     "price": "② 获取现价…",
@@ -276,10 +278,14 @@ def _find_claude() -> str:
 
 async def _claude(prompt: str) -> str:
     # VALUATION_JUDGMENT_CMD 可替换判断层命令（测试注入 / 将来切 Anthropic API）
-    # VALUATION_MODEL 可换判断层模型：sonnet(默认) / opus / fable，或完整模型 ID
+    # VALUATION_MODEL 可换判断层模型：opus(默认) / sonnet / fable，或完整模型 ID。
+    # 默认 opus（v2, 2026-07-22）：A/B 实测 sonnet 判断层同输入 4 次采样 base 目标价
+    # 全距 25.7%（CV 11.2%），强模型 CV≈3.5%——假设质量是这条管线的地板，判断层
+    # 频次低（每标的每季 1-3 次调用），用最强模型的成本可忽略；与 judge_openai_compat
+    # 的默认（claude-opus-4-8）对齐。要快可显式 VALUATION_MODEL=sonnet
     cmd = os.environ.get("VALUATION_JUDGMENT_CMD")
     if not cmd:
-        model = os.environ.get("VALUATION_MODEL", "sonnet")
+        model = os.environ.get("VALUATION_MODEL", "opus")
         cmd = f'"{_find_claude()}" -p --model {model}'
     proc = await asyncio.create_subprocess_shell(
         cmd, stdin=asyncio.subprocess.PIPE,
