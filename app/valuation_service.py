@@ -363,12 +363,32 @@ async def _pipeline(job: dict, ticker: str, email: str) -> None:
             caliber += ("数据已严重滞后：你必须按财报原文推出真实 TTM 营收，"
                         "输出 ttm_revenue_override（$M）与 ttm_revenue_note（出处），"
                         "并把所有 g 锚定在该基准上——缺失会被拒绝重试。")
+    # 假设连续性（可选）：VALUATION_PREV_CONFIG 指向上次的 config_假设留档.json。
+    # 注入后判断层被要求"仅在有新证据时修改假设并说明变更"，把运行间噪声
+    # （同输入采样 base CV≈3.5%，弱模型更大）转化为可审计的假设变更记录。
+    prev_section = ""
+    prev_path = os.environ.get("VALUATION_PREV_CONFIG")
+    if prev_path and Path(prev_path).exists():
+        try:
+            prev = json.loads(Path(prev_path).read_text(encoding="utf-8"))
+            if prev.get("ticker") == ticker:
+                prev_core = {k: prev.get(k) for k in
+                             ("date", "adj_ni", "net_cash", "fwd_shares", "scenarios", "rationale")}
+                prev_section = (
+                    "\n\n# 上一次运行的假设（连续性基准）\n"
+                    "连续性纪律：下面是上次运行的假设与理由。本次只在材料中出现**新证据**"
+                    "（新财报数字、新指引、新风险披露）时才修改对应假设，并在 notes 里逐条说明"
+                    "『相对上次的变更 + 依据的新证据』；没有新证据的假设保持上次原值。"
+                    "事实类字段（adj_ni/net_cash）仍按本次最新财报独立计算，不受此约束。\n"
+                    + json.dumps(prev_core, ensure_ascii=False, indent=1))
+        except (ValueError, OSError):
+            pass
     prompt = (f"{base_prompt}\n\n# 服务器注入的元数据（不要输出这些字段）\n"
               f"ticker={ticker} name={info['name']} date={today} price={price:.2f} "
               f"mcap={mcap/1e6:,.0f}M$ shares={shares}M股{caliber}\n\n"
               f"# FACTS（SEC XBRL）\n{_compact_facts(facts)}\n\n"
               f"# MANIFEST（本次分析的财报文件）\n{manifest}\n\n"
-              f"# SECTIONS（财报关键章节摘录 JSON）\n{sections}\n")
+              f"# SECTIONS（财报关键章节摘录 JSON）\n{sections}{prev_section}\n")
     judgment = None
     last_err = ""
     for attempt in range(2):
