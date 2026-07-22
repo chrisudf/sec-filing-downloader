@@ -9,6 +9,8 @@ GET  /api/valuation/{job_id}/result -> zip（财报原件 + manifest + 估值.xl
 from __future__ import annotations
 
 import asyncio
+import csv
+import io
 import json
 import os
 import re
@@ -29,6 +31,8 @@ from . import edgar
 ROOT = Path(__file__).resolve().parent.parent
 VAL = ROOT / "valuation"
 JOBS = ROOT / "jobs"
+# 连续性锚存放处（v2）——不能放 jobs/：_cleanup_jobs 按 mtime rmtree，锚活不过 3 天
+PREV_DIR = ROOT / "prev_configs"
 PY = sys.executable
 
 CLAUDE_TIMEOUT = 480
@@ -395,6 +399,8 @@ async def _pipeline(job: dict, ticker: str, email: str) -> None:
         zf.extractall(fdir)
     htms = sorted(str(p) for p in fdir.iterdir() if p.suffix.lower() in (".htm", ".html"))
     manifest = (fdir / "manifest.csv").read_text(encoding="utf-8")
+    latest_report = max((r.get("reportDate") or "" for r in
+                         csv.DictReader(io.StringIO(manifest))), default="")
 
     job["step"] = "sections"
     await _run([PY, str(VAL / "extract_sections.py"), str(wd / "sections.json"), *htms], wd)
@@ -432,26 +438,45 @@ async def _pipeline(job: dict, ticker: str, email: str) -> None:
             caliber += ("数据已严重滞后：你必须按财报原文推出真实 TTM 营收，"
                         "输出 ttm_revenue_override（$M）与 ttm_revenue_note（出处），"
                         "并把所有 g 锚定在该基准上——缺失会被拒绝重试。")
-    # 假设连续性（可选）：VALUATION_PREV_CONFIG 指向上次的 config_假设留档.json。
-    # 注入后判断层被要求"仅在有新证据时修改假设并说明变更"，把运行间噪声
-    # （同输入采样 base CV≈3.5%，弱模型更大）转化为可审计的假设变更记录。
+    # 假设连续性（v2 起默认开启，2026-07-22）：无新证据不得改数、改数必须留痕，
+    # 把运行间采样噪声（NVDA 实测三次 bear 综合 $29-$77）转化为可审计的假设变更记录。
+    # 来源优先级：VALUATION_PREV_CONFIG 显式指定 > prev_configs/{ticker}.json 自动持久化。
+    # VALUATION_NO_CONTINUITY=1 可整体关闭。失效触发器（自动作废 prev，本次独立重建）：
+    #   1) 语义版本不符（v1 的倍数假设在 v2 联动约束下不可复用）
+    #   2) 出现更新的报告期（新财报=新证据，禁止锚死在旧假设上——连续性最危险的
+    #      失效模式就是财报后按构造低反应）
+    #   3) 现价较上次运行变动 >15%（市场环境已变，倍数/wacc 假设需重估）
     prev_section = ""
-    prev_path = os.environ.get("VALUATION_PREV_CONFIG")
-    if prev_path and Path(prev_path).exists():
-        try:
-            prev = json.loads(Path(prev_path).read_text(encoding="utf-8"))
-            if prev.get("ticker") == ticker:
-                prev_core = {k: prev.get(k) for k in
-                             ("date", "adj_ni", "net_cash", "fwd_shares", "scenarios", "rationale")}
-                prev_section = (
-                    "\n\n# 上一次运行的假设（连续性基准）\n"
-                    "连续性纪律：下面是上次运行的假设与理由。本次只在材料中出现**新证据**"
-                    "（新财报数字、新指引、新风险披露）时才修改对应假设，并在 notes 里逐条说明"
-                    "『相对上次的变更 + 依据的新证据』；没有新证据的假设保持上次原值。"
-                    "事实类字段（adj_ni/net_cash）仍按本次最新财报独立计算，不受此约束。\n"
-                    + json.dumps(prev_core, ensure_ascii=False, indent=1))
-        except (ValueError, OSError):
-            pass
+    if not os.environ.get("VALUATION_NO_CONTINUITY"):
+        prev_path = os.environ.get("VALUATION_PREV_CONFIG") or str(PREV_DIR / f"{ticker}.json")
+        if Path(prev_path).exists():
+            try:
+                prev = json.loads(Path(prev_path).read_text(encoding="utf-8"))
+                stale = None
+                if prev.get("ticker") != ticker:
+                    stale = "标的不符"
+                elif prev.get("semantics_version", 1) != 2:
+                    stale = f"语义版本 v{prev.get('semantics_version', 1)} != v2"
+                elif prev.get("manifest_latest") and latest_report \
+                        and prev["manifest_latest"] != latest_report:
+                    stale = f"出现新报告期 {latest_report}（上次基于 {prev['manifest_latest']}）"
+                elif prev.get("price") and abs(price / prev["price"] - 1) > 0.15:
+                    stale = f"现价较上次变动 {price / prev['price'] - 1:+.0%}（>15%）"
+                if stale:
+                    prev_section = (f"\n\n# 假设连续性说明\n上次运行（{prev.get('date')}）的假设"
+                                    f"已失效：{stale}。本次独立重建全部假设。")
+                else:
+                    prev_core = {k: prev.get(k) for k in
+                                 ("date", "adj_ni", "net_cash", "fwd_shares", "scenarios", "rationale")}
+                    prev_section = (
+                        "\n\n# 上一次运行的假设（连续性基准）\n"
+                        "连续性纪律：下面是上次运行的假设与理由。本次只在材料中出现**新证据**"
+                        "（新财报数字、新指引、新风险披露）时才修改对应假设，并在 notes 里逐条说明"
+                        "『相对上次的变更 + 依据的新证据』；没有新证据的假设保持上次原值。"
+                        "事实类字段（adj_ni/net_cash）仍按本次最新财报独立计算，不受此约束。\n"
+                        + json.dumps(prev_core, ensure_ascii=False, indent=1))
+            except (ValueError, OSError):
+                pass
     prompt = (f"{base_prompt}\n\n# 服务器注入的元数据（不要输出这些字段）\n"
               f"ticker={ticker} name={info['name']} date={today} price={price:.2f} "
               f"mcap={mcap/1e6:,.0f}M$ shares={shares}M股{caliber}\n\n"
@@ -545,6 +570,17 @@ async def _pipeline(job: dict, ticker: str, email: str) -> None:
             # 复审输出不合格：保留原假设出报告，红旗如实展示——绝不静默吞掉
             job["detail"] = f"复审输出未通过校验（{e!r:.120}），沿用原假设并保留红旗"
             break
+
+    # 连续性锚持久化（v2）：只有 gate-clean（无 red 红旗）的 config 才能成为下次
+    # 运行的基准——带病假设冻结成锚会让偏差跨运行复利（方差可见，偏差不可见）。
+    # 原子写：避免任务中断留下半个 JSON 毒化后续所有运行
+    if (mode == "standard" and not reds
+            and not os.environ.get("VALUATION_NO_CONTINUITY")):
+        PREV_DIR.mkdir(exist_ok=True)
+        _tmp = PREV_DIR / f".{ticker}.json.tmp"
+        _tmp.write_text(json.dumps(dict(cfg, manifest_latest=latest_report),
+                                   ensure_ascii=False, indent=1), encoding="utf-8")
+        os.replace(_tmp, PREV_DIR / f"{ticker}.json")
 
     job["step"] = "report"
     xlsx = wd / f"{ticker}_valuation_{today}.xlsx"

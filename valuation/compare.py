@@ -22,6 +22,11 @@ T = new["ticker"]
 mode = new.get("mode", "standard")
 if old.get("mode", "standard") != mode:
     print(f"⚠️  两次运行模式不同（{old.get('mode')} → {mode}），仅对比公共字段\n")
+_sv_o, _sv_n = old.get("semantics_version", 1), new.get("semantics_version", 1)
+if _sv_o != _sv_n:
+    print(f"⚠️  估值语义版本不同（v{_sv_o} → v{_sv_n}）：v2（2026-07-22）起有跨情景联动"
+          "约束与 SOTP 降级，倍数类假设（pe/m1/m2）的漂移不可直接读作判断层改了主意，"
+          "综合目标价口径也可能不同（两法 vs 三法均值）\n")
 
 
 def chg(a, b, pct=False):

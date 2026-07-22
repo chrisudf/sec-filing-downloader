@@ -168,6 +168,11 @@ $env:SEC_EMAIL = "you@example.com"                       # 或环境变量（仅
 判断层默认走本机 Claude Code（`claude -p`，需先 `claude /login`；路径可用 `CLAUDE_CLI_PATH` 覆盖，
 整个判断层命令可用 `VALUATION_JUDGMENT_CMD` 替换成任何"stdin 进 prompt、stdout 出 JSON"的程序）。
 
+假设连续性（v2，2026-07-22 起**默认开启**）：每次 gate-clean 的假设留档自动持久化到
+`prev_configs/{ticker}.json`，下次运行注入判断层并要求"无新证据不改数、改数必须留痕"。
+出现新报告期 / 现价变动 >15% / 语义版本不符时自动作废重建。
+`VALUATION_NO_CONTINUITY=1` 关闭；`VALUATION_PREV_CONFIG=<path>` 显式指定基准文件。
+
 ### `GET /api/valuation/{job_id}` / `GET /api/valuation/{job_id}/result`
 
 轮询进度（九个步骤逐步显示）；完成后下载 zip（财报原件 + manifest + 估值 Excel + 假设留档 config.json）。
