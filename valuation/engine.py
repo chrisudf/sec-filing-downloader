@@ -154,10 +154,16 @@ ttm_m["fcf"] = ttm_m["cfo"] - ttm_m["capex"]
 # XBRL 严重滞后时（外国发行人 6-K 无季度 XBRL），判断层可从财报原文提取真实 TTM 营收
 # 作为基准覆盖（与 net_cash/adj_ni 同属"LLM 提取事实并注明出处"，非算术）
 rev0_note = ""
+rev0_reported = rev0   # 覆盖前的 XBRL 口径营收——P/FCF 红旗按利润率换算用
 if cfg.get("ttm_revenue_override"):
     rev0 = float(cfg["ttm_revenue_override"])
     ttm_m["revenue"] = round(rev0)   # Excel 公式区与引擎共用同一基准
     rev0_note = cfg.get("ttm_revenue_note", "判断层按财报原文修正的 TTM 营收基准")
+
+# P/FCF 红旗的分母：override 场景下 XBRL 的 fcf 绝对值是多年前的，直接除会对增长了
+# 2-3 倍的公司产生每次必现的假红旗（还会因 reds 不清空而永久阻断连续性锚持久化）——
+# 用"陈旧 FCF 利润率 × 当前营收基准"换算到同一量级
+fcf_base = (ttm_m["fcf"] / rev0_reported * rev0) if rev0_reported else ttm_m["fcf"]
 
 # v2（semantics_version=2, 2026-07-22）：主分部利润占比 >= 0.85 时 SOTP 与 PE 法
 # 实为同一笔盈利乘两次倍数（无分部折价可解锁），退化为参考项不入综合——
@@ -167,7 +173,11 @@ sotp_in_blend = cfg["seg1_share"] < SOTP_SEG1_CAP
 
 out = dict(
     ticker=cfg["ticker"], name=cfg["name"], date=cfg["date"], mode="standard",
-    semantics_version=cfg.get("semantics_version", 1),
+    # 语义版本属于引擎实现而非 config 声明：本引擎无条件执行 v2 计算（SOTP 降级/
+    # 诊断），重放 v1 老 config 时若透传声明值会得到"标 v1 却是两法综合"的自相矛盾
+    # 输出，compare.py 的 1==1 还会静默掉它本该拦的口径跳变告警
+    semantics_version=2,
+    config_semantics_version=cfg.get("semantics_version", 1),
     meta=dict(price=cfg["price"], mcap=cfg["mcap"], shares=cfg["shares"],
               fwd_shares=cfg["fwd_shares"], net_cash=cfg["net_cash"], fwd_label=cfg["fwd_label"],
               seg1=cfg["seg1"], seg2=cfg["seg2"], seg1_share=cfg["seg1_share"],
@@ -204,8 +214,8 @@ for name, s in cfg["scenarios"].items():
     if ddiag["tv_pv_share"] and ddiag["tv_pv_share"] > 0.75:
         warnings.append(["red", f"终值折现占 EV {ddiag['tv_pv_share']:.0%}（>75%）——"
                                 "估值几乎全押在永续段，对 wacc-tg 极端敏感"])
-    if ttm_m["fcf"] > 0.02 * ttm_m["revenue"]:
-        p_fcf = dcf_eq / ttm_m["fcf"]
+    if fcf_base > 0.02 * rev0:
+        p_fcf = dcf_eq / fcf_base
         ddiag["dcf_equity_over_ttm_fcf"] = round(p_fcf, 1)
         if not 5 <= p_fcf <= 90:
             warnings.append(["red", f"DCF 隐含股权价值为 TTM FCF 的 {p_fcf:.1f} 倍"

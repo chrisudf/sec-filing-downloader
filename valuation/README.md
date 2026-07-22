@@ -41,8 +41,9 @@ python valuation\verify_report.py valuation.json reports\NVDA_valuation_2026-07-
       "opm": 0.64, "tax": 0.16, "pe": 30,
       "m1": 24, "m2": 15, // 分部 EV/EBIT 倍数
       "wacc": 0.095, "tg": 0.03,
-      "g0": 0.32, "gN": 0.05,             // DCF 十年线性衰减起止增速
-      "margins": [0.46, ...],             // 十年 FCF 利润率路径（10 个值）
+      "g0": 0.32, "gN": 0.05,             // DCF 十年线性衰减起止增速；gN∈(0,0.12]——
+                                          // 终年增速必须为正，衰退终态建模进 margins 而非负 gN
+      "margins": [0.46, ...],             // 十年 FCF 利润率路径（10 个值，上限 0.65 或 1.2×当前FCF率）
       "permanent_impairment": true,        // 可选：判断为永久受损（解锁低盈利×低倍数组合）
       "impairment_note": "原文出处"        // permanent_impairment 时必填
     }

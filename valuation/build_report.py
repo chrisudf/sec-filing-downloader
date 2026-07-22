@@ -679,9 +679,12 @@ sources = [
     ("TTM 口径", "损益类=最近四个离散季度加总（Q4=年度-前三季）；现金流类=最新年度+本财年YTD-上年同期YTD（10-Q现金流表为累计口径）"),
     ("调整后净利", d["adj_note"]),
     ("净现金", d["net_cash_note"]),
-    ("估值语义版本", f"semantics_version={d.get('semantics_version', 1)}"
-                    "（v2, 2026-07-22：跨情景一致性规则 / SOTP 降级 / 诊断红旗；"
-                    "v1 与 v2 config 的倍数假设不可直接对比）"),
+    ("估值语义版本", (f"semantics_version={d.get('semantics_version', 1)}"
+                     + ("（v2, 2026-07-22：跨情景一致性规则 / SOTP 降级 / 诊断红旗；"
+                        f"config 声明版本 v{d.get('config_semantics_version', 1)}；"
+                        "v1 与 v2 的倍数假设与综合口径不可直接对比）"
+                        if d.get("semantics_version", 1) >= 2 else
+                        "（v1：情景盈利×情景倍数，三法均值，无一致性联动）"))),
     ("免责声明", "本报告为 sec-filing-downloader 项目的数据分析输出，所有估值结果由假设驱动，不构成任何投资建议。"),
 ]
 r = 3

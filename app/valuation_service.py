@@ -101,6 +101,10 @@ def _validate_judgment(d: dict, mode: str = "standard",
     for k in need:
         if k not in d:
             raise ValueError(f"缺少字段 {k}")
+    if not isinstance(d["fwd_shares"], (int, float)) or d["fwd_shares"] <= 0:
+        raise ValueError("fwd_shares 必须为正数（百万股）")
+    if not isinstance(d["other_income"], (int, float)):
+        raise ValueError("other_income 必须是数字（$M）")
     if not 0 <= d["seg1_share"] <= 1:
         raise ValueError("seg1_share 必须在 0-1")
     # build_report.py 直接取这些 rationale 键，缺了会在花完 LLM 调用后才崩，这里提前拒绝
@@ -125,8 +129,11 @@ def _validate_judgment(d: dict, mode: str = "standard",
                 raise ValueError(f"{sc} 缺少 {k}")
         if len(s["margins"]) != 10:
             raise ValueError(f"{sc}.margins 必须恰好 10 个值")
-        if not all(isinstance(m, (int, float)) and -0.3 < m < 0.65 for m in s["margins"]):
-            raise ValueError(f"{sc}.margins 必须是 (-0.3, 0.65) 内的数字（FCF 利润率）")
+        # 上界随当前实际 FCF 利润率放宽（特许权/授权类公司 TTM FCF 率本身可 >65%，
+        # 静态上界会连"维持现状"的路径都拒绝，两次 retry 撞同一堵墙后硬失败）
+        m_cap = max(0.65, min(0.9, 1.2 * fcf_margin)) if fcf_margin else 0.65
+        if not all(isinstance(m, (int, float)) and -0.3 < m < m_cap for m in s["margins"]):
+            raise ValueError(f"{sc}.margins 必须是 (-0.3, {m_cap:.2f}) 内的数字（FCF 利润率）")
         if not 0.05 <= s["wacc"] <= 0.2:
             raise ValueError(f"{sc}.wacc 越界")
         if s["wacc"] - s["tg"] < 0.045:
@@ -148,7 +155,7 @@ def _validate_judgment(d: dict, mode: str = "standard",
 
     # ---- v2 跨情景一致性（拦『所有参数同取极端』与周期双重计数）----
     sb, ss, su = d["scenarios"]["bear"], d["scenarios"]["base"], d["scenarios"]["bull"]
-    for k in ("g", "opm", "pe", "m1"):
+    for k in ("g", "opm", "pe", "m1", "m2"):
         if not sb[k] <= ss[k] <= su[k]:
             raise ValueError(f"情景排序：{k} 必须 bear <= base <= bull")
 
@@ -161,7 +168,9 @@ def _validate_judgment(d: dict, mode: str = "standard",
                for n in ("bear", "base", "bull")}
         if eps["base"] > 0:
             r_bear, r_bull = eps["bear"] / eps["base"], eps["bull"] / eps["base"]
-            for key in ("pe", "m1"):
+            # m2 仅在真双分部（次分部倍数非 0）时参与——它在 seg1_share<0.85 时
+            # 承担近半 SOTP 权重，同样是独立采样漂移通道
+            for key in (("pe", "m1", "m2") if sb.get("m2", 0) > 0 else ("pe", "m1")):
                 if (r_bear < 0.8 and sb[key] < 0.6 * ss[key] and not _exempt(sb)):
                     raise ValueError(
                         f"bear 双重计数：情景盈利已较 base 收缩至 {r_bear:.0%}，{key} 又 "
@@ -475,7 +484,9 @@ async def _pipeline(job: dict, ticker: str, email: str) -> None:
                         "『相对上次的变更 + 依据的新证据』；没有新证据的假设保持上次原值。"
                         "事实类字段（adj_ni/net_cash）仍按本次最新财报独立计算，不受此约束。\n"
                         + json.dumps(prev_core, ensure_ascii=False, indent=1))
-            except (ValueError, OSError):
+            except (ValueError, OSError, TypeError, KeyError):
+                # 设计意图：基准文件任何读取/类型问题都降级为"忽略连续性"，绝不杀任务
+                # （VALUATION_PREV_CONFIG 支持用户手工指定/编辑的文件）
                 pass
     prompt = (f"{base_prompt}\n\n# 服务器注入的元数据（不要输出这些字段）\n"
               f"ticker={ticker} name={info['name']} date={today} price={price:.2f} "
@@ -514,21 +525,26 @@ async def _pipeline(job: dict, ticker: str, email: str) -> None:
                     f"XBRL 数据滞后（最新期末 {facts.get('data_latest')}）："
                     "必须按财报原文提供 ttm_revenue_override（TTM 营收 $M）与 ttm_revenue_note")
             break
-        except (ValueError, json.JSONDecodeError, TypeError, KeyError) as e:
-            # TypeError/KeyError：LLM 把数字写成字符串、scenarios 不是对象等畸形输出，
-            # 同样应该带着原因重试而不是让整个任务崩掉
+        except (ValueError, json.JSONDecodeError, TypeError, KeyError,
+                ZeroDivisionError) as e:
+            # TypeError/KeyError/ZeroDivisionError：LLM 把数字写成字符串、scenarios
+            # 不是对象、fwd_shares=0 等畸形输出，同样应该带着原因重试而不是让任务崩掉
             last_err = repr(e)
             last_raw = raw
             judgment = None
     if judgment is None:
         raise RuntimeError(f"判断层输出两次校验失败：{last_err}")
 
-    # semantics_version=2（2026-07-22）：v2 一致性规则/诊断红旗/SOTP 降级口径。
-    # 连续性注入与 compare.py 依赖此字段区分新旧语义的倍数假设（不可跨版本直接复用）
+    # semantics_version=2（2026-07-22）：v2 一致性规则/诊断红旗/SOTP 降级口径，
+    # 仅描述 standard 模式（financials 沿用 v1 情景语义，恒为 1）。
+    # manifest_latest 直接进 cfg：bundle 里的 config_假设留档.json 与自动锚同源，
+    # 显式 VALUATION_PREV_CONFIG 指向 bundle config 时报告期失效触发器才有指纹可查
     cfg = dict(judgment, ticker=ticker, name=info["name"], date=today,
                price=round(price, 2), mcap=round(mcap / 1e6), shares=shares,
                mode=mode, adr_multiple=adr_multiple,
-               currency=facts.get("currency", "USD"), semantics_version=2)
+               currency=facts.get("currency", "USD"),
+               semantics_version=2 if mode == "standard" else 1,
+               manifest_latest=latest_report)
     # ---- v2 经济合理性复审：engine 干跑一次，red 红旗（假设可修复类）打回判断层
     # 至多一次；复审仍越界则带红旗出报告（fail loud，不 fail hard——红旗区会显示）。
     # 总 claude 调用 <= 3（schema retry 1 + 经济复审 1）。诊断只读 engine 输出的
@@ -561,12 +577,20 @@ async def _pipeline(job: dict, ticker: str, email: str) -> None:
             _validate_judgment(revised, mode,
                                rev0=float(revised.get("ttm_revenue_override") or rev0_m),
                                fcf_margin=fcfm)
+            # 陈旧 XBRL 的强制 override 在复审通道同样成立——revised 整体替换 judgment，
+            # 若复审输出丢掉可选的 ttm_revenue_override，全部情景会锚回多年前的营收基准
+            if (mode == "standard" and stale_days > 550
+                    and not revised.get("ttm_revenue_override")):
+                raise ValueError("复审输出丢失 ttm_revenue_override（陈旧 XBRL 下必须保留）")
             judgment = revised
             cfg = dict(judgment, ticker=ticker, name=info["name"], date=today,
                        price=round(price, 2), mcap=round(mcap / 1e6), shares=shares,
                        mode=mode, adr_multiple=adr_multiple,
-                       currency=facts.get("currency", "USD"), semantics_version=2)
-        except (ValueError, json.JSONDecodeError, TypeError, KeyError, RuntimeError) as e:
+                       currency=facts.get("currency", "USD"),
+                       semantics_version=2 if mode == "standard" else 1,
+                       manifest_latest=latest_report)
+        except (ValueError, json.JSONDecodeError, TypeError, KeyError,
+                ZeroDivisionError, RuntimeError) as e:
             # 复审输出不合格：保留原假设出报告，红旗如实展示——绝不静默吞掉
             job["detail"] = f"复审输出未通过校验（{e!r:.120}），沿用原假设并保留红旗"
             break
@@ -596,6 +620,8 @@ async def _pipeline(job: dict, ticker: str, email: str) -> None:
             zf.write(p, p.name)
         zf.write(xlsx, xlsx.name)
         zf.write(wd / "config.json", "config_假设留档.json")
+        # compare.py 的输入就是 valuation.json——不打包它，跨期对比就没有可分发的输入
+        zf.write(wd / "valuation.json", "valuation.json")
     val = json.loads((wd / "valuation.json").read_text(encoding="utf-8"))
     job.update(status="done", step="done", result=str(bundle),
                summary={k: dict(blend=v["blend"], upside=v["upside"])
