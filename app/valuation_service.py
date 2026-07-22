@@ -504,11 +504,47 @@ async def _pipeline(job: dict, ticker: str, email: str) -> None:
                price=round(price, 2), mcap=round(mcap / 1e6), shares=shares,
                mode=mode, adr_multiple=adr_multiple,
                currency=facts.get("currency", "USD"), semantics_version=2)
-    (wd / "config.json").write_text(json.dumps(cfg, ensure_ascii=False, indent=1), encoding="utf-8")
-
-    job["step"] = "engine"
-    await _run([PY, str(VAL / "engine.py"), str(wd / "config.json"), str(wd / "facts.json"),
-                str(wd / "valuation.json"), str(fdir / "manifest.csv")], wd)
+    # ---- v2 经济合理性复审：engine 干跑一次，red 红旗（假设可修复类）打回判断层
+    # 至多一次；复审仍越界则带红旗出报告（fail loud，不 fail hard——红旗区会显示）。
+    # 总 claude 调用 <= 3（schema retry 1 + 经济复审 1）。诊断只读 engine 输出的
+    # valuation.json，服务层绝不自行重算 DCF 量。
+    for gate_attempt in range(2):
+        (wd / f"config_attempt{gate_attempt}.json").write_text(
+            json.dumps(cfg, ensure_ascii=False, indent=1), encoding="utf-8")
+        (wd / "config.json").write_text(json.dumps(cfg, ensure_ascii=False, indent=1),
+                                        encoding="utf-8")
+        job["step"] = "engine"
+        await _run([PY, str(VAL / "engine.py"), str(wd / "config.json"), str(wd / "facts.json"),
+                    str(wd / "valuation.json"), str(fdir / "manifest.csv")], wd)
+        val = json.loads((wd / "valuation.json").read_text(encoding="utf-8"))
+        reds = [f"[{sc}] {msg}" for sc in ("bear", "base", "bull")
+                for lv, msg in (val["scenarios"].get(sc) or {}).get("warnings", [])
+                if lv == "red"]
+        if not reds or gate_attempt == 1 or mode != "standard":
+            break
+        job["step"] = "judgment"
+        job["detail"] = "经济合理性复审：引擎诊断红旗打回判断层"
+        retry_p = (prompt + "\n\n# 你上一次的输出（在此基础上最小修改，其余字段保持原值）\n"
+                   + json.dumps(judgment, ensure_ascii=False)
+                   + "\n\n# 估值引擎对上述假设的经济合理性红旗\n- "
+                   + "\n- ".join(reds)
+                   + "\n\n只调整导致红旗的假设（DCF 增速路径/margins/wacc-tg/倍数），"
+                     "其余保持原值，重新只输出完整 JSON。若你坚持某项红旗假设，"
+                     "必须在 notes 里给出财报原文依据（红旗会随报告展示）。")
+        try:
+            revised = _parse_json(await _claude(retry_p))
+            _validate_judgment(revised, mode,
+                               rev0=float(revised.get("ttm_revenue_override") or rev0_m),
+                               fcf_margin=fcfm)
+            judgment = revised
+            cfg = dict(judgment, ticker=ticker, name=info["name"], date=today,
+                       price=round(price, 2), mcap=round(mcap / 1e6), shares=shares,
+                       mode=mode, adr_multiple=adr_multiple,
+                       currency=facts.get("currency", "USD"), semantics_version=2)
+        except (ValueError, json.JSONDecodeError, TypeError, KeyError, RuntimeError) as e:
+            # 复审输出不合格：保留原假设出报告，红旗如实展示——绝不静默吞掉
+            job["detail"] = f"复审输出未通过校验（{e!r:.120}），沿用原假设并保留红旗"
+            break
 
     job["step"] = "report"
     xlsx = wd / f"{ticker}_valuation_{today}.xlsx"
