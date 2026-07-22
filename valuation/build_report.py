@@ -210,7 +210,8 @@ if MODE == "financials":
     put(ws, "A1", f"{d['name']} / {T} 估值分析（金融股模式）", TITLE, border=False)
     put(ws, "A2", f"sec-filing-downloader + SEC XBRL · {d['date']} · 分析工具输出，不构成投资建议",
         GREEN, border=False)
-    caliber = "方法：PE 法 + P/TBV 法（金融股不适用 FCFF DCF）"
+    caliber = ("方法：PE 法 + P/TBV 法（金融股不适用 FCFF DCF）"
+               "；口径注意：金融股模式沿用 v1 情景语义（情景盈利×情景倍数，无 v2 一致性联动）")
     if M.get("adr_multiple", 1.0) != 1.0:
         caliber += f"；价格为 ADR（1 ADR = {M['adr_multiple']:g} 普通股，股本已折算）"
     if M.get("currency", "USD") != "USD":
@@ -469,7 +470,10 @@ ws.column_dimensions["A"].width = 30
 ws.column_dimensions["B"].width = 46
 for col in "CDE":
     ws.column_dimensions[col].width = 14
-put(ws, "A1", f"{T} 分部加总 / 倍数法（基于 {FWD} 营业利润）", TITLE, border=False)
+_sotp_title = f"{T} 分部加总 / 倍数法（基于 {FWD} 营业利润）"
+if not d["meta"].get("sotp_in_blend", True):
+    _sotp_title += " ——参考项，不入综合（主分部利润占比>=85%，与 PE 法为同一笔盈利）"
+put(ws, "A1", _sotp_title, TITLE, border=False)
 for cell, v in [("A3", "项目"), ("B3", "说明"), ("C3", "悲观"), ("D3", "合理"), ("E3", "乐观")]:
     put(ws, cell, v, BOLD, fill=HDRFILL)
 
@@ -589,7 +593,9 @@ metrics = [
     ("PEG（合理）", "=B14/('情景假设'!$C$4*100)", "0.00", "Forward PE / 营收增速"),
     ("EV/EBIT (TTM)", "=(B5-B6)/'情景假设'!$B$20", FM_X, ""),
     ("FCF 收益率 (TTM)", "='情景假设'!$B$25/B5", FM_PCT, ""),
-    ("反向 DCF 隐含增速", d["reverse_dcf"], FM_PCT, "base利润率/WACC下现价隐含的起始增速（10年线性衰减）；Python 引擎计算"),
+    ("反向 DCF 隐含增速（base 口径条件）", d["reverse_dcf"], FM_PCT,
+     "现价隐含的 DCF 起始增速（10年线性衰减）——条件于 base 的利润率路径与 WACC，"
+     "base 假设错则此值同错；Python 引擎计算"),
 ]
 r = 11
 for label, v, fmt, note in metrics:
@@ -598,8 +604,12 @@ for label, v, fmt, note in metrics:
     put(ws, f"H{r}", note, GREEN, wrap=True)
     r += 1
 
-put(ws, "A20", "投资情景（三种方法 + 综合）", H2, border=False)
-for j, h in enumerate(["投资情景", "PE 法目标价", "DCF 每股价值", "SOTP 每股价值",
+# v2：主分部利润占比 >= 0.85 时 SOTP 只作参考（与 PE 法同一笔盈利），综合 = PE/DCF 均值
+_sotp_in = d["meta"].get("sotp_in_blend", True)
+put(ws, "A20", "投资情景（三种方法 + 综合）" if _sotp_in
+    else "投资情景（PE/DCF 综合；SOTP 为参考）", H2, border=False)
+for j, h in enumerate(["投资情景", "PE 法目标价", "DCF 每股价值",
+                       "SOTP 每股价值" if _sotp_in else "SOTP（参考，不入综合）",
                        "综合目标价", "距现价", "一年后目标价"]):
     put(ws, f"{get_column_letter(1+j)}21", h, BOLD, fill=HDRFILL)
 scen_rows = [
@@ -607,13 +617,14 @@ scen_rows = [
     ("⚖️ 合理 (Base)", "C", "=DCF!$B$32", "=SOTP!$D$12"),
     ("🛡️ 悲观 (Bear)", "B", "=DCF!$B$16", "=SOTP!$C$12"),
 ]
+_blend_rng = "B{r}:D{r}" if _sotp_in else "B{r}:C{r}"
 r = 22
 for label, ac, dcf_f, sotp_f in scen_rows:
     put(ws, f"A{r}", label, BOLD)
     put(ws, f"B{r}", f"='情景假设'!${ac}$35", GREEN, fmt=FM_PX)
     put(ws, f"C{r}", dcf_f, GREEN, fmt=FM_PX)
     put(ws, f"D{r}", sotp_f, GREEN, fmt=FM_PX)
-    c = put(ws, f"E{r}", f"=AVERAGE(B{r}:D{r})", BLACK, fmt=FM_PX)
+    c = put(ws, f"E{r}", f"=AVERAGE({_blend_rng.format(r=r)})", BLACK, fmt=FM_PX)
     c.fill = GREENFILL if r != 24 else REDFILL
     c.font = Font(name="Arial", bold=True, size=10)
     put(ws, f"F{r}", f"=E{r}/$B$4-1", BLACK, fmt=FM_PCT)
@@ -627,16 +638,34 @@ ws.conditional_formatting.add(
 ws.conditional_formatting.add(
     "F22:F24", CellIsRule(operator="greaterThan", formula=["0"],
                           font=Font(name="Arial", color="008000", bold=True)))
-put(ws, "A25", "注：一年后目标价 = 综合目标价 × (1+该情景 WACC)，即公允价值按要求回报率滚动一年（未扣股息）",
-    GREEN, border=False)
+_note25 = "注：一年后目标价 = 综合目标价 × (1+该情景 WACC)，即公允价值按要求回报率滚动一年（未扣股息）"
+if not _sotp_in:
+    _note25 += f"；SOTP 不入综合（主分部利润占比 {d['meta']['seg1_share']:.0%} >= 85%，与 PE 法为同一笔盈利）"
+put(ws, "A25", _note25, GREEN, border=False)
+_mth = "三法" if _sotp_in else "PE/DCF 两法"
 _spread = " / ".join(f"{sc} {d['scenarios'][sc].get('method_spread') or '—'}x"
                      for sc in ("bear", "base", "bull"))
-put(ws, "A26", f"方法离散度（同情景三法 max/min）：{_spread}——离散大说明三法分歧大，"
-               "综合目标价可信度降低，应分别看三法并参考反向 DCF", GREEN, border=False)
+put(ws, "A26", f"方法离散度（同情景{_mth} max/min）：{_spread}——离散大说明各法分歧大，"
+               "综合目标价可信度降低，应分别看各法并参考反向 DCF", GREEN, border=False)
 
-put(ws, "A27", "判断层注记（均有财报原文出处）：", H2, border=False)
+# v2 诊断红旗区：engine diagnostics 的 red/yellow 警告逐条落进摘要——
+# 警告和 headline 数字必须出现在同一张表上，不能只活在引擎 stdout 里
+_row = 27
+_flags = [(sc, lv, msg) for sc in ("bear", "base", "bull")
+          for lv, msg in d["scenarios"][sc].get("warnings", [])]
+if _flags:
+    put(ws, f"A{_row}", "合理性红旗（engine v2 diagnostics——red 项判断层已复审一次，仍越界则代表其坚持该假设）：",
+        Font(name="Arial", color="CC0000", bold=True, size=10), border=False)
+    _row += 1
+    for sc, lv, msg in _flags:
+        put(ws, f"A{_row}", f"{'⛔' if lv == 'red' else '⚠'} [{sc}] {msg}",
+            Font(name="Arial", color="CC0000" if lv == "red" else "B8860B", size=10),
+            border=False)
+        _row += 1
+
+put(ws, f"A{_row}", "判断层注记（均有财报原文出处）：", H2, border=False)
 for j, note in enumerate(d["notes"]):
-    put(ws, f"A{28+j}", note, GREEN, border=False)
+    put(ws, f"A{_row+1+j}", note, GREEN, border=False)
 
 # ============================================================ 出处
 ws = wb.create_sheet("出处")
@@ -650,6 +679,9 @@ sources = [
     ("TTM 口径", "损益类=最近四个离散季度加总（Q4=年度-前三季）；现金流类=最新年度+本财年YTD-上年同期YTD（10-Q现金流表为累计口径）"),
     ("调整后净利", d["adj_note"]),
     ("净现金", d["net_cash_note"]),
+    ("估值语义版本", f"semantics_version={d.get('semantics_version', 1)}"
+                    "（v2, 2026-07-22：跨情景一致性规则 / SOTP 降级 / 诊断红旗；"
+                    "v1 与 v2 config 的倍数假设不可直接对比）"),
     ("免责声明", "本报告为 sec-filing-downloader 项目的数据分析输出，所有估值结果由假设驱动，不构成任何投资建议。"),
 ]
 r = 3
