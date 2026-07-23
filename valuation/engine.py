@@ -25,15 +25,27 @@ MODE = cfg.get("mode", facts.get("mode", "standard"))
 
 
 def _vintage(manifest_text, run_date):
-    """从 manifest 提取"这份估值基于哪个报告期"——价值投资的第一个检查项就是数据新鲜度。"""
+    """从 manifest 提取"这份估值基于哪个报告期"——价值投资的第一个检查项就是数据新鲜度。
+
+    report_end 只看定期报告(10-K/10-Q/20-F/6-K)——8-K 新闻稿附件的
+    reportDate 是公布日,混进来会让时效块在 XBRL 还停留在上季度时显示
+    "1 天前",把警示反向变成误导。8-K 行单独输出 pending_8k_announced。"""
     try:
         rows = [r for r in csv.DictReader(io.StringIO(manifest_text)) if r.get("reportDate")]
         if not rows:
             return {}
-        latest = max(rows, key=lambda r: r["reportDate"])
+        periodic = [r for r in rows if not r["form"].startswith("8-K")]
+        if not periodic:
+            return {}
+        latest = max(periodic, key=lambda r: r["reportDate"])
         age = (date.fromisoformat(run_date) - date.fromisoformat(latest["reportDate"])).days
-        return {"report_end": latest["reportDate"], "filed": latest["filingDate"],
-                "age_days": age}
+        out = {"report_end": latest["reportDate"], "filed": latest["filingDate"],
+               "age_days": age}
+        pend = [r for r in rows if r["form"].startswith("8-K")
+                and r["filingDate"] > latest["filingDate"]]
+        if pend:
+            out["pending_8k_announced"] = max(r["filingDate"] for r in pend)
+        return out
     except Exception:
         return {}
 

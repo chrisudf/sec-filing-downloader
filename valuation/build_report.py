@@ -239,6 +239,11 @@ if MODE == "financials":
         _c = put(ws, "E7", _vin["age_days"], BLACK, fmt="#,##0")
         if _vin["age_days"] > 120:
             _c.font = Font(name="Arial", color="CC0000", bold=True)
+        if _vin.get("pending_8k_announced"):
+            _c = put(ws, "D8", f"⚠ 业绩已公布({_vin['pending_8k_announced']} 8-K)", BOLD)
+            _c.font = Font(name="Arial", color="CC0000", bold=True)
+            _c = put(ws, "E8", "10-Q 未提交:以上定量指标仍基于上一报告期", BOLD)
+            _c.font = Font(name="Arial", color="CC0000", bold=True)
 
     put(ws, "A9", "关键指标", H2, border=False)
     for cell, v in [("A10", "指标"), ("B10", "数值"), ("H10", "说明")]:
@@ -580,6 +585,11 @@ if _vin:
     put(ws, "D7", "距报告期(天)", BOLD)
     _c = put(ws, "E7", _vin["age_days"], BLACK, fmt="#,##0")
     if _vin["age_days"] > 120:
+        _c.font = Font(name="Arial", color="CC0000", bold=True)
+    if _vin.get("pending_8k_announced"):
+        _c = put(ws, "D8", f"⚠ 业绩已公布({_vin['pending_8k_announced']} 8-K)", BOLD)
+        _c.font = Font(name="Arial", color="CC0000", bold=True)
+        _c = put(ws, "E8", "10-Q 未提交:以上定量指标仍基于上一报告期", BOLD)
         _c.font = Font(name="Arial", color="CC0000", bold=True)
 
 put(ws, "A9", "关键指标", H2, border=False)
