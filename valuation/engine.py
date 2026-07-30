@@ -81,10 +81,22 @@ def tail(dic, n):
 ttm = facts["ttm"]
 rev0 = ttm["revenue"]["value"] / 1e6
 
+# XBRL 严重滞后时（外国发行人 6-K 无季度 XBRL；或业绩 8-K 已出而 10-Q 未交），
+# 判断层可从财报原文提取真实 TTM 营收作为基准覆盖（与 net_cash/adj_ni 同属
+# "LLM 提取事实并注明出处"，非算术）。必须在 MODE 分支之前生效：financials
+# （银行/券商/fintech）恰好是 10-Q 滞后业绩公布 2-6 周的重灾区，此前这段落在
+# 分支之后，financials 拿到 override 也会静默按上一季度基准估值。
+rev0_note = ""
+rev0_reported = rev0   # 覆盖前的 XBRL 口径营收——P/FCF 红旗按利润率换算用
+if cfg.get("ttm_revenue_override"):
+    rev0 = float(cfg["ttm_revenue_override"])
+    rev0_note = cfg.get("ttm_revenue_note", "判断层按财报原文修正的 TTM 营收基准")
+
 if MODE == "financials":
     # ================= 金融股：PE 法 + P/TBV 法 =================
     ttm_m = {k: round(ttm[k]["value"] / 1e6)
              for k in ("revenue", "pretax_income", "net_income")}
+    ttm_m["revenue"] = round(rev0)   # 覆盖生效时与情景基准/Excel 公式区同源
     eq = facts["equity_instant"]
     gw = facts.get("goodwill_instant") or {}
     it = facts.get("intangibles_instant") or {}
@@ -99,11 +111,16 @@ if MODE == "financials":
                   fwd_shares=cfg["fwd_shares"], fwd_label=cfg["fwd_label"],
                   tbv=tbv, tbv_ps=round(tbv_ps, 2), tbv_asof=eq_end,
                   adr_multiple=cfg.get("adr_multiple", 1.0),
-                  currency=cfg.get("currency", "USD"), vintage=VINTAGE),
+                  currency=cfg.get("currency", "USD"), vintage=VINTAGE,
+                  # XBRL 结构化数据的期末——与 vintage.report_end（定期报告期末）
+                  # 是两回事：外国发行人 6-K 无季度 XBRL 时二者能差一年以上
+                  # （TSM 实测 report_end=2026-06-30 而 data_latest=2024-12-31），
+                  # 报告里标注"哪些行还停在旧窗口"必须用这个。
+                  data_latest=facts.get("data_latest")),
         ttm=ttm_m, adj_ni=cfg["adj_ni"], adj_eps=round(cfg["adj_ni"] / cfg["shares"], 2),
         rote_ttm=round(cfg["adj_ni"] / tbv, 4),
         notes=cfg["notes"], rationale=cfg["rationale"], adj_note=cfg["adj_note"],
-        scenarios={}, manifest=manifest,
+        rev0_note=rev0_note, scenarios={}, manifest=manifest,
     )
 
     for name, s in cfg["scenarios"].items():
@@ -162,15 +179,7 @@ if MODE == "financials":
 # ================= standard：PE + DCF + SOTP =================
 ttm_m = {k: round(ttm[k]["value"] / 1e6) for k in ("revenue", "op_income", "net_income", "cfo", "capex")}
 ttm_m["fcf"] = ttm_m["cfo"] - ttm_m["capex"]
-
-# XBRL 严重滞后时（外国发行人 6-K 无季度 XBRL），判断层可从财报原文提取真实 TTM 营收
-# 作为基准覆盖（与 net_cash/adj_ni 同属"LLM 提取事实并注明出处"，非算术）
-rev0_note = ""
-rev0_reported = rev0   # 覆盖前的 XBRL 口径营收——P/FCF 红旗按利润率换算用
-if cfg.get("ttm_revenue_override"):
-    rev0 = float(cfg["ttm_revenue_override"])
-    ttm_m["revenue"] = round(rev0)   # Excel 公式区与引擎共用同一基准
-    rev0_note = cfg.get("ttm_revenue_note", "判断层按财报原文修正的 TTM 营收基准")
+ttm_m["revenue"] = round(rev0)   # 覆盖生效时 Excel 公式区与引擎共用同一基准
 
 # P/FCF 红旗的分母：override 场景下 XBRL 的 fcf 绝对值是多年前的，直接除会对增长了
 # 2-3 倍的公司产生每次必现的假红旗（还会因 reds 不清空而永久阻断连续性锚持久化）——
@@ -195,7 +204,7 @@ out = dict(
               seg1=cfg["seg1"], seg2=cfg["seg2"], seg1_share=cfg["seg1_share"],
               sotp_in_blend=sotp_in_blend,
               adr_multiple=cfg.get("adr_multiple", 1.0), currency=cfg.get("currency", "USD"),
-              vintage=VINTAGE),
+              vintage=VINTAGE, data_latest=facts.get("data_latest")),
     ttm=ttm_m, adj_ni=cfg["adj_ni"], adj_eps=round(cfg["adj_ni"] / cfg["shares"], 2),
     notes=cfg["notes"], rationale=cfg["rationale"],
     net_cash_note=cfg["net_cash_note"], adj_note=cfg["adj_note"],

@@ -60,6 +60,17 @@ R = d["rationale"]
 FWD = d["meta"]["fwd_label"]
 MODE = d.get("mode", "standard")
 
+# ttm_revenue_override 生效时只有营收被滚动到含最新季度的窗口，同块的利润/现金流
+# 仍是 XBRL 的上一窗口。不标窗口的话，"关键事实（勿改）"里会出现两类矛盾：
+# 按行相除得到跨期利润率（SOFI 实测 646/4306=15.0%，分子缺最新季度利润）；
+# 已滚动的调整后净利高于陈旧的报告净利（637 vs 577），而 adj_note 恰好说二者相等。
+# 窗口日期必须取 data_latest（XBRL 数据期末），不能用 vintage.report_end（定期报告
+# 期末）——TSM 这类 6-K 发行人二者分别是 2024-12-31 与 2026-06-30，标错等于把
+# "严重滞后"写成"刚更新"。老 valuation.json 没这个键，缺了就不写日期。
+_asof = d["meta"].get("data_latest")
+STALE = (f"；仍为 XBRL 窗口（至 {_asof}），不含最新季度" if _asof
+         else "；仍为 XBRL 窗口，不含最新季度") if d.get("rev0_note") else ""
+
 if MODE == "financials":
     # ============================================================
     # 金融股工作簿：摘要 / 情景假设 / PTBV敏感性 / 历史数据 / 出处
@@ -102,9 +113,11 @@ if MODE == "financials":
 
     put(ws, "A13", "关键事实（SEC XBRL / 财报原文，勿改）", H2, border=False)
     facts_rows = [
-        ("TTM 总净收入 ($M)", d["ttm"]["revenue"], "含净利息收入的总净收入口径"),
-        ("TTM 税前利润 ($M)", d["ttm"]["pretax_income"], "银行不申报营业利润，以税前利润代之"),
-        ("TTM 报告净利 ($M)", d["ttm"]["net_income"], "含一次性项目的账面口径"),
+        ("TTM 总净收入 ($M)", d["ttm"]["revenue"],
+         d.get("rev0_note") or "含净利息收入的总净收入口径"),
+        ("TTM 税前利润 ($M)", d["ttm"]["pretax_income"],
+         "银行不申报营业利润，以税前利润代之" + STALE),
+        ("TTM 报告净利 ($M)", d["ttm"]["net_income"], "含一次性项目的账面口径" + STALE),
         ("TTM 调整后净利 ($M)", d["adj_ni"], d["adj_note"]),
         ("有形账面价值 TBV ($M)", M["tbv"],
          f"股东权益−商誉−无形资产（XBRL {M['tbv_asof']} 时点）"),
@@ -372,10 +385,14 @@ put(ws, "A18", "关键事实（SEC XBRL / 财报原文，勿改）", H2, border=
 facts_rows = [
     ("TTM 营收 ($M)", d["ttm"]["revenue"],
      d.get("rev0_note") or "XBRL 最近四个离散季度加总"),
-    ("TTM 营业利润 ($M)", d["ttm"]["op_income"], "同上"),
-    ("TTM 报告净利 ($M)", d["ttm"]["net_income"], "含一次性项目的账面口径"),
+    # override 生效时上一行的说明变成了营收的原文出处，"同上"会顺带宣称营业利润
+    # 也来自滚动后的新闻稿——那时必须写回 XBRL 口径并标窗口
+    ("TTM 营业利润 ($M)", d["ttm"]["op_income"],
+     ("XBRL 最近四个离散季度加总" + STALE) if STALE else "同上"),
+    ("TTM 报告净利 ($M)", d["ttm"]["net_income"], "含一次性项目的账面口径" + STALE),
     ("TTM 调整后净利 ($M)", d["adj_ni"], d["adj_note"]),
-    ("TTM 经营现金流 ($M)", d["ttm"]["cfo"], "年度 + YTD 差额口径（10-Q现金流表为累计值）"),
+    ("TTM 经营现金流 ($M)", d["ttm"]["cfo"],
+     "年度 + YTD 差额口径（10-Q现金流表为累计值）" + STALE),
     ("TTM 资本开支 ($M)", d["ttm"]["capex"], "同上"),
     (None, None, "CFO - Capex"),
     ("净现金 ($M)", d["meta"]["net_cash"], d["net_cash_note"]),

@@ -80,6 +80,20 @@ def _scenario_eps(d: dict, s: dict, rev0: float) -> float:
     return ni / d["fwd_shares"]
 
 
+def _check_rev_override(d: dict) -> None:
+    """ttm_revenue_override 的类型/配对校验——两个模式共用。
+
+    engine 会拿它整体替换情景营收基准（rev0），无出处的覆盖等于让判断层
+    静默改写事实层，所以 note 是硬要求。曾经这段只长在 standard 路径上，
+    financials 提前 return 直接跳过——共用一个函数是为了不再漂移。"""
+    if "ttm_revenue_override" not in d:
+        return
+    if not isinstance(d["ttm_revenue_override"], (int, float)) or d["ttm_revenue_override"] <= 0:
+        raise ValueError("ttm_revenue_override 必须是正数（$M）")
+    if not d.get("ttm_revenue_note"):
+        raise ValueError("提供 ttm_revenue_override 时必须附 ttm_revenue_note（出处）")
+
+
 def _validate_judgment(d: dict, mode: str = "standard",
                        rev0: float | None = None,
                        fcf_margin: float | None = None) -> None:
@@ -117,11 +131,7 @@ def _validate_judgment(d: dict, mode: str = "standard",
             raise ValueError(f"rationale 缺少 {k}")
     if not isinstance(d["notes"], list) or not d["notes"]:
         raise ValueError("notes 必须是非空数组")
-    if "ttm_revenue_override" in d:
-        if not isinstance(d["ttm_revenue_override"], (int, float)) or d["ttm_revenue_override"] <= 0:
-            raise ValueError("ttm_revenue_override 必须是正数（$M）")
-        if not d.get("ttm_revenue_note"):
-            raise ValueError("提供 ttm_revenue_override 时必须附 ttm_revenue_note（出处）")
+    _check_rev_override(d)
     for sc in ("bear", "base", "bull"):
         if sc not in d["scenarios"]:
             raise ValueError(f"缺少情景 {sc}")
@@ -207,6 +217,7 @@ def _validate_judgment_financials(d: dict) -> None:
             raise ValueError(f"rationale 缺少 {k}")
     if not isinstance(d["notes"], list) or not d["notes"]:
         raise ValueError("notes 必须是非空数组")
+    _check_rev_override(d)
     for sc in ("bear", "base", "bull"):
         if sc not in d["scenarios"]:
             raise ValueError(f"缺少情景 {sc}")
@@ -449,26 +460,41 @@ async def _pipeline(job: dict, ticker: str, email: str) -> None:
         caliber += (f"\n口径说明：申报货币 {facts['currency']}，FACTS 已按现汇 "
                     f"{facts.get('fx_to_usd', 1):.5f} 折算美元（恒定汇率）；"
                     "历史增长率不受影响，绝对值以美元理解。")
+    # financials 模式的营收口径是 RevenuesNetOfInterestExpense（净息后总净收入），
+    # 照抄 standard 的"营收"会让判断层去取利息总收入或非 GAAP 的"调整后净收入"
+    fin = mode == "financials"
+    rev_term = "TTM 总净收入（净利息收入+非息收入）" if fin else "TTM 营收"
     stale_days = 0
     if facts.get("data_latest"):
         stale_days = (date.today() - date.fromisoformat(facts["data_latest"])).days
         caliber += (f"\nXBRL 结构化数据最新期末为 {facts['data_latest']}；"
                     "若 SECTIONS 财报原文里有更新的季度数字，以原文为准做前瞻判断。")
-        if stale_days > 550 and mode == "standard":
-            caliber += ("数据已严重滞后：你必须按财报原文推出真实 TTM 营收，"
+        if stale_days > 550:
+            caliber += (f"数据已严重滞后：你必须按财报原文推出真实 {rev_term}，"
                         "输出 ttm_revenue_override（$M）与 ttm_revenue_note（出处），"
                         "并把所有 g 锚定在该基准上——缺失会被拒绝重试。")
-    if pending_8k and mode == "standard":
+    # mode 门禁已移除（2026-07-30）：PENDING_10Q 窗口正是为"10-Q 滞后业绩公布
+    # 2-6 周"设计的，而那类发行人（银行/券商/fintech）全部走 financials——
+    # 此前 financials 检测到 pending_8k 却拿不到指令，静默按上一季度基准估值
+    if pending_8k:
         caliber += (
             f"\n⚠ PENDING_10Q：该公司 {pending_8k['filingDate']} 已公布业绩"
             "（SECTIONS 含其 8-K EX-99.1 新闻稿摘录，**未经审计、可能混非 GAAP"
             "口径**），但 10-Q 尚未提交——FACTS 的 XBRL/TTM 不含最新季度。你必须：\n"
-            "1) 前瞻判断（g/opm/指引）以新闻稿里的最新季度 **GAAP** 数字为准；\n"
-            "2) 用新闻稿计算真实 TTM 营收并输出 ttm_revenue_override（$M）与"
-            " ttm_revenue_note（公式=旧TTM − 去年同季 + 本季，写明数字出处）"
-            "——缺失会被拒绝重试；\n"
-            "3) 除营收基准外，勿把新闻稿数字与旧 XBRL 混算其他比率；"
-            "非 GAAP 数字仅作定性参考。")
+            + (f"1) 前瞻判断（g/nm/信贷质量/指引）以新闻稿里的最新季度 **GAAP** 数字为准；\n"
+               if fin else
+               "1) 前瞻判断（g/opm/指引）以新闻稿里的最新季度 **GAAP** 数字为准；\n")
+            + f"2) 用新闻稿计算真实 {rev_term}并输出 ttm_revenue_override（$M）与"
+              " ttm_revenue_note（公式=旧TTM − 去年同季 + 本季，写明数字出处）"
+              "——缺失会被拒绝重试；"
+            + ("口径须与 FACTS 的总净收入一致：净利息收入（**已扣利息支出**）+ 非息收入，"
+               "不是利息总收入，也不是新闻稿标题常用的『调整后净收入』/EBITDA 等非 GAAP 汇总；"
+               "新闻稿若只突出非 GAAP 或分部数字，取 GAAP 利润表页的合计行；\n" if fin else "\n")
+            + (f"3) 除{rev_term}基准外，勿把新闻稿数字与旧 XBRL 混算其他比率"
+               "（TBV/ROTE 仍以 XBRL 时点的股东权益为准）；非 GAAP 数字仅作定性参考。"
+               if fin else
+               "3) 除营收基准外，勿把新闻稿数字与旧 XBRL 混算其他比率；"
+               "非 GAAP 数字仅作定性参考。"))
     # 假设连续性（v2 起默认开启，2026-07-22）：无新证据不得改数、改数必须留痕，
     # 把运行间采样噪声（NVDA 实测三次 bear 综合 $29-$77）转化为可审计的假设变更记录。
     # 来源优先级：VALUATION_PREV_CONFIG 显式指定 > prev_configs/{ticker}.json 自动持久化。
@@ -542,13 +568,14 @@ async def _pipeline(job: dict, ticker: str, email: str) -> None:
             # 陈旧 XBRL（外国发行人 6-K 无季度框架）下，没有原文重锚的 TTM 会让
             # 全部情景锚在多年前的营收基准上——硬性要求判断层给 override。
             # PENDING_10Q（业绩 8-K 已出、10-Q 未交）同理：不重锚等于用上季度
-            # 基准估一家刚发完财报的公司
-            if (mode == "standard" and (stale_days > 550 or pending_8k)
+            # 基准估一家刚发完财报的公司。两模式同权，且与上面的注入条件严格
+            # 同源——注入与强制若走不同门禁，会出现"没要求却拒收"的死循环
+            if ((stale_days > 550 or pending_8k)
                     and not judgment.get("ttm_revenue_override")):
                 raise ValueError(
                     ("PENDING_10Q：业绩新闻稿已在 SECTIONS，" if pending_8k
                      else f"XBRL 数据滞后（最新期末 {facts.get('data_latest')}）：")
-                    + "必须按财报原文提供 ttm_revenue_override（TTM 营收 $M）与 ttm_revenue_note")
+                    + f"必须按财报原文提供 ttm_revenue_override（{rev_term} $M）与 ttm_revenue_note")
             break
         except (ValueError, json.JSONDecodeError, TypeError, KeyError,
                 ZeroDivisionError) as e:
@@ -604,7 +631,7 @@ async def _pipeline(job: dict, ticker: str, email: str) -> None:
                                fcf_margin=fcfm)
             # 陈旧 XBRL / PENDING_10Q 的强制 override 在复审通道同样成立——revised
             # 整体替换 judgment，若复审输出丢掉 override，全部情景会锚回旧营收基准
-            if (mode == "standard" and (stale_days > 550 or pending_8k)
+            if ((stale_days > 550 or pending_8k)
                     and not revised.get("ttm_revenue_override")):
                 raise ValueError("复审输出丢失 ttm_revenue_override（陈旧 XBRL/PENDING_10Q 下必须保留）")
             judgment = revised
