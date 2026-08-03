@@ -311,7 +311,7 @@ if any((ttm.get(k) or {}).get("value") is None for k in INCOME_ITEMS):
 if MODE == "financials" and not out.get("equity_instant"):
     problems.append("缺股东权益时点数据，P/TBV 法无法计算")
 if out["data_latest"]:
-    staleness = (date(2000, 1, 1).today() - date.fromisoformat(out["data_latest"])).days
+    staleness = (date.today() - date.fromisoformat(out["data_latest"])).days
     if staleness > 550:
         warnings.append(f"最新申报期为 {out['data_latest']}（{staleness} 天前）——"
                         "外国发行人 6-K 无 XBRL 时结构化数据只到上一份年报，"

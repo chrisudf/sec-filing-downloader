@@ -144,8 +144,10 @@ def _validate_judgment(d: dict, mode: str = "standard",
         # 上界随当前实际 FCF 利润率放宽（特许权/授权类公司 TTM FCF 率本身可 >65%，
         # 静态上界会连"维持现状"的路径都拒绝，两次 retry 撞同一堵墙后硬失败）
         m_cap = max(0.65, min(0.9, 1.2 * fcf_margin)) if fcf_margin else 0.65
-        if not all(isinstance(m, (int, float)) and -0.3 < m < m_cap for m in s["margins"]):
-            raise ValueError(f"{sc}.margins 必须是 (-0.3, {m_cap:.2f}) 内的数字（FCF 利润率）")
+        # 上界含等号，与 prompt / TUNING.md 的 (-0.3, cap] 一致：模型给恰好等于上界
+        # 的值（如 0.65）不该被误拒触发无谓 retry
+        if not all(isinstance(m, (int, float)) and -0.3 < m <= m_cap for m in s["margins"]):
+            raise ValueError(f"{sc}.margins 必须是 (-0.3, {m_cap:.2f}] 内的数字（FCF 利润率）")
         if not 0.05 <= s["wacc"] <= 0.2:
             raise ValueError(f"{sc}.wacc 越界")
         if s["wacc"] - s["tg"] < 0.045:
@@ -210,6 +212,13 @@ def _validate_judgment_financials(d: dict) -> None:
     for k in need:
         if k not in d:
             raise ValueError(f"缺少字段 {k}")
+    # 顶层数值校验（与 standard 一致）：engine financials 分支直接 ni1/fwd_shares、
+    # adj_ni/shares——fwd_shares 若为 "100"（字符串）会 TypeError、为 0 会 ZeroDivisionError，
+    # 在花完 LLM 调用后才在引擎阶段崩，这里提前拒绝
+    if not isinstance(d["fwd_shares"], (int, float)) or d["fwd_shares"] <= 0:
+        raise ValueError("fwd_shares 必须为正数（百万股）")
+    if not isinstance(d["adj_ni"], (int, float)):
+        raise ValueError("adj_ni 必须是数字（$M）")
     if not isinstance(d["rationale"], dict):
         raise ValueError("rationale 必须是对象")
     for k in ("g", "nm", "pe", "ptbv", "wacc"):

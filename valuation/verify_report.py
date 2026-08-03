@@ -24,7 +24,7 @@ def get(sheet, cell):
         return float(v[0][0])
     except Exception:
         # 标量结果（含 numpy 整型/浮点）不可下标，float() 归一化后再比较；
-        # 真正的非数值（XlError、字符串）保持原样，由 isinstance 判 FAIL
+        # 无法转成 float 的值（XlError、非数字字符串）保持原样，由 isinstance 判 FAIL
         try:
             return float(v)
         except Exception:
