@@ -88,7 +88,8 @@ async def _ticker_map(client: httpx.AsyncClient) -> dict[str, dict]:
 
 async def _submissions(client: httpx.AsyncClient, ticker: str) -> tuple[int, dict]:
     mapping = await _ticker_map(client)
-    entry = mapping.get(ticker)
+    # SEC 映射表对分级股用连字符（BRK-B / BF-B），用户习惯输入 BRK.B
+    entry = mapping.get(ticker) or mapping.get(ticker.replace(".", "-"))
     if entry is None:
         raise EdgarError(404, f"SEC EDGAR 中未找到股票代码 {ticker}")
     cik = int(entry["cik_str"])
@@ -108,7 +109,13 @@ def quarter_end(year: int, quarter: int) -> date:
 
 def _rows(block: dict) -> list[dict]:
     keys = ("accessionNumber", "form", "filingDate", "reportDate", "primaryDocument", "size")
-    return [{k: block[k][i] for k in keys} for i in range(len(block["form"]))]
+    out = [{k: block[k][i] for k in keys} for i in range(len(block["form"]))]
+    # items 仅 8-K 类表单有意义（"2.02"=业绩公告）；旧分页文件可能缺该数组
+    items = block.get("items")
+    if items:
+        for i, r in enumerate(out):
+            r["items"] = items[i] if i < len(items) else ""
+    return out
 
 
 def _is_quarter_end(d: str) -> bool:
@@ -166,16 +173,21 @@ async def _list_filings(
 ) -> list[dict]:
     rows = _rows(subs["filings"]["recent"])
 
-    # recent 只含最近约 1000 条，更早的按需拉分页文件
+    # recent 只含最近约 1000 条，更早的按需拉分页文件。
+    # 分页按 filingDate 索引，而下面按 reportDate 过滤：财报在报告期结束后才提交
+    # （10-K 可晚 2-3 个月），窗口需向后放宽，否则报告期在区间尾部的老财报会被漏掉
+    fetch_until = (dend + timedelta(days=400)).isoformat()
     for extra in subs["filings"].get("files", []):
-        if extra["filingTo"] >= dstart.isoformat() and extra["filingFrom"] <= dend.isoformat():
+        if extra["filingTo"] >= dstart.isoformat() and extra["filingFrom"] <= fetch_until:
             older = await _get_json(client, SUBMISSIONS_URL.format(name=extra["name"]))
             rows += _rows(older)
 
     picked = []
+    seen_acc: set[str] = set()
     for row in rows:
-        if row["form"] not in forms:
+        if row["form"] not in forms or row["accessionNumber"] in seen_acc:
             continue
+        seen_acc.add(row["accessionNumber"])
         basis = row["reportDate"] or row["filingDate"]
         try:
             d = date.fromisoformat(basis)
@@ -206,14 +218,60 @@ async def build_zip(
         return await _pack(client, cik, ticker, picked)
 
 
+def _pending_earnings_8k(rows: list[dict], picked: list[dict]) -> dict | None:
+    """业绩已公布(Item 2.02 的 8-K)、但对应 10-Q/10-K 还没交时,返回那份 8-K。
+
+    业绩公布走 8-K(新闻稿在 EX-99 附件),10-Q 大科技隔 0-2 天、银行/中盘
+    2-6 周后才交——这个窗口里"最新定期报告"整整落后一个季度且时效块不报警。
+    判据:最新的 items 含 2.02 的 8-K,其 filingDate 晚于所有已选定期报告。"""
+    if not picked:
+        return None
+    latest_periodic = max(r["filingDate"] for r in picked)
+    earn = [r for r in rows
+            if r["form"] == "8-K" and "2.02" in (r.get("items") or "")]
+    if not earn:
+        return None
+    newest = max(earn, key=lambda r: r["filingDate"])
+    return newest if newest["filingDate"] > latest_periodic else None
+
+
+async def _8k_press_release(client: httpx.AsyncClient, cik: int, acc: str,
+                            primary: str) -> str | None:
+    """8-K 的业绩新闻稿附件:优先文件名含 99·1 的(EX-99.1),否则取最大的
+    htm 附件(新闻稿远大于 8-K 封面);跳过 EX-99.2 投资者演示等。"""
+    try:
+        idx = await _get_json(client, INDEX_URL.format(cik=cik, acc=acc))
+        items = idx.get("directory", {}).get("item", [])
+    except Exception:
+        return None
+    cands = []
+    for it in items:
+        name = it.get("name", "")
+        low = name.lower()
+        if name == primary or "index" in low or not low.endswith((".htm", ".html")):
+            continue
+        cands.append((name, int(it.get("size") or 0)))
+    if not cands:
+        return None
+    import re as _re
+    ex991 = [c for c in cands if _re.search(r"99[._-]?1|ex99\b|exhibit99", c[0].lower())]
+    pool = ex991 or cands
+    return max(pool, key=lambda c: c[1])[0]
+
+
 async def build_zip_latest(
-    ticker: str, email: str, form_groups: list[tuple[str, ...]], count: int
+    ticker: str, email: str, form_groups: list[tuple[str, ...]], count: int,
+    include_pending_8k: bool = False,
 ) -> tuple[bytes, int]:
     """每组表单（季报组/年报组）各取最新 count 份，打包返回。
 
     按报告期倒序取，10-K/20-F、10-Q/6-K 同组互斥（美国公司只会有前者，
     外国发行人只会有后者），所以组内直接取最新即可。
     注意：6-K 里最新的一份未必是业绩公告（可能是新闻稿），智能过滤在路线图里。
+
+    include_pending_8k=True（估值管道用）：若业绩 8-K 比最新定期报告新
+    （PENDING_10Q 状态），把它的 EX-99.1 新闻稿一并打包——一旦 10-Q 提交,
+    该状态自动消失,行为回到只打包定期报告。
     """
     ticker = ticker.strip().upper()
     async with _client(email) as client:
@@ -237,6 +295,10 @@ async def build_zip_latest(
 
         if not picked:
             raise EdgarError(404, "没有找到符合条件的财报文件")
+        if include_pending_8k and not os.environ.get("VALUATION_NO_8K"):
+            pending = _pending_earnings_8k(rows, picked)
+            if pending:
+                picked.append(pending)
         picked.sort(key=lambda r: r["reportDate"] or r["filingDate"])
         return await _pack(client, cik, ticker, picked)
 
@@ -268,6 +330,37 @@ async def _pack(
     with zipfile.ZipFile(buf, "w", zipfile.ZIP_DEFLATED) as zf:
         for row in picked:
             acc = row["accessionNumber"].replace("-", "")
+
+            if row["form"] == "8-K":
+                # 业绩 8-K:封面正文无内容,只带 EX-99.1 新闻稿。
+                # reportDate 用 8-K 的事件日(=公布日),天然触发估值层的
+                # "出现新报告期"连续性失效——新财报就是新证据。
+                ex = await _8k_press_release(client, cik, acc, row["primaryDocument"])
+                if not ex:
+                    continue
+                ex_url = DOC_URL.format(cik=cik, acc=acc, doc=ex)
+                await asyncio.sleep(REQUEST_GAP)
+                ex_resp = await client.get(ex_url)
+                if ex_resp.status_code != 200:
+                    continue
+                period = row["reportDate"] or row["filingDate"]
+                ex_name = f"{ticker}_8-K_{period}_ex_{ex.rsplit('/', 1)[-1]}"
+                if ex_name in used:
+                    ex_name = f"{ticker}_8-K_{period}_{acc[-6:]}_ex_{ex.rsplit('/', 1)[-1]}"
+                used.add(ex_name)
+                zf.writestr(ex_name, ex_resp.content)
+                manifest.append(
+                    {
+                        "file": ex_name,
+                        "form": "8-K (exhibit 99.1, 业绩新闻稿, 未经审计)",
+                        "reportDate": row["reportDate"],
+                        "filingDate": row["filingDate"],
+                        "accessionNumber": row["accessionNumber"],
+                        "sourceUrl": ex_url,
+                    }
+                )
+                continue
+
             # 早期文件没有 primaryDocument，退回完整提交文本
             doc = row["primaryDocument"] or f"{row['accessionNumber']}.txt"
             url = DOC_URL.format(cik=cik, acc=acc, doc=doc)
@@ -303,6 +396,9 @@ async def _pack(
                     if ex_resp.status_code != 200:
                         continue
                     ex_name = f"{ticker}_6-K_{period}_ex_{ex.rsplit('/', 1)[-1]}"
+                    if ex_name in used:
+                        # 不同提交的附件可能同名（如 ex99-1.htm），加 accession 后缀而不是丢弃
+                        ex_name = f"{ticker}_6-K_{period}_{acc[-6:]}_ex_{ex.rsplit('/', 1)[-1]}"
                     if ex_name in used:
                         continue
                     used.add(ex_name)

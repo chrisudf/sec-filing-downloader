@@ -165,8 +165,15 @@ $env:SEC_EMAIL = "you@example.com"                       # 或环境变量（仅
 ### `POST /api/valuation` → `{job_id}`
 
 `{"ticker": "NVDA"}` 提交估值任务（单并发）。
-判断层默认走本机 Claude Code（`claude -p`，需先 `claude /login`；路径可用 `CLAUDE_CLI_PATH` 覆盖，
-整个判断层命令可用 `VALUATION_JUDGMENT_CMD` 替换成任何"stdin 进 prompt、stdout 出 JSON"的程序）。
+判断层默认走本机 Claude Code（`claude -p --model opus`，需先 `claude /login`；模型可用
+`VALUATION_MODEL` 覆盖——默认 opus 因 sonnet 判断层同输入采样全距实测达 25.7%，
+路径可用 `CLAUDE_CLI_PATH` 覆盖，整个判断层命令可用 `VALUATION_JUDGMENT_CMD` 替换成
+任何"stdin 进 prompt、stdout 出 JSON"的程序）。
+
+假设连续性（v2，2026-07-22 起**默认开启**，仅 standard 模式自动持久化）：每次 gate-clean
+（无诊断红旗）的假设留档自动持久化到 `prev_configs/{ticker}.json`，下次运行注入判断层
+并要求"无新证据不改数、改数必须留痕"。出现新报告期 / 现价变动 >15% / 语义版本不符时
+自动作废重建。`VALUATION_NO_CONTINUITY=1` 关闭；`VALUATION_PREV_CONFIG=<path>` 显式指定基准文件。
 
 ### `GET /api/valuation/{job_id}` / `GET /api/valuation/{job_id}/result`
 

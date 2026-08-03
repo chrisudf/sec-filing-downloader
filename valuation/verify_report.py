@@ -23,10 +23,42 @@ def get(sheet, cell):
     try:
         return float(v[0][0])
     except Exception:
-        return v
+        # 标量结果（含 numpy 整型/浮点）不可下标，float() 归一化后再比较；
+        # 无法转成 float 的值（XlError、非数字字符串）保持原样，由 isinstance 判 FAIL
+        try:
+            return float(v)
+        except Exception:
+            return v
 
 
 S = d["scenarios"]
+if d.get("mode") == "financials":
+    # 金融股布局：PE 法 + P/TBV 法（行号见 build_report 金融股分支）
+    checks = [
+        ("TTM调整后EPS", ("情景假设", "B20"), d["adj_eps"], 0.02),
+        ("每股TBV", ("情景假设", "B21"), d["meta"]["tbv_ps"], 0.02),
+    ]
+    for col, sc in zip("BCD", ("bear", "base", "bull")):
+        checks += [
+            (f"{sc} EPS1", ("情景假设", f"{col}27"), S[sc]["eps1"], 0.02),
+            (f"{sc} PE目标", ("情景假设", f"{col}28"), S[sc]["pe_target"], 0.5),
+            (f"{sc} PTBV目标", ("情景假设", f"{col}31"), S[sc]["ptbv_ps"], 0.5),
+            (f"{sc} justified参考", ("情景假设", f"{col}32"), S[sc]["justified_ps"], 1.0),
+        ]
+    checks += [
+        ("bull 综合", ("摘要", "D21"), S["bull"]["blend"], 0.5),
+        ("base 综合", ("摘要", "D22"), S["base"]["blend"], 0.5),
+        ("bear 综合", ("摘要", "D23"), S["bear"]["blend"], 0.5),
+    ]
+    fails = 0
+    for name, (sheet, cell), expected, tol in checks:
+        got = get(sheet, cell)
+        ok = isinstance(got, (int, float)) and abs(float(got) - expected) <= tol
+        fails += 0 if ok else 1
+        print(f"{'OK ' if ok else 'FAIL'} {T} {name:14s} 表内={got}  引擎={expected}")
+    print(f"\n{T} 结果:", "全部一致 ✓" if fails == 0 else f"{fails} 项不一致 ✗")
+    sys.exit(1 if fails else 0)
+
 checks = [
     ("TTM调整后EPS", ("情景假设", "B28"), d["adj_eps"], 0.02),
     ("bear EPS1", ("情景假设", "B34"), S["bear"]["eps1"], 0.02),
@@ -48,7 +80,7 @@ checks = [
 fails = 0
 for name, (sheet, cell), expected, tol in checks:
     got = get(sheet, cell)
-    ok = isinstance(got, float) and abs(got - expected) <= tol
+    ok = isinstance(got, (int, float)) and abs(float(got) - expected) <= tol
     fails += 0 if ok else 1
     print(f"{'OK ' if ok else 'FAIL'} {T} {name:12s} 表内={got}  引擎={expected}")
 print(f"\n{T} 结果:", "全部一致 ✓" if fails == 0 else f"{fails} 项不一致 ✗")

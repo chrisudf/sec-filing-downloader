@@ -363,14 +363,30 @@ $("valBtn").addEventListener("click", async () => {
       throw new Error(body.detail || `提交失败（HTTP ${res.status}）`);
     }
     const { job_id } = await res.json();
+    let pollErrors = 0;
     while (true) {
       await new Promise(r => setTimeout(r, 4000));
-      const st = await (await fetch(`/api/valuation/${job_id}`)).json();
+      let st;
+      try {
+        const stRes = await fetch(`/api/valuation/${job_id}`);
+        if (stRes.status === 404) throw new Error("任务已丢失（服务可能重启过），请重新提交");
+        if (!stRes.ok) throw new Error(`查询状态失败（HTTP ${stRes.status}）`);
+        st = await stRes.json();
+        pollErrors = 0;
+      } catch (e) {
+        // 偶发网络抖动容忍 3 次，任务丢失（404）直接终止。
+        // 抛出值可能不是 Error（个别环境 fetch 的拒绝原因），先归一化再读文本
+        const msg = (e && e.message) || String(e);
+        if (msg.includes("任务已丢失") || ++pollErrors >= 3) throw new Error(msg);
+        continue;
+      }
       if (st.status === "failed") throw new Error(st.error || "任务失败");
       if (st.status === "done") {
         const parts = Object.entries(st.summary || {}).map(
           ([k, v]) => `${k} $${v.blend}（${(v.upside * 100).toFixed(0)}%）`);
-        const blob = await (await fetch(`/api/valuation/${job_id}/result`)).blob();
+        const resultRes = await fetch(`/api/valuation/${job_id}/result`);
+        if (!resultRes.ok) throw new Error(`下载报告失败（HTTP ${resultRes.status}）`);
+        const blob = await resultRes.blob();
         const a = document.createElement("a");
         a.href = URL.createObjectURL(blob);
         a.download = `${ticker}_valuation_bundle.zip`;
@@ -382,7 +398,7 @@ $("valBtn").addEventListener("click", async () => {
       setValStatus("busy", st.step_label || st.step);
     }
   } catch (e) {
-    setValStatus("err", e.message);
+    setValStatus("err", (e && e.message) || String(e));
   } finally {
     $("valBtn").disabled = false;
   }
