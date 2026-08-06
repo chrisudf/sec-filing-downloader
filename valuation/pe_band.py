@@ -13,7 +13,7 @@
   2. 逐财年实现 PE（低/中/高）——用来核对某条带子是否真的框住了每一年
   3. --match 的逆向匹配——回答「这组 PE 带是按什么规则定出来的」
 
-三个会静默出错的地方，都已处理：
+四个会静默出错的地方，都已处理：
 - **防前视**：某交易日的 PE 用「当天已经公告的」TTM EPS，按 XBRL 的 filed 日切换，
   不是按报告期末。用期末会让 PE 带假性收窄（把还没公布的业绩提前算进去）。
 - **TTM EPS = TTM 净利 ÷ 四季平均稀释股数**：EPS 和加权平均股数都不可跨季加总
@@ -21,13 +21,17 @@
 - **拆股归一**：yfinance 的 Close 已按拆股调整，XBRL 的股数未必（companyfacts 只在
   后续财报把该期做比较期时才追溯重述）。按拆股日检测股数序列有无跳变再决定是否回补，
   否则 AAPL 4:1 / AMZN 20:1 这类会把拆股前整段 PE 算错一个数量级。
+- **一次性畸变双侧剔除**：near-zero 地板只挡分母塌缩，挡不住分母膨胀——巨额一次性
+  收益（AMZN 2026Q2 $53.4B Anthropic 重估）会把实现 EPS 吹大、PE 假性变低，带子的
+  min/P10 被拉低后 engine 的越界诊断恰好在最该响的票上失灵。按「单季净利偏离同窗
+  中位季 > ANOM_K 倍」双侧判定并整窗剔除，照 near_zero 惯例留痕。
 """
 import argparse
 import bisect
 import json
 import statistics
 import sys
-from datetime import date
+from datetime import date, timedelta
 
 import httpx
 
@@ -36,6 +40,19 @@ import httpx
 # （MSFT 末点显示 39.7x，实际应为 30.2x）——分布统计走 compute_band 未受影响，
 # 但展示层的数直接是错的。
 BASIS_KEY = {"forward": "pe_forward", "trailing": "pe_trailing", "ntm": "pe_ntm"}
+
+# 一次性畸变窗口判定：单季净利偏离同窗中位季超过 ANOM_K 倍（双侧）。校准点
+# （AMZN 真实数据实测）：2026-06-30 窗口（2025Q3~2026Q2，末季含 ~$42B 税后
+# Anthropic 重估）偏离 1.40 倍——1.5 恰好漏掉动机案例，故取 1.25；正常零售
+# 季节性（Q4 高 ~40%）偏离 <0.5 倍，2023-2025 干净窗口实测 ≤0.4 倍，余量充足。
+# 已知代价：4 季内利润 >3 倍的超高速 ramp（NVDA 2023 型）窗口可能被误标——
+# 那类窗口本身 PE 离散度极大，剔除且留痕好过静默混入。判定只用净利自身的
+# 截面形状，不引入营业利润等第二科目，保持模块零额外取数。
+# 第二个已知代价：判定是「相对同窗中位季」的，窗口自身中位季趋零时（周期底/
+# 微利期）任一正常季都能越过 1.25 倍门槛，整段谷底窗口会被剔。方向上与
+# near-zero 地板一致（都认为分母不代表盈利能力），且全量留痕可核对，故不额外
+# 加绝对量级门槛——真要放宽，改这里而不是调 K（K 是按畸变幅度校准的）。
+ANOM_K = 1.25
 
 NI_TAGS = ["NetIncomeLoss", "ProfitLossAttributableToOwnersOfParent", "ProfitLoss"]
 SH_TAGS = ["WeightedAverageNumberOfDilutedSharesOutstanding",
@@ -151,7 +168,13 @@ def normalize_splits(shares, splits):
 
 
 def build_ttm_eps(ni_q, sh_q):
-    """滚动四季 TTM EPS，附「最早可知日」= 四个季度里最晚的 filed 日。"""
+    """滚动四季 TTM EPS，附「最早可知日」= 四个季度里最晚的 filed 日。
+
+    附一次性畸变标记（anomalous）：单季净利偏离同窗中位季 > ANOM_K 倍即整窗标记。
+    双侧判定——巨额一次性收益把 EPS 吹大（PE 假低）和巨额减值把 EPS 打穿（PE 假高）
+    是同一种"分母不代表盈利能力"，near-zero 地板只挡得住后者的极端形态。标记不删点
+    （删点会让 ntm 配对的 i+4 错位），由消费侧跳过并计数。
+    """
     pts, qs = [], sorted(ni_q.items())
     for i in range(3, len(qs)):
         window = qs[i - 3:i + 1]
@@ -168,11 +191,24 @@ def build_ttm_eps(ni_q, sh_q):
                     max(s["first_filed"] for s in sh))
         if not known:
             continue
+        vals = {k: v["val"] for k, v in window}
+        med = statistics.median(vals.values())
+        anom_q, dev = max(((k, abs(x - med)) for k, x in vals.items()),
+                          key=lambda t: t[1])
+        anomalous = bool(med) and dev > ANOM_K * abs(med)
         pts.append({"period_end": window[-1][0], "known_from": known,
                     "ttm_ni": sum(v["val"] for _, v in window),
                     "avg_diluted_shares": avg_sh,
-                    "ttm_eps": sum(v["val"] for _, v in window) / avg_sh})
+                    "ttm_eps": sum(v["val"] for _, v in window) / avg_sh,
+                    "anomalous": anomalous,
+                    "anom_q": anom_q if anomalous else None})
     return sorted(pts, key=lambda p: p["known_from"])
+
+
+def years_ago(n):
+    """date.today() 往回 n 年。不用 replace(year=)——闰日运行时目标年 2/29 多半
+    不存在，ValueError 会让整条带子在每个 2 月 29 日全天缺席。"""
+    return date.today() - timedelta(days=round(365.25 * n))
 
 
 def pctile(sv, p):
@@ -235,6 +271,19 @@ def compute_band(ticker, email, years=5, basis="forward", include_series=False):
     fy_ends = sorted(ni_a)
     # 亏损年 PE 无意义，整年从分布里剔除——不说出来的话会被当成"数据缺了一段"
     dropped = [e for e in fy_ends if e not in eps_fy and e >= str(date.today().year - years)]
+    # 财年层面的一次性畸变（forward 口径的对应物）：FY 含畸变季则该年实现 EPS 同样
+    # 不代表盈利能力，与亏损年同等处置——整年剔除并单独留痕
+    anom_fys = []
+    for e in list(eps_fy):
+        ae = date.fromisoformat(e)
+        qv = [v["val"] for k, v in ni_q.items()
+              if 0 <= (ae - date.fromisoformat(k)).days < 340]
+        if len(qv) != 4:
+            continue
+        med = statistics.median(qv)
+        if med and max(abs(x - med) for x in qv) > ANOM_K * abs(med):
+            del eps_fy[e]
+            anom_fys.append(e)
 
     def fy_of(d):
         i = bisect.bisect_left(fy_ends, d)
@@ -246,17 +295,23 @@ def compute_band(ticker, email, years=5, basis="forward", include_series=False):
     # 切，只在 report_end = 财年末时才与 engine 重合（MSFT 是，AMZN 的 Q2 报告期
     # 不是）。要让 engine 的目标 PE 与历史分位严格可比，就得用这一档。
     by_end = sorted(pts, key=lambda p: p["period_end"])
-    ntm_after = {}
+    ntm_after, ntm_anom = {}, set()
     for i in range(len(by_end) - 4):
         a, b = by_end[i], by_end[i + 4]
         da = date.fromisoformat(a["period_end"])
         db = date.fromisoformat(b["period_end"])
         if 350 <= (db - da).days <= 380 and b["ttm_eps"] > 0:
-            ntm_after[a["period_end"]] = b["ttm_eps"]
+            # ntm 的分母是未来窗口 b：b 含一次性畸变季（如 AMZN 2026Q2 的重估收益）
+            # 时该分母不代表盈利能力，整段映射剔除并在消费侧按天计数
+            if b.get("anomalous"):
+                ntm_anom.add(a["period_end"])
+            else:
+                ntm_after[a["period_end"]] = b["ttm_eps"]
 
-    start = (date.today().replace(year=date.today().year - years)).isoformat()
+    start = years_ago(years).isoformat()
     knowns = [p["known_from"] for p in pts]
     series = []
+    anom_days = {"trailing": 0, "ntm": 0}
     for ts, row in hist.iterrows():
         d = ts.date().isoformat()
         if d < start:
@@ -265,13 +320,22 @@ def compute_band(ticker, email, years=5, basis="forward", include_series=False):
         rec = {"date": d, "close": px}
         i = bisect.bisect_right(knowns, d) - 1
         if i >= 0 and pts[i]["ttm_eps"] > 0:
-            rec["pe_trailing"] = px / pts[i]["ttm_eps"]
-            rec["ttm_eps"] = pts[i]["ttm_eps"]
-            rec["ttm_period"] = pts[i]["period_end"]
-            ntm_eps = ntm_after.get(pts[i]["period_end"])
-            if ntm_eps:
-                rec["pe_ntm"] = px / ntm_eps
-                rec["ntm_eps"] = ntm_eps
+            if pts[i].get("anomalous"):
+                anom_days["trailing"] += 1
+            else:
+                rec["pe_trailing"] = px / pts[i]["ttm_eps"]
+                rec["ttm_eps"] = pts[i]["ttm_eps"]
+                rec["ttm_period"] = pts[i]["period_end"]
+        if i >= 0:
+            # ntm 不再嵌套在 ttm_eps>0 之下：分母是未来窗口的 EPS，与当前已知 TTM
+            # 是否为正无关（负 TTM 期恰是周期底，realized-NTM 视角本应有值）
+            if pts[i]["period_end"] in ntm_anom:
+                anom_days["ntm"] += 1
+            else:
+                ntm_eps = ntm_after.get(pts[i]["period_end"])
+                if ntm_eps:
+                    rec["pe_ntm"] = px / ntm_eps
+                    rec["ntm_eps"] = ntm_eps
         fy = fy_of(d)
         if fy and fy in eps_fy:
             rec["pe_forward"] = px / eps_fy[fy]
@@ -315,6 +379,21 @@ def compute_band(ticker, email, years=5, basis="forward", include_series=False):
     cur = series[-1]
 
     pcts = {p: pctile(sv, p) for p in (1, 5, 10, 25, 50, 75, 90, 95, 99)}
+
+    # 近 3 年子窗分位：5 年全窗把 2021 零利率 regime 的倍数原样计入（AMZN 全窗
+    # P50≈31x 比手工参考带的中位还高），直接拿全窗 P50 当锚会把泡沫期抬进锚里。
+    # 子窗按日历日切——ntm 口径最近一年天然无实现值，子窗实际覆盖会更短，days
+    # 如实报告；样本 <60 天不出，宁缺勿错。供 engine 交易区间/判断层 PE 锚优先取用。
+    RECENT_YEARS = 3
+    recent = None
+    if years > RECENT_YEARS:
+        rstart = years_ago(RECENT_YEARS).isoformat()
+        rsv = sorted(s[key] for s in series if s["date"] >= rstart)
+        if len(rsv) >= 60:
+            recent = {"years": RECENT_YEARS, "days": len(rsv),
+                      "min": rsv[0], "max": rsv[-1],
+                      "pctiles": {p: pctile(rsv, p) for p in (10, 25, 50, 75, 90)}}
+
     bounds = [(fy_ends[i - 1] if i else "0000-00-00", fy_ends[i]) for i in range(len(fy_ends))]
     bounds.append((fy_ends[-1], "9999-99-99"))
     fy_rows = []
@@ -329,10 +408,13 @@ def compute_band(ticker, email, years=5, basis="forward", include_series=False):
     out = {
         "ticker": ticker, "cik": cik, "basis": basis, "years": years, "days": len(series),
         "mean": mean, "median": pcts[50], "stdev": sd_, "min": sv[0], "max": sv[-1],
-        "pctiles": pcts, "fiscal_years": fy_rows, "current": cur,
+        "pctiles": pcts, "recent": recent, "fiscal_years": fy_rows, "current": cur,
         "other_basis": other.split("_")[1],
         "other_basis_median": (pctile(other_pes, 50) if other_pes else None),
         "split_notes": split_notes, "dropped_fys": dropped,
+        "anom_windows": [{"period_end": p["period_end"], "quarter": p["anom_q"]}
+                         for p in by_end if p.get("anomalous")],
+        "anom_days": anom_days, "anom_fys": anom_fys,
         "near_zero_days": len(near_zero),
         "near_zero_range": ([near_zero[0], near_zero[-1]] if near_zero else None),
         "candidates": [{"name": n, "lo": lo, "hi": hi, "mid": (lo + hi) / 2,
@@ -382,6 +464,19 @@ def main():
     if a.basis == "forward" and b["dropped_fys"]:
         print(f"  剔除: 财年 {', '.join(b['dropped_fys'])} 净利为负或缺股数，"
               "PE 无意义，整年不计入分布")
+    if a.basis == "forward" and b["anom_fys"]:
+        print(f"  剔除: 财年 {', '.join(b['anom_fys'])} 含单季一次性畸变"
+              f"（偏离同年中位季 >{ANOM_K}x），实现 EPS 不代表盈利能力，整年不计入")
+    if b["anom_windows"] and a.basis in ("trailing", "ntm"):
+        _tail = "、".join(f"{w['period_end']}(畸变季 {w['quarter']})"
+                          for w in b["anom_windows"][-3:])
+        # 窗口数是全 XBRL 历史口径（META 的 3 个全在 2012-13），天数才是本次
+        # --years 窗口内的实际影响——两个数不同源，写在一起必须说清，否则
+        # "剔除 26 个窗口却只影响 0 天"会被当成 bug 排查
+        print(f"  剔除: 全历史 {len(b['anom_windows'])} 个 TTM 窗口含单季一次性畸变"
+              f"（末几个: {_tail}）——影响本窗 trailing {b['anom_days']['trailing']} 天 / "
+              f"ntm {b['anom_days']['ntm']} 天；巨额一次性损益会把实现 EPS 吹大、"
+              "PE 假性变低，双侧剔除")
     if b["near_zero_days"]:
         r = b["near_zero_range"]
         print(f"  剔除: {b['near_zero_days']} 个交易日的 EPS 低于窗口中位数的 25%"
@@ -402,6 +497,12 @@ def main():
               f"处第 {rank_of(sv, cur[key]):.0f} 百分位")
     print(f"\n分布: 均值 {mean:.2f}  中位数 {b['median']:.2f}  σ {sd_:.2f}  "
           f"最低 {b['min']:.2f}  最高 {b['max']:.2f}")
+    if b.get("recent"):
+        rc, rp = b["recent"], b["recent"]["pctiles"]
+        print(f"  近{rc['years']}年子窗({rc['days']}天): "
+              f"P10 {rp[10]:.2f}  P25 {rp[25]:.2f}  P50 {rp[50]:.2f}  "
+              f"P75 {rp[75]:.2f}  P90 {rp[90]:.2f}"
+              "  ← 锚定/交易区间建议用这组（全窗把 2021 regime 原样计入）")
     if b["other_basis_median"]:
         print(f"  对照 {b['other_basis']} 口径中位数 {b['other_basis_median']:.2f}"
               f"（两者之比 {b['other_basis_median'] / b['median']:.2f}x ≈ 期间 EPS 增速，"
