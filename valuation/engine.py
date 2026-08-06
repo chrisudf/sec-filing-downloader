@@ -97,9 +97,14 @@ def _pctile_rank(pcts, x):
 def pe_band_check(scenario_name, pe, band, ddiag):
     """目标 PE 相对该票自身历史「已实现前瞻 PE」分布的位置。
 
-    口径对齐：band 的分母是各财年最终实现的稀释 EPS，引擎 s["pe"] 乘的是下一财年
-    eps1——同为前瞻口径，可比。两者都是 GAAP 基础；判断层若改用剔 SBC 的非 GAAP
-    EPS，分母变大、PE 变小，本诊断会系统性偏低，届时不可直接采信。
+    口径对齐：band 由 fetch_facts 以 basis="ntm" 写入——分母是「该日之后 12 个月
+    实际实现的稀释 EPS」；引擎的 s["pe"] 乘的是 eps1 = TTM×(1+g)，前瞻期同样是
+    NTM（见 valuation_service.fwd_window）。两者严格同源，可直接比分位。
+    band["basis"] 字段可核对；若哪天改回 forward（按财年切），只在 report_end =
+    财年末时才对得上，AMZN/META 这类 12 月财年公司在 Q1~Q3 报告期会系统性错位。
+
+    两者都是 GAAP 基础；判断层若改用剔 SBC 的非 GAAP EPS，分母变大、PE 变小，
+    本诊断会系统性偏低，届时不可直接采信。
 
     阈值刻意保守：只在「该票历史上从未出现过的倍数」或「base 偏离中枢区间」时报
     yellow。低倍数本身不是错——价值下沿本就该落在历史低位附近，这里只要求留痕。

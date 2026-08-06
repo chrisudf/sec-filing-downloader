@@ -77,7 +77,10 @@ def record(val: dict, gate_clean: bool, root: Path | None = None) -> Path | None
     原子写：任务中断留下半个 JSON 会毒化之后所有趋势读取（PREV_DIR 同样处理）。
     """
     root = root or ROOT   # 默认值在 def 时求值，写成 None 才能在测试里覆盖 ROOT
-    ticker = val.get("ticker")
+    # 写入侧必须与 load() 的 ticker.upper() 一致：Windows 文件系统大小写不敏感
+    # 掩盖了这个问题，但部署在 Linux 上时小写 ticker 会写进 vintages/aapl/ 而
+    # load 去读 vintages/AAPL/，表现为"归档成功但趋势视图读不到"
+    ticker = (val.get("ticker") or "").upper()
     report_end = (val.get("meta", {}).get("vintage") or {}).get("report_end")
     if not ticker or not report_end:
         return None  # 无 manifest 的手工运行没有报告期，不归档好过归到错误的格子

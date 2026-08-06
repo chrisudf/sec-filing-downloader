@@ -316,7 +316,9 @@ if os.environ.get("VALUATION_NO_PE_BAND") != "1":
         _band = compute_band(TICKER, EMAIL, years=5, basis="ntm")
         _band.pop("_sorted", None)
         out["pe_band"] = _band
-        print(f"PE带(forward,5y): 中位 {_band['median']:.1f}x  区间 "
+        # 口径/年数一律从 _band 自身字段拼：写死字符串会在换 basis 时静默说谎
+        # （曾切到 ntm 后仍打印 "forward"，排查与回归对比都会被带偏）
+        print(f"PE带({_band['basis']},{_band['years']}y): 中位 {_band['median']:.1f}x  区间 "
               f"{_band['min']:.1f}~{_band['max']:.1f}x  {_band['days']} 个交易日")
     except Exception as _e:
         out["pe_band_error"] = f"{type(_e).__name__}: {_e}"

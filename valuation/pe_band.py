@@ -31,6 +31,12 @@ from datetime import date
 
 import httpx
 
+# 口径 -> 序列字段名。必须是唯一定义处：compute_band 与 main 各写一份三元表达式时，
+# 加 ntm 档只改了前者，CLI 在 --basis ntm 下把 trailing 的 PE 当成 NTM 打印出来
+# （MSFT 末点显示 39.7x，实际应为 30.2x）——分布统计走 compute_band 未受影响，
+# 但展示层的数直接是错的。
+BASIS_KEY = {"forward": "pe_forward", "trailing": "pe_trailing", "ntm": "pe_ntm"}
+
 NI_TAGS = ["NetIncomeLoss", "ProfitLossAttributableToOwnersOfParent", "ProfitLoss"]
 SH_TAGS = ["WeightedAverageNumberOfDilutedSharesOutstanding",
            "AdjustedWeightedAverageShares", "WeightedAverageShares"]
@@ -274,7 +280,7 @@ def compute_band(ticker, email, years=5, basis="forward", include_series=False):
         if any(k in rec for k in ("pe_trailing", "pe_forward", "pe_ntm")):
             series.append(rec)
 
-    key = {"forward": "pe_forward", "trailing": "pe_trailing", "ntm": "pe_ntm"}[basis]
+    key = BASIS_KEY[basis]
     # 对照档固定选 trailing（唯一一档不依赖后见之明，任何标的都必然有值）
     other = "pe_trailing" if basis != "trailing" else "pe_forward"
     series = [s for s in series if key in s]
@@ -363,8 +369,7 @@ def main():
     except RuntimeError as e:
         raise SystemExit(str(e))
     sv = b.pop("_sorted")
-    mean, sd_, cur, key = b["mean"], b["stdev"], b["current"], \
-        ("pe_forward" if a.basis == "forward" else "pe_trailing")
+    mean, sd_, cur, key = b["mean"], b["stdev"], b["current"], BASIS_KEY[a.basis]
 
     basis_desc = {"forward": "forward（分母 = 该财年最终实现的稀释 EPS）",
                   "trailing": "trailing（分母 = 当日已公告的滚动四季 EPS）",
