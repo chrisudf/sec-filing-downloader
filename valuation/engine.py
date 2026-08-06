@@ -78,6 +78,53 @@ def tail(dic, n):
     return [k for k, _ in items], [v for _, v in items]
 
 
+def _pctile_rank(pcts, x):
+    """从稀疏分位点表反查 x 的百分位（线性插值）。facts.json 里 key 是字符串。"""
+    ks = sorted(int(k) for k in pcts)
+    vals = [pcts[str(k)] for k in ks]
+    if x <= vals[0]:
+        return float(ks[0])
+    if x >= vals[-1]:
+        return float(ks[-1])
+    for i in range(len(ks) - 1):
+        if vals[i] <= x <= vals[i + 1]:
+            span = vals[i + 1] - vals[i]
+            f = (x - vals[i]) / span if span > 0 else 0.0
+            return ks[i] + f * (ks[i + 1] - ks[i])
+    return 50.0
+
+
+def pe_band_check(scenario_name, pe, band, ddiag):
+    """目标 PE 相对该票自身历史「已实现前瞻 PE」分布的位置。
+
+    口径对齐：band 的分母是各财年最终实现的稀释 EPS，引擎 s["pe"] 乘的是下一财年
+    eps1——同为前瞻口径，可比。两者都是 GAAP 基础；判断层若改用剔 SBC 的非 GAAP
+    EPS，分母变大、PE 变小，本诊断会系统性偏低，届时不可直接采信。
+
+    阈值刻意保守：只在「该票历史上从未出现过的倍数」或「base 偏离中枢区间」时报
+    yellow。低倍数本身不是错——价值下沿本就该落在历史低位附近，这里只要求留痕。
+    """
+    if not band or not band.get("pctiles"):
+        return []
+    pcts = band["pctiles"]
+    rank = _pctile_rank(pcts, pe)
+    ddiag["pe_vs_history"] = {
+        "pctile": round(rank, 1), "median": round(pcts["50"], 1),
+        "p10": round(pcts["10"], 1), "p90": round(pcts["90"], 1),
+        "min": round(band["min"], 1), "max": round(band["max"], 1),
+        "years": band["years"], "days": band["days"], "basis": band["basis"]}
+    ctx = (f"（近 {band['years']} 年已实现前瞻 PE：中位 {pcts['50']:.1f}x，"
+           f"实际区间 {band['min']:.1f}~{band['max']:.1f}x，{band['days']} 个交易日）")
+    if not band["min"] <= pe <= band["max"]:
+        return [["yellow", f"{scenario_name} 目标 PE {pe:.1f}x 落在该票近 {band['years']} 年"
+                           f"从未出现过的区间之外{ctx}——不必然是错，"
+                           "但请在 rationale 中给出依据"]]
+    if scenario_name == "base" and not pcts["10"] <= pe <= pcts["90"]:
+        return [["yellow", f"base 目标 PE {pe:.1f}x 处历史第 {rank:.0f} 百分位"
+                           f"（界外 [P10,P90]）{ctx}——base 应为中枢情景"]]
+    return []
+
+
 ttm = facts["ttm"]
 rev0 = ttm["revenue"]["value"] / 1e6
 
@@ -248,6 +295,7 @@ for name, s in cfg["scenarios"].items():
             warnings.append(["yellow", f"综合目标价隐含 P/调整后净利 {p_ni:.1f}x（界外 [6,60]）"])
     if spread and spread > 2:
         warnings.append(["yellow", f"方法离散度 {spread}x（>2x）——各法分歧大，综合可信度降低"])
+    warnings += pe_band_check(name, s["pe"], facts.get("pe_band"), ddiag)
 
     out["scenarios"][name] = dict(
         assumptions=s, rev1=round(rev1), op1=round(op1), ni1=round(ni1),

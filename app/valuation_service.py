@@ -19,7 +19,7 @@ import sys
 import time
 import uuid
 import zipfile
-from datetime import date
+from datetime import date, timedelta
 from pathlib import Path
 
 from fastapi import APIRouter
@@ -111,8 +111,11 @@ def _validate_judgment(d: dict, mode: str = "standard",
     if mode == "financials":
         _validate_judgment_financials(d)
         return
+    # fwd_label 已移出判断层（2026-08-06）：它可由 report_end 纯日期推导，属服务器
+    # 注入的事实（见 fwd_window 的 docstring）。仍在此必填会让"要求不要输出"与
+    # "缺字段就重试"互相打架，每次运行必然两轮 retry 后失败。
     need = ("fwd_shares", "net_cash", "net_cash_note", "adj_ni", "adj_note",
-            "other_income", "fwd_label", "seg1", "seg2", "seg1_share",
+            "other_income", "seg1", "seg2", "seg1_share",
             "scenarios", "rationale", "notes")
     for k in need:
         if k not in d:
@@ -208,7 +211,8 @@ def _validate_judgment(d: dict, mode: str = "standard",
 
 def _validate_judgment_financials(d: dict) -> None:
     """金融股（银行/券商/fintech）判断层校验：P/E + P/TBV 假设集，无 DCF margins。"""
-    need = ("fwd_shares", "adj_ni", "adj_note", "fwd_label", "scenarios", "rationale", "notes")
+    # fwd_label 同 standard：已改为服务器注入，不再向判断层索要
+    need = ("fwd_shares", "adj_ni", "adj_note", "scenarios", "rationale", "notes")
     for k in need:
         if k not in d:
             raise ValueError(f"缺少字段 {k}")
@@ -329,6 +333,67 @@ def _parse_json(text: str) -> dict:
     return json.loads(text[start:end + 1])
 
 
+def _add_months(d: date, n: int) -> date:
+    """加 n 个月，落在不存在的日期时退到当月最后一天（3-31 + 1月 -> 4-30）。"""
+    y, m = divmod(d.year * 12 + (d.month - 1) + n, 12)
+    for day in range(d.day, 27, -1):     # 27 一定存在，最多回退 4 天
+        try:
+            return date(y, m + 1, day)
+        except ValueError:
+            continue
+    return date(y, m + 1, d.day)
+
+
+def fwd_window(ttm_end: str, fy_end: str, rolled_quarters: int = 0) -> dict:
+    """推导本次估值的**前瞻期**，返回 {start, end, label, straddle, aligned}。
+
+    为什么这是"事实"而不是"判断"
+    ----------------------------
+    engine.py 算的是 `rev1 = rev0 × (1+g)`，而 `rev0` 恒为 **TTM 营收**。
+    所以前瞻期在数学上永远是「TTM 窗口末端起的未来 12 个月」(NTM)，
+    **不是任何一个财年**——只有 report_end 恰好等于财年末时两者才重合。
+
+    此前 fwd_label 由判断层自己填、prompt 又要求"按公司财年"，与 g 的
+    "vs TTM"定义直接冲突。冲突只在 report_end ≠ 财年末时暴露：
+    AMZN（12月财年）2026-06-30 报告期跑 3 次，1 次填 FY2026E、2 次填 FY2027E，
+    差整整一年增长，g 跟着裂成 0.06/0.13/0.21，三个目标价完全不可比。
+    MSFT 报告期恰是财年末，两定义重合，所以 4 次全稳——问题被掩盖了很久。
+
+    既然完全可由 report_end 推导，它就属于"服务器注入的事实"（与 price/shares
+    同类），不该经过 LLM。这样失败模式从构造上消失，无需 schema 校验与 retry。
+
+    rolled_quarters
+    ---------------
+    PENDING_10Q（业绩 8-K 已出、10-Q 未交）时判断层被强制给 ttm_revenue_override，
+    TTM 基准已前滚一个季度，窗口要跟着 +3 个月。外国发行人 XBRL 陈旧那条路径
+    （stale_days>550）滚了几个季度无从得知，此处不滚并在 straddle 里注明——
+    见 TODO「前瞻期口径」条，那是本函数已知的最大近似。
+    """
+    te = date.fromisoformat(ttm_end)
+    if rolled_quarters:
+        te = _add_months(te, 3 * rolled_quarters)
+    start, end = te + timedelta(days=1), _add_months(te, 12)
+    out = {"start": start.isoformat(), "end": end.isoformat()}
+
+    # 财年末对齐判断：月-日相同即说明 TTM 窗口正好是一个完整财年，NTM 也就正好是下一个
+    if fy_end and fy_end[5:] == te.isoformat()[5:]:
+        out["aligned"] = True
+        out["straddle"] = f"= FY{end.year} 完整财年"
+    else:
+        out["aligned"] = False
+        if fy_end:
+            fy_md = fy_end[5:]
+            # 窗口起点/终点各自落在哪个财年（财年以其结束日命名）
+            fy1 = start.year if start.isoformat()[5:] <= fy_md else start.year + 1
+            fy2 = end.year if end.isoformat()[5:] <= fy_md else end.year + 1
+            out["straddle"] = (f"横跨 FY{fy1} 后段 + FY{fy2} 前段"
+                               if fy1 != fy2 else f"落在 FY{fy1} 之内")
+        else:
+            out["straddle"] = "财年末未知"
+    out["label"] = f"NTM {start:%Y-%m}~{end:%Y-%m}（{out['straddle']}）"
+    return out
+
+
 def _compact_facts(facts: dict) -> str:
     """给判断层的事实摘要：年度尾6 + 季度尾8（含 净利/营业利润 比，暴露一次性项目）。"""
     if facts.get("mode") == "financials":
@@ -441,6 +506,16 @@ async def _pipeline(job: dict, ticker: str, email: str) -> None:
                          csv.DictReader(io.StringIO(manifest))), default="")
     pending_8k = next((r for r in csv.DictReader(io.StringIO(manifest))
                        if r["form"].startswith("8-K")), None)
+    # 前瞻期推导必须用**定期报告**的报告期：8-K 的 reportDate 是公布日而非期末，
+    # 混进来会把 NTM 窗口整体推错（engine._vintage 出于同样理由排除 8-K）
+    periodic_end = max((r.get("reportDate") or "" for r in
+                        csv.DictReader(io.StringIO(manifest))
+                        if not (r.get("form") or "").startswith("8-K")), default="")
+    # 财年末取最新一期年度报表的期末日（standard/financials 都用 revenue_annual）
+    fy_end = max(facts.get("revenue_annual") or {}, default="")
+    # PENDING_10Q 时 ttm_revenue_override 会把 TTM 前滚一个季度，窗口跟着滚
+    FWD = (fwd_window(periodic_end, fy_end, rolled_quarters=1 if pending_8k else 0)
+           if periodic_end else None)
 
     job["step"] = "sections"
     await _run([PY, str(VAL / "extract_sections.py"), str(wd / "sections.json"), *htms], wd)
@@ -545,9 +620,21 @@ async def _pipeline(job: dict, ticker: str, email: str) -> None:
                 # 设计意图：基准文件任何读取/类型问题都降级为"忽略连续性"，绝不杀任务
                 # （VALUATION_PREV_CONFIG 支持用户手工指定/编辑的文件）
                 pass
+    # 前瞻期是服务器算好的事实，不由判断层选——但必须显式告诉它窗口是哪一段，
+    # 否则 g/opm/fwd_shares 会各自锚在不同的"下一财年"上（AMZN 实测三次裂成两种口径）
+    fwd_meta = ""
+    if FWD:
+        fwd_meta = (
+            f"\n前瞻期(NTM)={FWD['start']}~{FWD['end']}（{FWD['straddle']}）"
+            "\n  ← g / opm / tax / fwd_shares **全部针对这个 12 个月窗口**，不是某个财年。"
+            "\n  g 的定义 = 该窗口营收 ÷ TTM营收 − 1（TTM 即 FACTS 里的口径）。"
+            + ("\n  该窗口与公司财年重合，可直接套用财年指引。" if FWD["aligned"] else
+               "\n  ⚠ 该窗口**不等于**任何一个财年：财报 guidance 与卖方一致预期都按财年给，"
+               "必须先换算到这个窗口再定 g，不要直接搬用财年数字。")
+            + "\n  fwd_label 由服务器生成，你不要输出该字段。")
     prompt = (f"{base_prompt}\n\n# 服务器注入的元数据（不要输出这些字段）\n"
               f"ticker={ticker} name={info['name']} date={today} price={price:.2f} "
-              f"mcap={mcap/1e6:,.0f}M$ shares={shares}M股{caliber}\n\n"
+              f"mcap={mcap/1e6:,.0f}M$ shares={shares}M股{fwd_meta}{caliber}\n\n"
               f"# FACTS（SEC XBRL）\n{_compact_facts(facts)}\n\n"
               f"# MANIFEST（本次分析的财报文件）\n{manifest}\n\n"
               f"# SECTIONS（财报关键章节摘录 JSON）\n{sections}{prev_section}\n")
@@ -600,12 +687,32 @@ async def _pipeline(job: dict, ticker: str, email: str) -> None:
     # 仅描述 standard 模式（financials 沿用 v1 情景语义，恒为 1）。
     # manifest_latest 直接进 cfg：bundle 里的 config_假设留档.json 与自动锚同源，
     # 显式 VALUATION_PREV_CONFIG 指向 bundle config 时报告期失效触发器才有指纹可查
-    cfg = dict(judgment, ticker=ticker, name=info["name"], date=today,
-               price=round(price, 2), mcap=round(mcap / 1e6), shares=shares,
-               mode=mode, adr_multiple=adr_multiple,
-               currency=facts.get("currency", "USD"),
-               semantics_version=2 if mode == "standard" else 1,
-               manifest_latest=latest_report)
+    def _build_cfg(j: dict) -> dict:
+        """判断层输出 + 服务器注入的事实 -> engine 的 config。
+
+        必须是**唯一**的 cfg 构造点：此前首轮与经济复审重试各写了一份等价的
+        dict(...)，2026-08-06 给首轮加 fwd_label 注入时漏了重试那份，走复审
+        路径的运行直接 KeyError 崩在 engine.py:250（AMZN 实测 3 次中 1 次）。
+        """
+        c = dict(j, ticker=ticker, name=info["name"], date=today,
+                 price=round(price, 2), mcap=round(mcap / 1e6), shares=shares,
+                 mode=mode, adr_multiple=adr_multiple,
+                 currency=facts.get("currency", "USD"),
+                 semantics_version=2 if mode == "standard" else 1,
+                 manifest_latest=latest_report)
+        # fwd_label 是可由 report_end 纯日期推导的事实，与 price/shares 同类：
+        # 在此**覆盖**判断层的输出，让"选错财年"这个失败模式从构造上不存在。
+        # 判断层若仍输出了该字段，静默被盖掉即可——prompt 已明确要求不要输出。
+        # 兜底分支不可省：字段已从判断层 schema 移除，服务器再不给就没人给了，
+        # engine 无条件读 cfg["fwd_label"]，缺失即崩。
+        if FWD:
+            c["fwd_label"] = FWD["label"]
+            c["fwd_window"] = {k: FWD[k] for k in ("start", "end", "straddle", "aligned")}
+        else:
+            c["fwd_label"] = "NTM（起点未知：manifest 无定期报告期）"
+        return c
+
+    cfg = _build_cfg(judgment)
     # ---- v2 经济合理性复审：engine 干跑一次，red 红旗（假设可修复类）打回判断层
     # 至多一次；复审仍越界则带红旗出报告（fail loud，不 fail hard——红旗区会显示）。
     # 总 claude 调用 <= 3（schema retry 1 + 经济复审 1）。诊断只读 engine 输出的
@@ -644,12 +751,7 @@ async def _pipeline(job: dict, ticker: str, email: str) -> None:
                     and not revised.get("ttm_revenue_override")):
                 raise ValueError("复审输出丢失 ttm_revenue_override（陈旧 XBRL/PENDING_10Q 下必须保留）")
             judgment = revised
-            cfg = dict(judgment, ticker=ticker, name=info["name"], date=today,
-                       price=round(price, 2), mcap=round(mcap / 1e6), shares=shares,
-                       mode=mode, adr_multiple=adr_multiple,
-                       currency=facts.get("currency", "USD"),
-                       semantics_version=2 if mode == "standard" else 1,
-                       manifest_latest=latest_report)
+            cfg = _build_cfg(judgment)
         except (ValueError, json.JSONDecodeError, TypeError, KeyError,
                 ZeroDivisionError, RuntimeError) as e:
             # 复审输出不合格：保留原假设出报告，红旗如实展示——绝不静默吞掉
@@ -684,6 +786,20 @@ async def _pipeline(job: dict, ticker: str, email: str) -> None:
         # compare.py 的输入就是 valuation.json——不打包它，跨期对比就没有可分发的输入
         zf.write(wd / "valuation.json", "valuation.json")
     val = json.loads((wd / "valuation.json").read_text(encoding="utf-8"))
+
+    # vintage 归档（trend.py 的数据源）：按**报告期**存快照，同一报告期的多次运行
+    # 追加为多个样本——组内离散就是判断层噪声的直接估计，趋势视图靠它把"新财报导致
+    # 的变化"和"运行间抖动"分开。与 PREV_DIR 不同的是带红旗的运行这里照存（打
+    # gate_clean 标记，读取侧默认排除）：直接丢弃会让样本有偏，坏假设往往偏向同一侧。
+    # 归档失败绝不能连累已经跑完的报告——包在 try 里，只在 detail 留痕。
+    try:
+        if str(VAL) not in sys.path:
+            sys.path.insert(0, str(VAL))
+        import vintages
+        vintages.record(val, gate_clean=not reds)
+    except Exception as e:  # noqa: BLE001
+        job["detail"] = f"vintage 归档失败（{e!r:.120}），不影响本次报告"
+
     job.update(status="done", step="done", result=str(bundle),
                summary={k: dict(blend=v["blend"], upside=v["upside"])
                         for k, v in val["scenarios"].items()})

@@ -1,0 +1,443 @@
+# -*- coding: utf-8 -*-
+"""历史 PE 带：XBRL TTM EPS × yfinance 日收盘 -> 逐日 PE -> 分位数/σ 带 + 逆向匹配。
+
+用法:
+  python pe_band.py TICKER EMAIL [--years 5] [--match 23.5,31.5] [--out OUT.json]
+
+  --years N       回看年数（默认 5）
+  --match lo,hi   逆向工程：给定一组 PE 带，反查它对应的分位数/σ 倍数/覆盖率
+  --out PATH      同时写出 JSON
+
+产出三块：
+  1. PE 分布统计 + 若干候选带（min/max、各分位、均值±kσ）及各自的历史覆盖率
+  2. 逐财年实现 PE（低/中/高）——用来核对某条带子是否真的框住了每一年
+  3. --match 的逆向匹配——回答「这组 PE 带是按什么规则定出来的」
+
+三个会静默出错的地方，都已处理：
+- **防前视**：某交易日的 PE 用「当天已经公告的」TTM EPS，按 XBRL 的 filed 日切换，
+  不是按报告期末。用期末会让 PE 带假性收窄（把还没公布的业绩提前算进去）。
+- **TTM EPS = TTM 净利 ÷ 四季平均稀释股数**：EPS 和加权平均股数都不可跨季加总
+  （见 fetch_facts.py:244），净利可以——所以在分子上加总，分母取四季均值。
+- **拆股归一**：yfinance 的 Close 已按拆股调整，XBRL 的股数未必（companyfacts 只在
+  后续财报把该期做比较期时才追溯重述）。按拆股日检测股数序列有无跳变再决定是否回补，
+  否则 AAPL 4:1 / AMZN 20:1 这类会把拆股前整段 PE 算错一个数量级。
+"""
+import argparse
+import bisect
+import json
+import statistics
+import sys
+from datetime import date
+
+import httpx
+
+NI_TAGS = ["NetIncomeLoss", "ProfitLossAttributableToOwnersOfParent", "ProfitLoss"]
+SH_TAGS = ["WeightedAverageNumberOfDilutedSharesOutstanding",
+           "AdjustedWeightedAverageShares", "WeightedAverageShares"]
+
+
+def resolve_cik(ticker, headers):
+    m = httpx.get("https://www.sec.gov/files/company_tickers.json",
+                  headers=headers, timeout=60).json()
+    for v in m.values():
+        if v["ticker"].upper() == ticker:
+            return int(v["cik_str"])
+    raise SystemExit(f"SEC EDGAR 中未找到 {ticker}")
+
+
+def pick(facts, tags, kind, units):
+    """{期末: {"val","filed","first_filed"}}。
+
+    val 取 filed **最新**（重述/换标签后的口径更准）；可知日取 filed **最早**。
+    两者必须分开：同一期会在后续财报里作为比较期反复出现，若拿最新 filed 当可知日，
+    2024 年的季度会被标成 2026 年才可知，整条 PE 序列退化成「远古 EPS 除当期价格」。
+    """
+    rows = {}
+    for tag in tags:
+        if tag not in facts:
+            continue
+        for unit, entries in facts[tag]["units"].items():
+            if unit not in units:
+                continue
+            for f in entries:
+                end, start = f.get("end"), f.get("start")
+                if start is None or end is None:
+                    continue
+                days = (date.fromisoformat(end) - date.fromisoformat(start)).days
+                if kind == "annual":
+                    if not 350 <= days <= 380:
+                        continue
+                    # AMZN 这类公司每个季报都申报一条 twelve-months-ended，长度同样落在
+                    # 350~380 天里（见 fetch_facts.py:221）。只按天数过滤会把 4 个季末
+                    # 都当成财年末，财年边界被切成四段、每段只剩 60 多个交易日。
+                    if f.get("fp", "FY") != "FY":
+                        continue
+                if kind == "quarterly" and not 80 <= days <= 100:
+                    continue
+                filed, val = f.get("filed", ""), float(f["val"])
+                r = rows.get(end)
+                if r is None:
+                    rows[end] = {"val": val, "filed": filed, "first_filed": filed}
+                    continue
+                if filed > r["filed"]:
+                    r["val"], r["filed"] = val, filed
+                if filed and (not r["first_filed"] or filed < r["first_filed"]):
+                    r["first_filed"] = filed
+    return dict(sorted(rows.items()))
+
+
+def derive_q4(quarterly, annual):
+    """Q4 = 年度 − 前三季，只对可加总的流量科目成立（净利可以，股数/EPS 不行）。"""
+    for a_end, a in annual.items():
+        ae = date.fromisoformat(a_end)
+        in_year = {k: v for k, v in quarterly.items()
+                   if 0 < (ae - date.fromisoformat(k)).days < 340}
+        if len(in_year) == 3 and a_end not in quarterly:
+            quarterly[a_end] = {"val": a["val"] - sum(v["val"] for v in in_year.values()),
+                                "filed": a["filed"], "first_filed": a["first_filed"]}
+    return dict(sorted(quarterly.items()))
+
+
+def derive_q4_avg(quarterly, annual):
+    """加权平均股数的 Q4 = 4×FY均值 − 前三季之和。
+
+    fetch_facts.py:244 说「加权股数不可加总」，指的是 年度−前三季 那个**和式**
+    （会得到大负数）；股数是均值不是和，均值式 4×FY−Σ3 才成立。公司不报 Q4 10-Q，
+    不补这一期的话每个滚动四季窗口都缺一角，TTM 序列会直接为空。
+    """
+    for a_end, a in annual.items():
+        ae = date.fromisoformat(a_end)
+        in_year = {k: v for k, v in quarterly.items()
+                   if 0 < (ae - date.fromisoformat(k)).days < 340}
+        if len(in_year) != 3 or a_end in quarterly:
+            continue
+        vals = [v["val"] for v in in_year.values()]
+        q4 = 4 * a["val"] - sum(vals)
+        if 0.5 * min(vals) < q4 < 2 * max(vals):  # 越界说明口径不一致（如跨拆股），宁缺勿错
+            quarterly[a_end] = {"val": q4, "filed": a["filed"],
+                                "first_filed": a["first_filed"]}
+    return dict(sorted(quarterly.items()))
+
+
+def normalize_splits(shares, splits):
+    """XBRL 旧期股数可能是拆股前口径；按拆股日检测跳变，有跳变才回补。
+
+    未重述时 后/前 ≈ 拆股比（20:1 就是 ~20），已重述时 ≈ 1——两种情形差一个
+    数量级，用 0.75×比例 当阈值足够稳，不会被增发/回购的百分之几噪声误触发。
+    """
+    notes = []
+    for sd, ratio in sorted(splits.items(), reverse=True):
+        sd_s = sd.isoformat()
+        items = sorted(shares.items())
+        before = [v["val"] for k, v in items if k < sd_s][-2:]
+        after = [v["val"] for k, v in items if k >= sd_s][:2]
+        if not before or not after:
+            continue
+        obs = (sum(after) / len(after)) / (sum(before) / len(before))
+        if obs > ratio * 0.75:
+            for k, v in shares.items():
+                if k < sd_s:
+                    v["val"] *= ratio
+            notes.append(f"{sd_s} {ratio:g}:1 拆股 — XBRL 旧期为拆股前口径，已按比例回补")
+        else:
+            notes.append(f"{sd_s} {ratio:g}:1 拆股 — XBRL 已追溯重述，无需调整")
+    return notes
+
+
+def build_ttm_eps(ni_q, sh_q):
+    """滚动四季 TTM EPS，附「最早可知日」= 四个季度里最晚的 filed 日。"""
+    pts, qs = [], sorted(ni_q.items())
+    for i in range(3, len(qs)):
+        window = qs[i - 3:i + 1]
+        ends = [date.fromisoformat(k) for k, _ in window]
+        if not all(80 <= (ends[j + 1] - ends[j]).days <= 100 for j in range(3)):
+            continue
+        sh = [sh_q.get(k) for k, _ in window]
+        if not all(sh):
+            continue
+        avg_sh = sum(s["val"] for s in sh) / 4
+        if avg_sh <= 0:
+            continue
+        known = max(max(v["first_filed"] for _, v in window),
+                    max(s["first_filed"] for s in sh))
+        if not known:
+            continue
+        pts.append({"period_end": window[-1][0], "known_from": known,
+                    "ttm_ni": sum(v["val"] for _, v in window),
+                    "avg_diluted_shares": avg_sh,
+                    "ttm_eps": sum(v["val"] for _, v in window) / avg_sh})
+    return sorted(pts, key=lambda p: p["known_from"])
+
+
+def pctile(sv, p):
+    k = (len(sv) - 1) * p / 100.0
+    f = int(k)
+    c = min(f + 1, len(sv) - 1)
+    return sv[f] + (sv[c] - sv[f]) * (k - f)
+
+
+def rank_of(sv, x):
+    return 100.0 * bisect.bisect_left(sv, x) / len(sv)
+
+
+def coverage(sv, lo, hi):
+    return 100.0 * (bisect.bisect_right(sv, hi) - bisect.bisect_left(sv, lo)) / len(sv)
+
+
+def compute_band(ticker, email, years=5, basis="forward", include_series=False):
+    """算出历史 PE 分布，返回纯数据 dict（不打印）。
+
+    供 CLI 与 fetch_facts.py 共用——engine.py 是零联网的确定性计算层，
+    带子必须由数据层算好塞进 facts.json，不能让引擎自己去取。
+    """
+    ticker = ticker.upper()
+    H = {"User-Agent": f"sec-filing-downloader pe_band ({email})"}
+    cik = resolve_cik(ticker, H)
+    allf = httpx.get(f"https://data.sec.gov/api/xbrl/companyfacts/CIK{cik:010d}.json",
+                     headers=H, timeout=90).json()["facts"]
+    facts = allf.get("us-gaap") or allf.get("ifrs-full")
+    if not facts:
+        raise RuntimeError(f"{ticker}（CIK {cik}）没有 us-gaap/ifrs-full 数据")
+
+    ni_a = pick(facts, NI_TAGS, "annual", {"USD"})
+    ni_q = derive_q4(pick(facts, NI_TAGS, "quarterly", {"USD"}), ni_a)
+    sh_a = pick(facts, SH_TAGS, "annual", {"shares"})
+    sh_q = derive_q4_avg(pick(facts, SH_TAGS, "quarterly", {"shares"}), sh_a)
+    if len(ni_q) < 4 or len(sh_q) < 4:
+        raise RuntimeError(f"{ticker} 季度 XBRL 不足（净利 {len(ni_q)} 期/股数 {len(sh_q)} 期）"
+                         "——外国发行人常无季度 XBRL，本工具需要季度序列")
+
+    import yfinance as yf
+    tk = yf.Ticker(ticker)
+    hist = tk.history(period=f"{years + 1}y", auto_adjust=False)
+    if hist.empty:
+        raise RuntimeError(f"yfinance 取不到 {ticker} 价格")
+    splits = {d.date(): float(r) for d, r in tk.splits.items() if r and float(r) != 1.0}
+    split_notes = normalize_splits(sh_q, splits)
+    normalize_splits(sh_a, splits)
+
+    pts = build_ttm_eps(ni_q, sh_q)
+    if not pts:
+        raise RuntimeError(f"{ticker} 无法构造连续四季 TTM EPS")
+
+    # forward 口径：用「该财年最终实现的」EPS 反算当年每一天的 PE。
+    # 这是**刻意**用后见之明——它不是交易信号，而是在回答「这只票在某财年里，
+    # 按该财年真实 EPS 算，实际交易在什么倍数区间」。要复刻「财年交易区间」这类
+    # 预测，需要的历史分布正是它；用滚动 TTM 口径去比会系统性差一个增长率。
+    eps_fy = {e: ni_a[e]["val"] / sh_a[e]["val"] for e in ni_a
+              if e in sh_a and sh_a[e]["val"] > 0 and ni_a[e]["val"] > 0}
+    fy_ends = sorted(ni_a)
+    # 亏损年 PE 无意义，整年从分布里剔除——不说出来的话会被当成"数据缺了一段"
+    dropped = [e for e in fy_ends if e not in eps_fy and e >= str(date.today().year - years)]
+
+    def fy_of(d):
+        i = bisect.bisect_left(fy_ends, d)
+        return fy_ends[i] if i < len(fy_ends) else None
+
+    # ntm 口径：某期末之后 12 个月**实际实现**的 EPS = 4 个季度后那一点的 TTM EPS。
+    # 这是与 engine 严格同源的口径——engine 算 rev1 = TTM×(1+g)，前瞻期恒为 NTM
+    # 而非财年（见 valuation_service.fwd_window 的 docstring）。forward 口径按财年
+    # 切，只在 report_end = 财年末时才与 engine 重合（MSFT 是，AMZN 的 Q2 报告期
+    # 不是）。要让 engine 的目标 PE 与历史分位严格可比，就得用这一档。
+    by_end = sorted(pts, key=lambda p: p["period_end"])
+    ntm_after = {}
+    for i in range(len(by_end) - 4):
+        a, b = by_end[i], by_end[i + 4]
+        da = date.fromisoformat(a["period_end"])
+        db = date.fromisoformat(b["period_end"])
+        if 350 <= (db - da).days <= 380 and b["ttm_eps"] > 0:
+            ntm_after[a["period_end"]] = b["ttm_eps"]
+
+    start = (date.today().replace(year=date.today().year - years)).isoformat()
+    knowns = [p["known_from"] for p in pts]
+    series = []
+    for ts, row in hist.iterrows():
+        d = ts.date().isoformat()
+        if d < start:
+            continue
+        px = float(row["Close"])
+        rec = {"date": d, "close": px}
+        i = bisect.bisect_right(knowns, d) - 1
+        if i >= 0 and pts[i]["ttm_eps"] > 0:
+            rec["pe_trailing"] = px / pts[i]["ttm_eps"]
+            rec["ttm_eps"] = pts[i]["ttm_eps"]
+            rec["ttm_period"] = pts[i]["period_end"]
+            ntm_eps = ntm_after.get(pts[i]["period_end"])
+            if ntm_eps:
+                rec["pe_ntm"] = px / ntm_eps
+                rec["ntm_eps"] = ntm_eps
+        fy = fy_of(d)
+        if fy and fy in eps_fy:
+            rec["pe_forward"] = px / eps_fy[fy]
+            rec["fy_eps"] = eps_fy[fy]
+            rec["fy"] = fy
+        if any(k in rec for k in ("pe_trailing", "pe_forward", "pe_ntm")):
+            series.append(rec)
+
+    key = {"forward": "pe_forward", "trailing": "pe_trailing", "ntm": "pe_ntm"}[basis]
+    # 对照档固定选 trailing（唯一一档不依赖后见之明，任何标的都必然有值）
+    other = "pe_trailing" if basis != "trailing" else "pe_forward"
+    series = [s for s in series if key in s]
+    if len(series) < 60:
+        raise RuntimeError(
+            f"{ticker} {basis} 口径有效交易日仅 {len(series)} 天，样本不足"
+            + ("（forward 口径需要该财年已披露年报，本财年至今必然缺）"
+               if basis == "forward" else
+               "（ntm 口径需要该日之后满 4 个季度已披露，最近一年必然缺）"
+               if basis == "ntm" else ""))
+
+    # 分母趋零时 PE 无信息量：AMZN 2022 年滚动 EPS 逼近零，ntm 口径下算出 300x
+    # 这类数——不是"贵"，是除以了一个接近 0 的数。均值/σ/max 会被单点带飞，而
+    # engine.pe_band_check 正是用 min/max 判"该票从未出现过的倍数"，被污染就失效。
+    # 规则：剔除 EPS < 窗口内 EPS 中位数 25% 的交易日（此时 PE 已是中位倍数的 4 倍
+    # 以上，纯由分母塌缩造成）。forward 口径按亏损财年整年剔除是同一思路的离散版。
+    EPS_KEY = {"pe_forward": "fy_eps", "pe_trailing": "ttm_eps", "pe_ntm": "ntm_eps"}[key]
+    eps_all = sorted(s[EPS_KEY] for s in series if s.get(EPS_KEY))
+    near_zero = []
+    if eps_all:
+        floor = 0.25 * pctile(eps_all, 50)
+        near_zero = [s["date"] for s in series if (s.get(EPS_KEY) or 0) < floor]
+        if near_zero:
+            series = [s for s in series if (s.get(EPS_KEY) or 0) >= floor]
+    if len(series) < 60:
+        raise RuntimeError(f"{ticker} {basis} 口径剔除盈利塌缩期后仅剩 {len(series)} 天，样本不足")
+
+    pes = [s[key] for s in series]
+    other_pes = sorted(s[other] for s in series if other in s)
+    sv = sorted(pes)
+    mean, sd_ = statistics.mean(pes), statistics.pstdev(pes)
+    cur = series[-1]
+
+    pcts = {p: pctile(sv, p) for p in (1, 5, 10, 25, 50, 75, 90, 95, 99)}
+    bounds = [(fy_ends[i - 1] if i else "0000-00-00", fy_ends[i]) for i in range(len(fy_ends))]
+    bounds.append((fy_ends[-1], "9999-99-99"))
+    fy_rows = []
+    for lo_d, hi_d in bounds:
+        seg = sorted(s[key] for s in series if lo_d < s["date"] <= hi_d)
+        if len(seg) < 20:
+            continue
+        fy_rows.append({"fy_end": hi_d if hi_d != "9999-99-99" else "本财年至今",
+                        "low": seg[0], "median": pctile(seg, 50),
+                        "high": seg[-1], "days": len(seg)})
+
+    out = {
+        "ticker": ticker, "cik": cik, "basis": basis, "years": years, "days": len(series),
+        "mean": mean, "median": pcts[50], "stdev": sd_, "min": sv[0], "max": sv[-1],
+        "pctiles": pcts, "fiscal_years": fy_rows, "current": cur,
+        "other_basis": other.split("_")[1],
+        "other_basis_median": (pctile(other_pes, 50) if other_pes else None),
+        "split_notes": split_notes, "dropped_fys": dropped,
+        "near_zero_days": len(near_zero),
+        "near_zero_range": ([near_zero[0], near_zero[-1]] if near_zero else None),
+        "candidates": [{"name": n, "lo": lo, "hi": hi, "mid": (lo + hi) / 2,
+                        "coverage_pct": coverage(sv, lo, hi)}
+                       for n, lo, hi in (("最低 / 最高", sv[0], sv[-1]),
+                                         ("P5 / P95", pcts[5], pcts[95]),
+                                         ("P10 / P90", pcts[10], pcts[90]),
+                                         ("P25 / P75", pcts[25], pcts[75]),
+                                         ("均值 ±1.0σ", mean - sd_, mean + sd_),
+                                         ("均值 ±1.5σ", mean - 1.5 * sd_, mean + 1.5 * sd_),
+                                         ("均值 ±2.0σ", mean - 2 * sd_, mean + 2 * sd_))],
+    }
+    if include_series:
+        out["series"] = series
+    out["_sorted"] = sv
+    return out
+
+
+def main():
+    ap = argparse.ArgumentParser()
+    ap.add_argument("ticker")
+    ap.add_argument("email")
+    ap.add_argument("--years", type=int, default=5)
+    ap.add_argument("--basis", choices=("forward", "trailing", "ntm"), default="forward",
+                    help="forward=按该财年已实现EPS（复刻「财年交易区间」用这个）；"
+                         "trailing=按当日已公告的滚动TTM EPS；"
+                         "ntm=按该日之后12个月实现的EPS（与 engine 的前瞻期严格同源）")
+    ap.add_argument("--match")
+    ap.add_argument("--out")
+    a = ap.parse_args()
+
+    try:
+        b = compute_band(a.ticker, a.email, a.years, a.basis, include_series=bool(a.out))
+    except RuntimeError as e:
+        raise SystemExit(str(e))
+    sv = b.pop("_sorted")
+    mean, sd_, cur, key = b["mean"], b["stdev"], b["current"], \
+        ("pe_forward" if a.basis == "forward" else "pe_trailing")
+
+    basis_desc = {"forward": "forward（分母 = 该财年最终实现的稀释 EPS）",
+                  "trailing": "trailing（分母 = 当日已公告的滚动四季 EPS）",
+                  "ntm": "ntm（分母 = 该日之后 12 个月实现的 EPS，与 engine 前瞻期同源）"}[a.basis]
+    print(f"\n=== {b['ticker']} 历史 PE 带 · {basis_desc} ===")
+    print(f"近 {a.years} 年，{b['days']} 个交易日 | XBRL CIK {b['cik']} | "
+          "价格 yfinance 日收盘（拆股调整）")
+    for n in b["split_notes"]:
+        print(f"  拆股: {n}")
+    if a.basis == "forward" and b["dropped_fys"]:
+        print(f"  剔除: 财年 {', '.join(b['dropped_fys'])} 净利为负或缺股数，"
+              "PE 无意义，整年不计入分布")
+    if b["near_zero_days"]:
+        r = b["near_zero_range"]
+        print(f"  剔除: {b['near_zero_days']} 个交易日的 EPS 低于窗口中位数的 25%"
+              f"（{r[0]}~{r[1]}）——分母趋零，PE 无信息量")
+    if a.basis == "ntm":
+        print(f"  末点: {cur['date']} 收盘 {cur['close']:.2f} / 其后12个月实现 EPS "
+              f"{cur['ntm_eps']:.2f} = PE {cur[key]:.1f}x，处第 {rank_of(sv, cur[key]):.0f} 百分位")
+        print("       （ntm 序列止于「最近一个满 4 季度已披露」的日子；这是刻意的后见之明，"
+              "用途是给 engine 的目标 PE 提供同口径历史分布，不是交易信号）")
+    elif a.basis == "forward":
+        print(f"  末点: {cur['date']} 收盘 {cur['close']:.2f} / FY{cur['fy']} 实现 EPS "
+              f"{cur['fy_eps']:.2f} = PE {cur[key]:.1f}x，处第 {rank_of(sv, cur[key]):.0f} 百分位")
+        print("       （forward 序列止于最近一个已披露年报的财年末；本财年至今无实现 EPS，"
+              "要看当下位置请加 --basis trailing）")
+    else:
+        print(f"  最新: {cur['date']} 收盘 {cur['close']:.2f} / TTM EPS {cur['ttm_eps']:.2f} "
+              f"（{cur['ttm_period']} 期末）= PE {cur[key]:.1f}x，"
+              f"处第 {rank_of(sv, cur[key]):.0f} 百分位")
+    print(f"\n分布: 均值 {mean:.2f}  中位数 {b['median']:.2f}  σ {sd_:.2f}  "
+          f"最低 {b['min']:.2f}  最高 {b['max']:.2f}")
+    if b["other_basis_median"]:
+        print(f"  对照 {b['other_basis']} 口径中位数 {b['other_basis_median']:.2f}"
+              f"（两者之比 {b['other_basis_median'] / b['median']:.2f}x ≈ 期间 EPS 增速，"
+              "两个口径的带子不可混用）")
+    print("  注意：均值 ≠ 中位数 ≠ (min+max)/2。PE 序列右偏时 (min+max)/2 会系统性偏高。")
+    print(f"  (min+max)/2 = {(b['min'] + b['max']) / 2:.2f}   vs   真中位数 {b['median']:.2f}")
+
+    print(f"\n{'候选带':<14}{'下沿':>8}{'上沿':>8}{'中点':>8}{'半宽%':>8}{'覆盖率':>9}")
+    for c in b["candidates"]:
+        print(f"{c['name']:<14}{c['lo']:>8.2f}{c['hi']:>8.2f}{c['mid']:>8.2f}"
+              f"{100 * (c['hi'] - c['mid']) / c['mid']:>7.1f}%{c['coverage_pct']:>8.1f}%")
+
+    # 逐财年实现 PE：某条带子是否真框住了每一年，只能这样核对
+    print(f"\n{'财年(期末)':<14}{'最低PE':>9}{'中位PE':>9}{'最高PE':>9}{'天数':>7}")
+    for f in b["fiscal_years"]:
+        print(f"{f['fy_end']:<14}{f['low']:>9.2f}{f['median']:>9.2f}"
+              f"{f['high']:>9.2f}{f['days']:>7}")
+
+    if a.match:
+        lo, hi = (float(x) for x in a.match.split(","))
+        mid = (lo + hi) / 2
+        k_lo = (mean - lo) / sd_ if sd_ else 0
+        k_hi = (hi - mean) / sd_ if sd_ else 0
+        cov = coverage(sv, lo, hi)
+        fy_in = sum(1 for f in b["fiscal_years"] if f["low"] >= lo and f["high"] <= hi)
+        print(f"\n=== 逆向匹配 [{lo}, {hi}] ===")
+        print(f"  下沿 {lo} → 第 {rank_of(sv, lo):.1f} 百分位 = 均值 − {k_lo:.2f}σ")
+        print(f"  上沿 {hi} → 第 {rank_of(sv, hi):.1f} 百分位 = 均值 + {k_hi:.2f}σ")
+        print(f"  中点 {mid:.2f}（真中位数 {b['median']:.2f}，均值 {mean:.2f}），"
+              f"半宽 ±{100 * (hi - mid) / mid:.1f}%")
+        print(f"  覆盖率 {cov:.1f}% 的交易日 | 完整框住 {fy_in}/{len(b['fiscal_years'])} 个财年")
+        print(f"  对称性: {'σ 对称' if abs(k_lo - k_hi) < 0.15 else 'σ 不对称——不是均值±kσ 规则'}")
+        b["match"] = {"lo": lo, "hi": hi, "mid": mid, "k_lo": k_lo, "k_hi": k_hi,
+                      "pct_lo": rank_of(sv, lo), "pct_hi": rank_of(sv, hi),
+                      "coverage_pct": cov, "fy_contained": fy_in,
+                      "fy_total": len(b["fiscal_years"])}
+
+    if a.out:
+        json.dump(b, open(a.out, "w", encoding="utf-8"), ensure_ascii=False, indent=1)
+        print(f"\n已写出 {a.out}")
+
+
+if __name__ == "__main__":
+    sys.exit(main())

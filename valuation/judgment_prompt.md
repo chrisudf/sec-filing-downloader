@@ -56,17 +56,16 @@
 只输出一个 JSON 对象（不要 markdown 代码块、不要解释文字），schema：
 
 {
-  "fwd_shares": <下一财年稀释股本估计,百万股,考虑回购趋势>,
+  "fwd_shares": <前瞻期(NTM,见元数据)加权稀释股本估计,百万股,考虑回购趋势>,
   "ttm_revenue_override": <可选！仅当元数据提示 XBRL 数据滞后时提供：按财报原文（6-K/最新季报）
     推出的真实 TTM 营收 $M，g 的基准将以此为准>,
   "ttm_revenue_note": "<提供 override 时必填：推导口径与出处>",
   "net_cash": <净现金 $M>, "net_cash_note": "<口径与出处>",
   "adj_ni": <TTM调整后净利 $M>, "adj_note": "<调整口径>",
   "other_income": <年化其他收益 $M,正常化>,
-  "fwd_label": "<如 FY2027E（至2027-01）,按公司财年>",
   "seg1": "<主分部名>", "seg2": "<次分部名或—>", "seg1_share": <0-1>,
   "scenarios": {
-    "bear": {"g": <下一财年营收增速vs TTM,小数>, "opm": <营业利润率>, "tax": <税率>,
+    "bear": {"g": <前瞻期(NTM,见元数据)营收增速vs TTM,小数>, "opm": <营业利润率>, "tax": <税率>,
              "pe": <目标PE>, "m1": <主分部EV/EBIT倍数>, "m2": <次分部倍数,无则0>,
              "wacc": <0.08-0.12>, "tg": <永续增速,须比wacc小至少0.05>,
              "g0": <DCF起始增速>, "gN": <DCF第10年增速>,
