@@ -196,6 +196,16 @@ python valuation/trend.py MSFT
 python valuation/trend.py MSFT --ingest 历史bundle里的*_valuation.json   # 回填归档
 ```
 
+```bash
+# 参考表复刻：财年一致预期 EPS × PE 带 -> 价值交易区间 + 中位价 + EPS 修正轨迹
+python valuation/ref_table.py AMZN you@example.com
+```
+
+`ref_table.py` 复刻「前瞻 EPS × 历史 PE 带」类参考表的公式（区间=PE带×财年EPS，中位价=PE中位×EPS）：
+EPS 用 yfinance 免费一致预期（0y/+1y 财年口径 + 90 天修正轨迹，一次性项目污染 GAAP consensus 时自动预警），
+带子默认 pe_band 分位数、可在 `ref_table_overrides.json` 钉死手拍带（输出自动给逆向匹配：框住历史的百分之几）。
+每次运行快照进 `ref_snapshots/`，攒出参考表「一行一个季度」的修正轨迹。与估值管线的三情景互为对照。
+
 `trend.py` 与普通趋势表的区别在于**把季度间的变化和同一报告期内的采样噪声放在一起看**。
 判断层有运行间噪声（MSFT 实测 base 综合目标价 CV 2.4%，NVDA bear CV≈12%），
 所以 vintage 按**报告期**归档、同期多次运行存为多个样本，相邻期用
