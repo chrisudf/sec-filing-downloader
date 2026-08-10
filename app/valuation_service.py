@@ -632,9 +632,35 @@ async def _pipeline(job: dict, ticker: str, email: str) -> None:
                "\n  ⚠ 该窗口**不等于**任何一个财年：财报 guidance 与卖方一致预期都按财年给，"
                "必须先换算到这个窗口再定 g，不要直接搬用财年数字。")
             + "\n  fwd_label 由服务器生成，你不要输出该字段。")
+    # 历史 PE 带锚（与前瞻期同口径）：此前 band 只做 engine 事后 check，目标 PE
+    # 由判断层自由拍——与「前瞻 EPS × 历史 PE 带」类参考基准相比，base 水平会
+    # 系统性漂移（漂移方向随判断层口味，且无证据可审计）。注入分位数并要求默认
+    # 锚近 3 年子窗 P50：全窗把 2021 零利率 regime 原样计入（AMZN 全窗 P50≈31x），
+    # 直接锚全窗会把泡沫倍数抬进锚。与连续性纪律同哲学：无证据不偏离。
+    band_meta = ""
+    _b = facts.get("pe_band") or {}
+    if mode == "standard" and _b.get("pctiles"):
+        _rc = _b.get("recent") or {}
+        _rp = _rc.get("pctiles") or {}
+
+        def _pfmt(pp):
+            return " / ".join(f"P{q} {pp[str(q)]:.1f}x" for q in (10, 25, 50, 75, 90)
+                              if str(q) in pp)
+        _anchor_win = f"近{_rc['years']}年" if _rp else f"近{_b['years']}年"
+        band_meta = (
+            f"\n历史已实现 NTM PE 带（与上述前瞻期同口径，basis={_b['basis']}，"
+            "一次性畸变窗口已剔除）："
+            f"\n  全窗近{_b['years']}年: {_pfmt(_b['pctiles'])}（{_b['days']}天）"
+            + (f"\n  近{_rc['years']}年子窗: {_pfmt(_rp)}（{_rc['days']}天）" if _rp else "")
+            + f"\n  ← base 情景目标 PE **默认锚{_anchor_win} P50**；bear/bull 参照"
+              " P25/P75 量级再叠加各自情景的盈利假设。偏离锚 ±15% 以上必须在"
+              " rationale.pe 给出财报证据（增长/利润率结构变化、资本回报变化等），"
+              "『保守起见』类无证据折价不接受——那会系统性压低所有标的。"
+              "\n  若下方给出「上一次运行的假设（连续性基准）」，连续性优先——"
+              "本锚只约束首次基线与失锚重建。")
     prompt = (f"{base_prompt}\n\n# 服务器注入的元数据（不要输出这些字段）\n"
               f"ticker={ticker} name={info['name']} date={today} price={price:.2f} "
-              f"mcap={mcap/1e6:,.0f}M$ shares={shares}M股{fwd_meta}{caliber}\n\n"
+              f"mcap={mcap/1e6:,.0f}M$ shares={shares}M股{fwd_meta}{band_meta}{caliber}\n\n"
               f"# FACTS（SEC XBRL）\n{_compact_facts(facts)}\n\n"
               f"# MANIFEST（本次分析的财报文件）\n{manifest}\n\n"
               f"# SECTIONS（财报关键章节摘录 JSON）\n{sections}{prev_section}\n")

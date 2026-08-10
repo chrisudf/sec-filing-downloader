@@ -113,10 +113,20 @@ def pe_band_check(scenario_name, pe, band, ddiag):
         return []
     pcts = band["pctiles"]
     rank = _pctile_rank(pcts, pe)
+    # base 中枢检查用与判断层 PE 锚同一个窗（近 3 年子窗，见 valuation_service 的
+    # band_meta 注入）：锚了子窗 P50 却按全窗 [P10,P90] 打旗会自相矛盾——全窗含
+    # 2021 regime，子窗中位低于全窗 P10 的票（倍数已下台阶）恰好每次被冤枉。
+    # min/max 的「从未出现过」检查仍看全窗（问题本来就是全历史范围的）。
+    _rc = (band.get("recent") or {})
+    _rp = _rc.get("pctiles") or {}
+    cpcts = _rp if ("10" in _rp and "90" in _rp) else pcts
+    cwin = f"近{_rc['years']}年子窗" if cpcts is _rp else f"近{band['years']}年全窗"
     ddiag["pe_vs_history"] = {
         "pctile": round(rank, 1), "median": round(pcts["50"], 1),
         "p10": round(pcts["10"], 1), "p90": round(pcts["90"], 1),
         "min": round(band["min"], 1), "max": round(band["max"], 1),
+        "anchor_window": cwin,
+        "anchor_p50": (round(cpcts["50"], 1) if "50" in cpcts else None),
         "years": band["years"], "days": band["days"], "basis": band["basis"]}
     ctx = (f"（近 {band['years']} 年已实现前瞻 PE：中位 {pcts['50']:.1f}x，"
            f"实际区间 {band['min']:.1f}~{band['max']:.1f}x，{band['days']} 个交易日）")
@@ -124,9 +134,21 @@ def pe_band_check(scenario_name, pe, band, ddiag):
         return [["yellow", f"{scenario_name} 目标 PE {pe:.1f}x 落在该票近 {band['years']} 年"
                            f"从未出现过的区间之外{ctx}——不必然是错，"
                            "但请在 rationale 中给出依据"]]
-    if scenario_name == "base" and not pcts["10"] <= pe <= pcts["90"]:
-        return [["yellow", f"base 目标 PE {pe:.1f}x 处历史第 {rank:.0f} 百分位"
-                           f"（界外 [P10,P90]）{ctx}——base 应为中枢情景"]]
+    if scenario_name == "base":
+        # 容许区间 = 子窗 [P10,P90] ∪ 锚 P50 的 ±ANCHOR_TOL——prompt 里写的锚纪律就是
+        # 「偏离 P50 ±15% 以上要给证据」，若这里只按 [P10,P90] 打旗，倍数分布窄的票
+        # （MSFT/AMZN 子窗半宽仅 ±12%）会出现"按纪律给了证据的偏离照样吃黄旗"，
+        # 两层规则各说各话。取并集后：纪律内不打旗，纪律外必打旗，口径一致。
+        ANCHOR_TOL = 0.15
+        lo_ok, hi_ok = cpcts["10"], cpcts["90"]
+        if "50" in cpcts:
+            lo_ok = min(lo_ok, cpcts["50"] * (1 - ANCHOR_TOL))
+            hi_ok = max(hi_ok, cpcts["50"] * (1 + ANCHOR_TOL))
+        if not lo_ok <= pe <= hi_ok:
+            return [["yellow", f"base 目标 PE {pe:.1f}x 界外 {cwin} [P10,P90]="
+                               f"[{cpcts['10']:.1f},{cpcts['90']:.1f}]x（并 P50±"
+                               f"{ANCHOR_TOL:.0%} 后为 [{lo_ok:.1f},{hi_ok:.1f}]x，"
+                               f"全窗第 {rank:.0f} 百分位）{ctx}——base 应为中枢情景"]]
     return []
 
 
