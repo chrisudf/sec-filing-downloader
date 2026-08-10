@@ -89,6 +89,16 @@
       `diagnostics.pe_vs_history` 并在越界时报 yellow。`VALUATION_NO_PE_BAND=1` 可关。
 - [ ] `pe_band_check` 接 financials 模式：该模式 scenario dict 无 `warnings` 通道
       （engine.py:135-144），要连带改 build_report 的红旗区渲染
+- [ ] **观察项：全窗 min/max 那条「从未出现过的倍数」检查是否已过松**（2026-08-10 记，
+      先不改，攒观察）。一次性畸变剔除那版把 `ntm` 从 `ttm_eps>0` 的嵌套里解了出来
+      （分母是未来窗口的 EPS，与当前已知 TTM 正负无关，负 TTM 期恰是周期底）——
+      口径上是对的，副作用是低 EPS 日回流：AMZN 全窗 max 从 58x 涨到 114x，
+      于是 `band["min"] <= pe <= band["max"]` 这条黄旗的上界被单点带高，
+      实际上只对荒谬值还有约束力。**锚与交易区间不受影响**（都走近 3 年子窗），
+      base 中枢检查也已改成子窗 [P10,P90] ∪ P50±15%，所以当前无实际损害。
+      要观察的是：bear/bull 是否出现过"离谱但因为全窗 max 被撑大而没打旗"的案例。
+      若确认，候选改法是这条也改用子窗 min/max，或对全窗 min/max 先做分位裁剪
+      （如 P1/P99）——但那会削弱"从未出现过"这句话的字面含义，需要一并想清楚措辞。
 - [ ] 相对估值：PS / EV-EBITDA 历史分位 + 同行对比（PE 分位已完成，见上）
 - [ ] 报告 PDF 导出
 
