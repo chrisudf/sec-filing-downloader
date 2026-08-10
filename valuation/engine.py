@@ -319,6 +319,27 @@ if abs(_dev) > 0.35:
         ["yellow", f"base 综合较现价偏离 {_dev:+.0%}（>±35%）——请核对 base 假设"
                    "或在注记中显式说明为何与市场定价分歧"])
 
+# ---- 价值交易区间：历史已实现 NTM PE 分位 × base 前瞻 EPS ----
+# 与三情景互为对照：情景是「基本面情景各自的公允价」（bear=EPS↓×PE↓ 双压），
+# 这行回答「按该票自己的历史倍数分布，base 盈利下会交易在哪个区间」——
+# 参考表用手拍带子回答的问题，这里用分位数回答。锚窗优先近 3 年子窗
+# （pe_band.recent，避开 2021 regime），回退全窗；facts.json round-trip 后
+# recent.pctiles 的键是字符串（与 pctiles 同，见 _pctile_rank 注）。
+_band = facts.get("pe_band") or {}
+_rc = _band.get("recent") or {}
+_use = _rc.get("pctiles") or _band.get("pctiles") or {}
+if all(q in _use for q in ("10", "25", "50", "75", "90")):
+    _e1 = out["scenarios"]["base"]["eps1"]
+    _tr_pe = {q: round(float(_use[q]), 2) for q in ("10", "25", "50", "75", "90")}
+    out["trading_range"] = dict(
+        basis=_band.get("basis"),
+        window=(f"近{_rc['years']}年" if _rc.get("pctiles") else f"近{_band.get('years')}年"),
+        days=(_rc.get("days") if _rc.get("pctiles") else _band.get("days")),
+        eps1_base=_e1, pe=_tr_pe,
+        px={q: round(v * _e1, 1) for q, v in _tr_pe.items()},
+        full_window_p50=(round(float(_band["pctiles"]["50"]), 2)
+                         if _band.get("pctiles") else None))
+
 # 反向 DCF：base 口径下现价隐含的起始增速
 s = cfg["scenarios"]["base"]
 lo, hi = -0.20, 0.80
@@ -362,6 +383,11 @@ print(f"===== {cfg['ticker']} @ ${cfg['price']} (semantics v{out['semantics_vers
 print(f"TTM: rev {ttm_m['revenue']:,} op {ttm_m['op_income']:,} adjNI {cfg['adj_ni']:,} "
       f"adjEPS {out['adj_eps']} FCF {ttm_m['fcf']:,}")
 print(f"反向DCF隐含起始增速: {out['reverse_dcf']:.1%}（base 利润率/WACC 条件下）")
+if out.get("trading_range"):
+    _tr = out["trading_range"]
+    print(f"交易区间（{_tr['window']}已实现 NTM PE 分位 × base EPS {_tr['eps1_base']}）: "
+          f"P25~P75 {_tr['px']['25']}~{_tr['px']['75']}  中位 {_tr['px']['50']}"
+          f"  宽区间 P10~P90 {_tr['px']['10']}~{_tr['px']['90']}")
 if not sotp_in_blend:
     print(f"SOTP 降级为参考项（主分部利润占比 {cfg['seg1_share']:.0%} >= 85%），综合 = PE/DCF 均值")
 for n, v in out["scenarios"].items():

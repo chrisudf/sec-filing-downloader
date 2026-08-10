@@ -800,9 +800,15 @@ async def _pipeline(job: dict, ticker: str, email: str) -> None:
     except Exception as e:  # noqa: BLE001
         job["detail"] = f"vintage 归档失败（{e!r:.120}），不影响本次报告"
 
+    # trading_range 走独立字段而非塞进 summary：前端 Object.entries(summary) 按
+    # "情景名 $blend（upside%）"渲染，混入结构不同的键会渲染出 undefined
+    _tr = val.get("trading_range")
     job.update(status="done", step="done", result=str(bundle),
                summary={k: dict(blend=v["blend"], upside=v["upside"])
-                        for k, v in val["scenarios"].items()})
+                        for k, v in val["scenarios"].items()},
+               trading_range=(dict(lo=_tr["px"].get("25"), mid=_tr["px"].get("50"),
+                                   hi=_tr["px"].get("75"), window=_tr["window"])
+                              if _tr and _tr.get("px") else None))
 
 
 async def _run_job(job_id: str, ticker: str, email: str) -> None:
