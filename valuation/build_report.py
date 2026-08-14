@@ -107,7 +107,7 @@ if MODE == "financials":
             put(ws, f"{col}{r}", S[sc]["assumptions"][key], BLUE, fmt=fmt, fill=YELLOW)
         put(ws, f"E{r}", note, GREEN)
         r += 1
-    put(ws, "A11", "下一财年稀释股本 (M)", BOLD)
+    put(ws, "A11", "前瞻期(NTM)稀释股本 (M)", BOLD)
     put(ws, "B11", M["fwd_shares"], BLUE, fmt="#,##0", fill=YELLOW)
     put(ws, "E11", "三情景共用", GREEN)
 
@@ -264,7 +264,7 @@ if MODE == "financials":
     metrics = [
         ("TTM 调整后 EPS", "='情景假设'!$B$20", FM_EPS, d["adj_note"]),
         ("调整后 Trailing PE", "=B4/B11", FM_X, "现价 / TTM 调整后 EPS"),
-        (f"{FWD} EPS（合理）", "='情景假设'!$C$27", FM_EPS, "合理情景假设下的下一财年 EPS"),
+        (f"{FWD} EPS（合理）", "='情景假设'!$C$27", FM_EPS, "合理情景假设下的前瞻期(NTM) EPS"),
         ("Forward PE（合理）", "=B4/B13", FM_X, ""),
         ("当前 P/TBV", "=B4/'情景假设'!$B$21", FM_X2, "现价 / 每股有形账面价值"),
         ("justified P/TBV（合理）", "='情景假设'!$C$30", FM_X2,
@@ -371,7 +371,7 @@ for label, key, fmt, note in params:
         put(ws, f"{col}{r}", S[sc]["assumptions"][key], BLUE, fmt=fmt, fill=YELLOW)
     put(ws, f"E{r}", note, GREEN)
     r += 1
-put(ws, "A14", "下一财年稀释股本 (M)", BOLD)
+put(ws, "A14", "前瞻期(NTM)稀释股本 (M)", BOLD)
 put(ws, "B14", d["meta"]["fwd_shares"], BLUE, fmt="#,##0", fill=YELLOW)
 put(ws, "E14", "回购小幅缩减；三情景共用", GREEN)
 put(ws, "A15", "年化其他收益 ($M)", BOLD)
@@ -575,7 +575,7 @@ for col in "BCDEFG":
 ws.column_dimensions["H"].width = 72
 put(ws, "A1", f"{d['name']} / {T} 估值分析", TITLE, border=False)
 put(ws, "A2", f"sec-filing-downloader + SEC XBRL · {d['date']} · 分析工具输出，不构成投资建议", GREEN, border=False)
-_caliber = "目标价口径：综合目标价 = 当前公允价值（锚定下一财年盈利与 DCF 现值，≈未来12个月视角）"
+_caliber = "目标价口径：综合目标价 = 当前公允价值（锚定前瞻期 NTM 盈利与 DCF 现值，窗口见情景假设表）"
 if d["meta"].get("adr_multiple", 1.0) != 1.0:
     _caliber += f"；价格为 ADR（1 ADR = {d['meta']['adr_multiple']:g} 普通股，股本已折算）"
 if d["meta"].get("currency", "USD") != "USD":
@@ -615,7 +615,7 @@ for cell, v in [("A10", "指标"), ("B10", "数值"), ("H10", "说明")]:
 metrics = [
     ("TTM 调整后 EPS", "='情景假设'!$B$28", FM_EPS, d["adj_note"]),
     ("调整后 Trailing PE", "=B4/B11", FM_X, "现价 / TTM 调整后 EPS"),
-    (f"{FWD} EPS（合理）", "='情景假设'!$C$34", FM_EPS, "合理情景假设下的下一财年 EPS"),
+    (f"{FWD} EPS（合理）", "='情景假设'!$C$34", FM_EPS, "合理情景假设下的前瞻期(NTM) EPS"),
     ("Forward PE（合理）", "=B4/B13", FM_X, ""),
     ("PEG（合理）", "=B14/('情景假设'!$C$4*100)", "0.00", "Forward PE / 营收增速"),
     ("EV/EBIT (TTM)", "=(B5-B6)/'情景假设'!$B$20", FM_X, ""),
@@ -679,7 +679,8 @@ put(ws, "A26", f"方法离散度（同情景{_mth} max/min）：{_spread}——�
 # （情景=基本面情景各自的公允价，bear 是 EPS↓×PE↓ 双压；这块回答「按该票自己的
 # 历史倍数分布，base 盈利下会交易在哪个区间」）。PE 分位是引擎从 facts.pe_band
 # 取的常量，价格行/距现价行是活公式（改 base EPS 或现价即联动）。
-# 布局固定从 27 行起：verify_report 交叉核对 D30（P50 价格），改布局须同步。
+# 布局契约：块从 27 行起、价格行=起始行+3。verify_report 的检查列按同一 _qs 规则
+# 动态推导（不再写死 D30），但行号仍以此为契约——改起始行须两边同步。
 _row = 27
 _tr = d.get("trading_range")
 if _tr:

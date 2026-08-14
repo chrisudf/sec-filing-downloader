@@ -7,7 +7,7 @@
 # 任务
 
 根据下面的 XBRL 事实数据和财报关键章节摘录，为该金融公司生成 bear/base/bull 三情景估值假设。
-估值方法为 P/E 法（下一财年 EPS × 目标 PE）+ P/TBV 法（有形账面价值 × 目标 P/TBV，
+估值方法为 P/E 法（前瞻期 NTM EPS × 目标 PE，窗口见服务器注入的元数据）+ P/TBV 法（有形账面价值 × 目标 P/TBV，
 引擎同时按 Gordon 公式 (ROTE−g)/(WACC−g) 推导 justified P/TBV 作交叉参考）。
 
 必做检查清单：

@@ -61,7 +61,7 @@ flowchart TB
    （增速/利润率/倍数/WACC/FCF路径 + 每条依据与出处）；服务器注入价格/股本等事实并做
    schema 硬校验，不合格自动重试——**LLM 永远不碰算术**
 3. **计算层**（确定性 Python）：引擎算出全部数字 → Excel 里所有结果是引用黄色假设格的活公式 →
-   `formulas` 包独立复算 16 个关键单元格与引擎交叉核对，全部一致才交付
+   `formulas` 包独立复算 16~17 个关键单元格与引擎交叉核对（交易区间块在时多一项），全部一致才交付
 
 ## 📁 目录结构
 
@@ -75,12 +75,12 @@ sec-filing-downloader/
 │   └── index.html             # 深色主题单页前端（原生 JS，无构建步骤）
 ├── valuation/                 # 估值确定性计算层 + 判断层提示词
 │   ├── fetch_facts.py         # XBRL companyfacts 取数（多标签合并/Q4推导/TTM/SBC/PE带）
-│   ├── pe_band.py             # 历史 PE 分位带（forward/trailing 双口径 + 逆向匹配）
+│   ├── pe_band.py             # 历史 PE 分位带（forward/trailing/ntm 三口径 + 畸变剔除 + 逆向匹配）
 │   ├── extract_sections.py    # 财报关键章节定位（分部/税率/capex/流动性）
 │   ├── judgment_prompt.md     # 判断层提示词（假设 schema + 检查清单）
-│   ├── engine.py              # PE 法 / 十年 FCFF DCF / SOTP / 反向 DCF / 敏感性
+│   ├── engine.py              # PE 法 / 十年 FCFF DCF / SOTP / 反向 DCF / 交易区间 / 敏感性
 │   ├── build_report.py        # 六表 Excel（假设=黄色活格，全表公式联动）
-│   ├── verify_report.py       # formulas 包独立复算，16 项交叉核对
+│   ├── verify_report.py       # formulas 包独立复算，16~17 项交叉核对
 │   ├── compare.py             # 两次运行对比（基本面/假设漂移/结论变动）
 │   ├── vintages.py            # 估值快照归档：按报告期存，同期多次运行=多样本
 │   ├── trend.py               # N 期趋势视图：变化 vs 组内采样噪声的显著性对照

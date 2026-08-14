@@ -479,7 +479,8 @@ def main():
     ap.add_argument("--basis", choices=("forward", "trailing", "ntm"), default="forward",
                     help="forward=按该财年已实现EPS（复刻「财年交易区间」用这个）；"
                          "trailing=按当日已公告的滚动TTM EPS；"
-                         "ntm=按该日之后12个月实现的EPS（与 engine 的前瞻期严格同源）")
+                         "ntm=按该日已知最新TTM期末之后12个月实现的EPS"
+                         "（与 engine 的前瞻期严格同源；较日历日起算最多滞后一季）")
     ap.add_argument("--match")
     ap.add_argument("--out")
     a = ap.parse_args()
@@ -493,7 +494,8 @@ def main():
 
     basis_desc = {"forward": "forward（分母 = 该财年最终实现的稀释 EPS）",
                   "trailing": "trailing（分母 = 当日已公告的滚动四季 EPS）",
-                  "ntm": "ntm（分母 = 该日之后 12 个月实现的 EPS，与 engine 前瞻期同源）"}[a.basis]
+                  "ntm": "ntm（分母 = 该日已知最新 TTM 期末之后 12 个月实现的 EPS，"
+                         "与 engine 前瞻期同源）"}[a.basis]
     print(f"\n=== {b['ticker']} 历史 PE 带 · {basis_desc} ===")
     print(f"近 {a.years} 年，{b['days']} 个交易日 | XBRL CIK {b['cik']} | "
           "价格 yfinance 日收盘（拆股调整）")

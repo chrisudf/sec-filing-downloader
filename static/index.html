@@ -385,7 +385,8 @@ $("valBtn").addEventListener("click", async () => {
         const parts = Object.entries(st.summary || {}).map(
           ([k, v]) => `${k} $${v.blend}（${(v.upside * 100).toFixed(0)}%）`);
         // 交易区间与三情景并列：情景=基本面公允价，区间=按历史倍数该在哪交易
-        // lo/hi/mid 三个都要判：服务端是逐档 .get() 取的，缺一档就会渲染出
+        // lo/hi/mid 三重判空是防御：现状服务端只在五档分位齐时才出 trading_range
+        // （engine.py 闸门），缺档不可达；防的是未来服务端改成逐档可缺时渲染出
         // "$undefined~$undefined"——宁可整块不出
         const tr = st.trading_range;
         const trTxt = tr && tr.lo != null && tr.hi != null && tr.mid != null

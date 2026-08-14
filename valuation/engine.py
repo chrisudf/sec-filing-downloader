@@ -106,8 +106,8 @@ def _pctile_rank(pcts, x):
 def pe_band_check(scenario_name, pe, band, ddiag):
     """目标 PE 相对该票自身历史「已实现前瞻 PE」分布的位置。
 
-    口径对齐：band 由 fetch_facts 以 basis="ntm" 写入——分母是「该日之后 12 个月
-    实际实现的稀释 EPS」；引擎的 s["pe"] 乘的是 eps1 = TTM×(1+g)，前瞻期同样是
+    口径对齐：band 由 fetch_facts 以 basis="ntm" 写入——分母是「该日已知的最新
+    TTM 期末之后 12 个月实现的稀释 EPS」（按 filed 切换，比日历日起算最多滞后一季）；引擎的 s["pe"] 乘的是 eps1 = TTM×(1+g)，前瞻期同样是
     NTM（见 valuation_service.fwd_window）。两者严格同源，可直接比分位。
     band["basis"] 字段可核对；若哪天改回 forward（按财年切），只在 report_end =
     财年末时才对得上，AMZN/META 这类 12 月财年公司在 Q1~Q3 报告期会系统性错位。
