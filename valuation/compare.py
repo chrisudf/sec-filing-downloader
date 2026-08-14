@@ -29,6 +29,17 @@ if _sv_o != _sv_n:
           "倍数类假设（pe/m1/m2）的漂移不可直接读作判断层改了主意，"
           "综合目标价口径与水平也可能不同\n")
 
+# blend 权重对比：权重是口径不是假设——等权与缺省（老文件无该键）视为等价
+def _wnorm(w):
+    return {k: v for k, v in (w or {}).items()
+            if isinstance(v, (int, float)) and abs(v - 1) > 1e-9}
+
+
+_bw_o, _bw_n = _wnorm(old.get("blend_weights")), _wnorm(new.get("blend_weights"))
+if _bw_o != _bw_n:
+    print(f"⚠️  blend 权重不同（{_bw_o or '等权'} → {_bw_n or '等权'}）：综合目标价口径已变，"
+          "③ 里综合的水平差异先归因权重，不要读作假设修正\n")
+
 # 前瞻窗口对比：NTM 窗口随报告期滚动，跨季对比时不同是正常的（下面会如实打印）；
 # 但**同一报告期**内两次运行窗口不同 = 口径分裂，g/eps1/pe 全部不可直接对比——
 # 这正是趋势视图按 (fwd_label, semantics) 分组拒绝混聚的同一件事，两期对比也得拦

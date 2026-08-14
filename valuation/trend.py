@@ -100,6 +100,11 @@ def main():
             for s in used:
                 _k = (f"{s.get('fwd_label') or '?'}"
                       f"｜v{s.get('semantics_version') or '?'}")
+                # blend 权重非默认也是口径（等权与缺省视为同一组，兼容旧样本）
+                _bw = {k: v for k, v in (s.get("blend_weights") or {}).items()
+                       if isinstance(v, (int, float)) and abs(v - 1) > 1e-9}
+                if _bw:
+                    _k += "｜w=" + ":".join(f"{k}{v:g}" for k, v in sorted(_bw.items()))
                 groups.setdefault(_k, []).append(s)
             if len(groups) > 1:
                 mixed = {k: len(v) for k, v in groups.items()}

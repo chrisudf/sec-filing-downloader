@@ -61,6 +61,7 @@ def _sample(val: dict, gate_clean: bool) -> dict:
         "run_ts": time.time(),
         "gate_clean": bool(gate_clean),
         "semantics_version": val.get("semantics_version"),
+        "blend_weights": val.get("blend_weights"),
         # PENDING_10Q 样本：TTM 基准来自 8-K 新闻稿滚动而非 XBRL，10-Q 落地后的
         # 同格样本与它口径略有差异（override vs XBRL），读取侧可据此单独审视
         "pending_10q": bool((val.get("meta", {}).get("vintage") or {}).get("pending_10q")),

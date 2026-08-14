@@ -23,6 +23,24 @@ manifest = open(sys.argv[4], encoding="utf-8").read() if len(sys.argv) > 4 else 
 
 MODE = cfg.get("mode", facts.get("mode", "standard"))
 
+# ★ blend 权重政策（数字须按自己的纪律定；默认全 1 = 等权，历史行为逐位不变）。
+# 「95% 的情况实际用的是倍数」的立场 argue 倍数腿占大头——但 DCF 腿留着有实证
+# 价值（终值占比红旗、tv_pv 阈值巡航都是它抓的），所以做成权重而不是砍腿。
+# 环境变量覆盖（非负，按当次参与综合的腿归一化）：
+#   standard: VALUATION_BLEND_W_PE / _DCF / _SOTP；financials: _PE / _PTBV
+# 权重随 valuation.json（blend_weights）进 Excel 综合公式与 compare/trend——
+# 改权重 = 改口径，跨运行对比必须可见，不允许只活在环境变量里。
+def _env_w(name):
+    try:
+        w = float(os.environ.get(name, 1) or 1)
+    except ValueError:
+        w = 1.0
+    return max(w, 0.0)
+
+
+BLEND_W = {"pe": _env_w("VALUATION_BLEND_W_PE"), "dcf": _env_w("VALUATION_BLEND_W_DCF"),
+           "sotp": _env_w("VALUATION_BLEND_W_SOTP"), "ptbv": _env_w("VALUATION_BLEND_W_PTBV")}
+
 
 def _vintage(manifest_text, run_date):
     """从 manifest 提取"这份估值基于哪个报告期"——价值投资的第一个检查项就是数据新鲜度。
@@ -193,6 +211,7 @@ if MODE == "financials":
         # financials 情景语义恒为 v1（无一致性联动/锚）；显式写出，趋势视图按
         # (fwd_label, semantics_version) 复合键聚合时金融股样本才不会落进 "v?" 组
         semantics_version=1,
+        blend_weights={m: BLEND_W[m] for m in ("pe", "ptbv")},
         meta=dict(price=cfg["price"], mcap=cfg["mcap"], shares=cfg["shares"],
                   fwd_shares=cfg["fwd_shares"], fwd_label=cfg["fwd_label"],
                   tbv=tbv, tbv_ps=round(tbv_ps, 2), tbv_asof=eq_end,
@@ -217,7 +236,9 @@ if MODE == "financials":
         ptbv_ps = tbv_ps * s["ptbv"]
         rote1 = ni1 / tbv
         justified = (rote1 - s["tg"]) / (s["wacc"] - s["tg"])
-        blend = (pe_ps + ptbv_ps) / 2
+        _wsum = BLEND_W["pe"] + BLEND_W["ptbv"]
+        blend = ((pe_ps * BLEND_W["pe"] + ptbv_ps * BLEND_W["ptbv"]) / _wsum
+                 if _wsum > 0 else (pe_ps + ptbv_ps) / 2)
         out["scenarios"][name] = dict(
             assumptions=s, rev1=round(rev1), ni1=round(ni1), eps1=round(eps1, 2),
             pe_target=round(pe_ps, 1), ptbv_ps=round(ptbv_ps, 1),
@@ -287,6 +308,7 @@ out = dict(
     # PE 的产生方式与目标价水平，锚前(≤v2)/锚后(v3) 样本不可直接对比或混聚
     semantics_version=3,
     config_semantics_version=cfg.get("semantics_version", 1),
+    blend_weights={m: BLEND_W[m] for m in ("pe", "dcf", "sotp")},
     meta=dict(price=cfg["price"], mcap=cfg["mcap"], shares=cfg["shares"],
               fwd_shares=cfg["fwd_shares"], net_cash=cfg["net_cash"], fwd_label=cfg["fwd_label"],
               seg1=cfg["seg1"], seg2=cfg["seg2"], seg1_share=cfg["seg1_share"],
@@ -319,7 +341,10 @@ for name, s in cfg["scenarios"].items():
     blend_methods = ((["pe"] if not pe_nm else [])
                      + ["dcf"] + (["sotp"] if sotp_in_blend else []))
     methods = ([] if pe_nm else [pe_target]) + [dcf_ps] + ([sotp_ps] if sotp_in_blend else [])
-    blend = sum(methods) / len(methods)
+    _vals = {"pe": pe_target, "dcf": dcf_ps, "sotp": sotp_ps}
+    _wsum = sum(BLEND_W[m] for m in blend_methods)
+    blend = (sum(_vals[m] * BLEND_W[m] for m in blend_methods) / _wsum
+             if _wsum > 0 else sum(methods) / len(methods))
     spread = (round(max(methods) / min(methods), 2)
               if len(methods) > 1 and min(methods) > 0 else None)
 

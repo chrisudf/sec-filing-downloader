@@ -82,6 +82,7 @@ yellow 级只在摘要红旗区展示。**红旗不阻断出报告，但会阻�
 | 旋钮 | 现值 | 位置 | 什么时候调 |
 |---|---|---|---|
 | `VALUATION_MODEL` | **opus**（v2 起的默认） | `_claude()` | sonnet 同输入 4 次采样 base 全距 25.7%，opus CV≈3.5%。判断层是全链智力瓶颈，不建议为省额度换回；赶时间可临时 `VALUATION_MODEL=sonnet` |
+| `VALUATION_BLEND_W_PE`/`_DCF`/`_SOTP`/`_PTBV` | 全 1（等权 = 历史行为逐位不变） | `engine.py` BLEND_W | ★数字须按自己的纪律定。「95% 用倍数」的立场可加 PE 腿权重，但 DCF 腿的红旗（终值占比/tv_pv）不受权重影响照常工作。改权重=改口径：权重进 valuation.json/Excel 公式，compare 会警、trend 按权重签名隔离分组——先有 house view 再动，别当采样旋钮 |
 | `CLAUDE_TIMEOUT` | 600s | 模块常量 `CLAUDE_TIMEOUT` | opus 在 ~45k 字符 prompt 上更慢。超时会让整个任务报废 |
 | 单次运行总调用 | ≤ 3（首次 + schema retry 1 + 经济复审 1） | — | 刻意不做"拒绝就重采样"的循环——硬 gate 循环会教模型贴边过关，制造边界聚集偏差 |
 | 章节预算 | 45k 总量，按文件平分；fact 通道优先于 risk | `extract_sections.py` | 判断层 notes 反复说"摘录未含 XX"时加预算（代价=更长 prompt）。极端关键词密集的文档理论上会把 risk 通道挤空，真实 NVDA 10-K/10-Q 实测 risk 仍拿到 3+4 条 |

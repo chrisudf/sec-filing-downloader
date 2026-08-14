@@ -287,7 +287,14 @@ if MODE == "financials":
         put(ws, f"A{r}", label, BOLD)
         put(ws, f"B{r}", f"='情景假设'!${ac}$28", GREEN, fmt=FM_PX)
         put(ws, f"C{r}", f"='情景假设'!${ac}$31", GREEN, fmt=FM_PX)
-        c = put(ws, f"D{r}", f"=AVERAGE(B{r}:C{r})", BLACK, fmt=FM_PX)
+        _bw = d.get("blend_weights") or {}
+        if any(abs(_bw.get(m, 1) - 1) > 1e-9 for m in ("pe", "ptbv")):
+            _den = _bw.get("pe", 1) + _bw.get("ptbv", 1)
+            _f = (f"=(B{r}*{_bw.get('pe', 1):g}+C{r}*{_bw.get('ptbv', 1):g})/{_den:g}"
+                  if _den > 0 else f"=AVERAGE(B{r}:C{r})")
+        else:
+            _f = f"=AVERAGE(B{r}:C{r})"
+        c = put(ws, f"D{r}", _f, BLACK, fmt=FM_PX)
         c.fill = GREENFILL if r != 23 else REDFILL
         c.font = Font(name="Arial", bold=True, size=10)
         put(ws, f"E{r}", f"=D{r}/$B$4-1", BLACK, fmt=FM_PCT)
@@ -668,10 +675,19 @@ for label, ac, key, dcf_f, sotp_f in scen_rows:
     # 老 valuation.json 无该键，回退旧行为（pe+dcf+按降级开关的 sotp）
     _bm = (d["scenarios"][key].get("blend_methods")
            or ["pe", "dcf"] + (["sotp"] if _sotp_in else []))
-    _cells = [f"{c_}{r}" for m, c_ in (("pe", "B"), ("dcf", "C"), ("sotp", "D")) if m in _bm]
+    _pairs = [(m, c_) for m, c_ in (("pe", "B"), ("dcf", "C"), ("sotp", "D")) if m in _bm]
+    _cells = [f"{c_}{r}" for _, c_ in _pairs]
     if "pe" not in _bm:
         _nm_rows.append(label)
-    c = put(ws, f"E{r}", f"=AVERAGE({','.join(_cells)})", BLACK, fmt=FM_PX)
+    # 权重非默认时综合=显式加权公式（与引擎 BLEND_W 同构），默认等权保持 AVERAGE
+    _bw = d.get("blend_weights") or {}
+    if any(abs(_bw.get(m, 1) - 1) > 1e-9 for m, _ in _pairs):
+        _den = sum(_bw.get(m, 1) for m, _ in _pairs)
+        _num = "+".join(f"{c_}{r}*{_bw.get(m, 1):g}" for m, c_ in _pairs)
+        _bf = f"=({_num})/{_den:g}" if _den > 0 else f"=AVERAGE({','.join(_cells)})"
+    else:
+        _bf = f"=AVERAGE({','.join(_cells)})"
+    c = put(ws, f"E{r}", _bf, BLACK, fmt=FM_PX)
     c.fill = GREENFILL if r != 24 else REDFILL
     c.font = Font(name="Arial", bold=True, size=10)
     put(ws, f"F{r}", f"=E{r}/$B$4-1", BLACK, fmt=FM_PCT)

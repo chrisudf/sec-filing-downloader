@@ -83,6 +83,10 @@ bear \$37-\$87，根因是判断层对连续参数的独立采样叠加"情景�
   max(4, 0.6×锚窗P10)（带子即证据）；无带子回退静态 8
 - 锚改变 base PE 的产生方式与目标价水平：锚前(≤v2)/锚后(v3) 样本在 trend/compare 里
   按版本隔离，连续性锚跨版本自动失效重建
+- **近零利润守卫**：情景 eps1<=0 或 opm<2% 时 PE 腿 n.m. 退出综合（blend_methods 记录），
+  综合退化为 DCF(+SOTP)，红旗区给 P/S 参考价（facts.ps_band，不入综合）
+- **blend 权重政策**：`VALUATION_BLEND_W_PE/_DCF/_SOTP/_PTBV`（默认等权，行为不变）；
+  权重随 valuation.json 进 Excel 公式与 compare/trend——改权重=改口径
 
 ## 判断层检查清单（写 config 前必做）
 
