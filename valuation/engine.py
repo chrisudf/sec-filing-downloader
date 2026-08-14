@@ -383,6 +383,11 @@ if _e1 > 0 and all(q in _use for q in ("10", "25", "50", "75", "90")):
         full_window_p50=(round(float(_band["pctiles"]["50"]), 2)
                          if _band.get("pctiles") else None))
 
+# Rule of 40 透传（fetch_facts 计算，standard 模式）：营收增速+利润率的标尺，
+# 与 pe_band 同属"倍数值不值得给"的判断参照，进报告与 prompt 元数据
+if facts.get("rule_of_40"):
+    out["rule_of_40"] = facts["rule_of_40"]
+
 # 反向 DCF：base 口径下现价隐含的起始增速
 s = cfg["scenarios"]["base"]
 lo, hi = -0.20, 0.80

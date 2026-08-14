@@ -303,6 +303,52 @@ out["ttm"] = ttm
 out["data_latest"] = max(max(out["revenue_annual"], default=""),
                          max(out["revenue_quarterly"], default=""))
 
+# ---- Rule of 40（standard 模式）：营收增速 + 利润率，"高倍数值不值得给"的标尺
+# （软件/平台业惯例：>40 分算优秀——增速是在换未来利润还是单纯烧钱）。
+# 营收增速 = TTM vs 上一个 TTM（最近 8 个离散季度，逐 gap 校验），比单季 YoY 稳；
+# 利润率给两个口径：营业利润率（主）与 FCF 利润率——FCF 把 SBC 加了回来
+# （SBC 是真实成本），剔 SBC 变体一并给出，SBC 占营收比高的票两者差十几分。
+# 非核心项：任何一项算不出只留空，不阻断取数。
+if MODE == "standard":
+    ro40 = {}
+    _q8 = list(out["revenue_quarterly"].items())[-8:]
+    if len(_q8) == 8:
+        _ends = [date.fromisoformat(k) for k, _ in _q8]
+        if all(80 <= (_ends[i + 1] - _ends[i]).days <= 100 for i in range(7)):
+            _cur4 = sum(v for _, v in _q8[4:])
+            _prev4 = sum(v for _, v in _q8[:4])
+            if _prev4 > 0:
+                ro40["rev_g_ttm"] = round(_cur4 / _prev4 - 1, 4)
+    _rev = (ttm.get("revenue") or {}).get("value")
+    if _rev:
+        _op = (ttm.get("op_income") or {}).get("value")
+        _cfo = (ttm.get("cfo") or {}).get("value")
+        _cap = (ttm.get("capex") or {}).get("value")
+        _sbc = (ttm.get("sbc") or {}).get("value")
+        if _op is not None:
+            ro40["opm_ttm"] = round(_op / _rev, 4)
+        if _cfo is not None and _cap is not None:
+            ro40["fcf_margin_ttm"] = round((_cfo - _cap) / _rev, 4)
+        if _sbc is not None:
+            ro40["sbc_margin_ttm"] = round(_sbc / _rev, 4)
+    if "rev_g_ttm" in ro40:
+        if "opm_ttm" in ro40:
+            ro40["score_op"] = round(100 * (ro40["rev_g_ttm"] + ro40["opm_ttm"]), 1)
+        if "fcf_margin_ttm" in ro40:
+            ro40["score_fcf"] = round(100 * (ro40["rev_g_ttm"] + ro40["fcf_margin_ttm"]), 1)
+            if "sbc_margin_ttm" in ro40:
+                ro40["score_fcf_ex_sbc"] = round(
+                    100 * (ro40["rev_g_ttm"] + ro40["fcf_margin_ttm"] - ro40["sbc_margin_ttm"]), 1)
+    if ro40:
+        out["rule_of_40"] = ro40
+        if "score_op" in ro40:
+            print(f"Rule of 40: 营收增速 {ro40.get('rev_g_ttm', 0):+.1%} + "
+                  f"OPM {ro40.get('opm_ttm', 0):.1%} = {ro40['score_op']:.0f} 分"
+                  + (f"（FCF 口径 {ro40['score_fcf']:.0f}"
+                     + (f"，剔 SBC {ro40['score_fcf_ex_sbc']:.0f}"
+                        if "score_fcf_ex_sbc" in ro40 else "") + "）"
+                     if "score_fcf" in ro40 else ""))
+
 # ---- 历史「已实现前瞻 PE」分布：供 engine.py 的目标 PE 越界诊断（pe_band_check）
 # 引擎是零联网的确定性计算层，带子必须在数据层备好。属非核心项：任何失败只记
 # pe_band_error 不阻断取数——但要留痕，不静默。VALUATION_NO_PE_BAND=1 可关闭。

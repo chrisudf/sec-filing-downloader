@@ -672,9 +672,23 @@ async def _pipeline(job: dict, ticker: str, email: str) -> None:
               "不接受——那会系统性压低所有标的。"
               "\n  若下方给出「上一次运行的假设（连续性基准）」，连续性优先——"
               "本锚只约束首次基线与失锚重建。")
+    # Rule of 40（fetch_facts 计算）：营收增速+利润率，「高倍数值不值得给」的对照
+    # 标尺——分数高支撑倍数带上沿，分数低而倍数高 = 增速在烧钱换。给判断层做
+    # pe/g 组合合理性的参照，不是硬规则（校验层不执法）。
+    ro40_meta = ""
+    _r40 = facts.get("rule_of_40") or {}
+    if mode == "standard" and _r40.get("score_op") is not None:
+        ro40_meta = (
+            f"\nRule of 40（TTM）：营收增速 {_r40.get('rev_g_ttm', 0):+.1%} + 营业利润率 "
+            f"{_r40.get('opm_ttm', 0):.1%} = {_r40['score_op']:.0f} 分"
+            + (f"；FCF 口径 {_r40['score_fcf']:.0f} 分" if _r40.get("score_fcf") is not None else "")
+            + (f"（剔 SBC 后 {_r40['score_fcf_ex_sbc']:.0f} 分，SBC 占营收 "
+               f"{_r40['sbc_margin_ttm']:.1%}）" if _r40.get("score_fcf_ex_sbc") is not None else "")
+            + "\n  ← 软件/平台类 >40 算优秀。用作 pe/g 组合合理性的对照：分数低于 40"
+              " 而你给的目标倍数落在历史带上沿时，rationale.pe 里要说清为什么。")
     prompt = (f"{base_prompt}\n\n# 服务器注入的元数据（不要输出这些字段）\n"
               f"ticker={ticker} name={info['name']} date={today} price={price:.2f} "
-              f"mcap={mcap/1e6:,.0f}M$ shares={shares}M股{fwd_meta}{band_meta}{caliber}\n\n"
+              f"mcap={mcap/1e6:,.0f}M$ shares={shares}M股{fwd_meta}{band_meta}{ro40_meta}{caliber}\n\n"
               f"# FACTS（SEC XBRL）\n{_compact_facts(facts)}\n\n"
               f"# MANIFEST（本次分析的财报文件）\n{manifest}\n\n"
               f"# SECTIONS（财报关键章节摘录 JSON）\n{sections}{prev_section}\n")

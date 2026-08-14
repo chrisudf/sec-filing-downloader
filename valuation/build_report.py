@@ -624,6 +624,18 @@ metrics = [
      "现价隐含的 DCF 起始增速（10年线性衰减）——条件于 base 的利润率路径与 WACC，"
      "base 假设错则此值同错；Python 引擎计算"),
 ]
+# Rule of 40（fetch_facts 计算，engine 透传）：高倍数值不值得给的标尺——
+# 静态值不联动（增速/利润率不在工作簿内），放 metrics 末行（第 19 行），
+# 不移动任何 verify_report 交叉核对的单元格
+_r40 = d.get("rule_of_40") or {}
+if _r40.get("score_op") is not None:
+    metrics.append((
+        "Rule of 40（TTM）", _r40["score_op"], "0.0",
+        f"营收增速 {_r40.get('rev_g_ttm', 0):+.1%} + 营业利润率 {_r40.get('opm_ttm', 0):.1%}"
+        + (f"；FCF 口径 {_r40['score_fcf']:.1f} 分" if _r40.get("score_fcf") is not None else "")
+        + (f"（剔 SBC 后 {_r40['score_fcf_ex_sbc']:.1f}，SBC 占营收 "
+           f"{_r40['sbc_margin_ttm']:.1%}）" if _r40.get("score_fcf_ex_sbc") is not None else "")
+        + "。软件/平台类 >40 算优秀——分数低而倍数高 = 增速在烧钱换"))
 r = 11
 for label, v, fmt, note in metrics:
     put(ws, f"A{r}", label, BOLD)
