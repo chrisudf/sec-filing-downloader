@@ -653,7 +653,13 @@ async def _pipeline(job: dict, ticker: str, email: str) -> None:
     # 直接锚全窗会把泡沫倍数抬进锚。与连续性纪律同哲学：无证据不偏离。
     band_meta = ""
     _b = facts.get("pe_band") or {}
-    if mode == "standard" and _b.get("pctiles"):
+    if mode == "standard" and _b.get("thin_coverage"):
+        # 覆盖不足：不给锚（薄样本的 P50 没有话语权），但显式告诉判断层"没有锚"——
+        # 沉默会让它自由发挥还以为有历史背书
+        band_meta = (f"\n历史 NTM PE 带覆盖不足（仅 {_b.get('days')} 个交易日/"
+                     f"{_b.get('years')} 年，原始数据缺口）——**本次无历史锚**：目标 PE 按"
+                     "基本面第一性与可比经验判断，并在 rationale.pe 写明定价依据。")
+    elif mode == "standard" and _b.get("pctiles"):
         _rc = _b.get("recent") or {}
         _rp = _rc.get("pctiles") or {}
 
@@ -676,7 +682,10 @@ async def _pipeline(job: dict, ticker: str, email: str) -> None:
     # financials 的锚是 P/TBV 带（图3 的教科书结论：银行 E 带杠杆带周期，估值锚
     # 是 P/B 系）——与 standard 的 PE 锚同一纪律结构，锚 s["ptbv"]
     _tb = facts.get("ptbv_band") or {}
-    if mode == "financials" and _tb.get("pctiles"):
+    if mode == "financials" and _tb.get("thin_coverage"):
+        band_meta = (f"\n历史 P/TBV 带覆盖不足（仅 {_tb.get('days')} 个交易日）——本次无历史锚："
+                     "目标 P/TBV 按 ROTE/资本回报第一性判断，并在 rationale.ptbv 写明依据。")
+    elif mode == "financials" and _tb.get("pctiles"):
         _rc2 = _tb.get("recent") or {}
         _rp2 = _rc2.get("pctiles") or {}
 

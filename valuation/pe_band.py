@@ -513,9 +513,13 @@ def compute_band(ticker, email, years=5, basis="forward", include_series=False,
                         "low": seg[0], "median": pctile(seg, 50),
                         "high": seg[-1], "days": len(seg)})
 
+    # 覆盖率门槛：有效天数不足一个财年（<250 交易日）时，分布不代表"该票的历史"，
+    # 锚/交易区间/中枢检查在消费侧全部停用（看 thin_coverage 字段）。双类股股数
+    # 维度化导致的原料缺口（GOOG 实测 5 年仅 61 天）、新上市、长停牌都会踩到——
+    # 薄样本照出不误（排查用），但不给它锚的话语权。
     out = {
         "ticker": ticker, "cik": cik, "basis": basis, "metric": metric,
-        "years": years, "days": len(series),
+        "years": years, "days": len(series), "thin_coverage": len(series) < 250,
         "mean": mean, "median": pcts[50], "stdev": sd_, "min": sv[0], "max": sv[-1],
         "pctiles": pcts, "recent": recent, "fiscal_years": fy_rows, "current": cur,
         "other_basis": other.split("_")[1],
@@ -670,7 +674,7 @@ def compute_ptbv_band(ticker, email, years=5, inputs=None):
     cur = series[-1]
     return {
         "ticker": ticker, "cik": inputs["cik"], "basis": "trailing", "metric": "tbvps",
-        "years": years, "days": len(series),
+        "years": years, "days": len(series), "thin_coverage": len(series) < 250,
         "mean": statistics.mean(vals), "median": pcts[50], "stdev": statistics.pstdev(vals),
         "min": sv[0], "max": sv[-1], "pctiles": pcts, "recent": recent, "current": cur,
         "split_notes": split_notes, "shares_basis": shares_basis,

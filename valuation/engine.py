@@ -142,6 +142,15 @@ def pe_band_check(scenario_name, pe, band, ddiag, label="PE", diag_key="pe_vs_hi
     """
     if not band or not band.get("pctiles"):
         return []
+    if band.get("thin_coverage"):
+        # 覆盖不足（<250 天）：分布不是"该票的历史"，锚与中枢检查都失去意义——
+        # 停用并只在 base 上留一条可见的黄旗（三情景重复三遍是噪声）
+        ddiag[diag_key] = {"thin_coverage": True, "days": band["days"],
+                           "years": band["years"], "basis": band["basis"]}
+        if scenario_name == "base":
+            return [["yellow", f"历史{label}带覆盖不足（{band['days']} 天/{band['years']} 年，"
+                               "原始数据缺口）——锚与中枢检查停用，倍数假设无历史对照"]]
+        return []
     pcts = band["pctiles"]
     rank = _pctile_rank(pcts, pe)
     # base 中枢检查用与判断层 PE 锚同一个窗（近 3 年子窗，见 valuation_service 的
@@ -452,7 +461,11 @@ if _base_pe_nm and _use:
     out["scenarios"]["base"]["warnings"].append(
         ["yellow", f"base PE 腿 n.m.（前瞻 EPS {_e1:.2f}）——交易区间（历史 PE 分位 × "
                    "base EPS）无意义，本次不出该块；参考红旗区的 P/S 参考价"])
-if not _base_pe_nm and all(q in _use for q in ("10", "25", "50", "75", "90")):
+if _band.get("thin_coverage") and _use:
+    out["scenarios"]["base"]["warnings"].append(
+        ["yellow", f"历史 PE 带覆盖不足（{_band.get('days')} 天）——交易区间不出"])
+if (not _base_pe_nm and not _band.get("thin_coverage")
+        and all(q in _use for q in ("10", "25", "50", "75", "90"))):
     _tr_pe = {q: round(float(_use[q]), 2) for q in ("10", "25", "50", "75", "90")}
     out["trading_range"] = dict(
         basis=_band.get("basis"),
