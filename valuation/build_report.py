@@ -745,7 +745,12 @@ sources = [
     ("调整后净利", d["adj_note"]),
     ("净现金", d["net_cash_note"]),
     ("估值语义版本", (f"semantics_version={d.get('semantics_version', 1)}"
-                     + ("（v2, 2026-07-22：跨情景一致性规则 / SOTP 降级 / 诊断红旗；"
+                     + ("（v3, 2026-08-14：v2 之上 base 目标 PE 默认锚历史 NTM 带"
+                        "近3年子窗 P50、偏离 ±15% 须给证据；"
+                        f"config 声明版本 v{d.get('config_semantics_version', 1)}；"
+                        "锚前(≤v2)与锚后(v3) 的倍数假设与目标价水平不可直接对比）"
+                        if d.get("semantics_version", 1) >= 3 else
+                        "（v2, 2026-07-22：跨情景一致性规则 / SOTP 降级 / 诊断红旗；"
                         f"config 声明版本 v{d.get('config_semantics_version', 1)}；"
                         "v1 与 v2 的倍数假设与综合口径不可直接对比）"
                         if d.get("semantics_version", 1) >= 2 else

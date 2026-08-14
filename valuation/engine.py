@@ -14,7 +14,7 @@ import io
 import json
 import os
 import sys
-from datetime import date
+from datetime import date, timedelta
 
 cfg = json.load(open(sys.argv[1], encoding="utf-8"))
 facts = json.load(open(sys.argv[2], encoding="utf-8"))
@@ -51,6 +51,15 @@ def _vintage(manifest_text, run_date):
 
 
 VINTAGE = _vintage(manifest, cfg["date"])
+# PENDING_10Q（业绩 8-K 已出、10-Q 未交）：本次运行的判断层已被强制按新闻稿滚动
+# TTM（ttm_revenue_override），估的是 8-K 覆盖的那个季度——vintage 归档键若仍用
+# 定期报告期末，会把"最新业绩下的估值"归进旧季度的格子，等 10-Q 落地后的运行
+# 与它同格混聚。归档键前滚到滚动后的 TTM 末端（= fwd_window.start − 1 天）；
+# report_end/age_days 保持定期报告口径不动——时效面板要展示的恰是"10-Q 还没来"。
+if cfg.get("pending_10q") and (cfg.get("fwd_window") or {}).get("start") and VINTAGE:
+    _fs = date.fromisoformat(cfg["fwd_window"]["start"])
+    VINTAGE["vintage_end"] = (_fs - timedelta(days=1)).isoformat()
+    VINTAGE["pending_10q"] = True
 
 
 def dcf(rev0, g0, gN, margins, wacc, tg, net_cash, shares, years=10):
@@ -181,6 +190,9 @@ if MODE == "financials":
 
     out = dict(
         ticker=cfg["ticker"], name=cfg["name"], date=cfg["date"], mode="financials",
+        # financials 情景语义恒为 v1（无一致性联动/锚）；显式写出，趋势视图按
+        # (fwd_label, semantics_version) 复合键聚合时金融股样本才不会落进 "v?" 组
+        semantics_version=1,
         meta=dict(price=cfg["price"], mcap=cfg["mcap"], shares=cfg["shares"],
                   fwd_shares=cfg["fwd_shares"], fwd_label=cfg["fwd_label"],
                   tbv=tbv, tbv_ps=round(tbv_ps, 2), tbv_asof=eq_end,
@@ -270,8 +282,10 @@ out = dict(
     ticker=cfg["ticker"], name=cfg["name"], date=cfg["date"], mode="standard",
     # 语义版本属于引擎实现而非 config 声明：本引擎无条件执行 v2 计算（SOTP 降级/
     # 诊断），重放 v1 老 config 时若透传声明值会得到"标 v1 却是两法综合"的自相矛盾
-    # 输出，compare.py 的 1==1 还会静默掉它本该拦的口径跳变告警
-    semantics_version=2,
+    # 输出，compare.py 的 1==1 还会静默掉它本该拦的口径跳变告警。
+    # v3（2026-08-14）：判断层 PE 锚（历史 NTM 带子窗 P50）纳入语义——锚改变 base
+    # PE 的产生方式与目标价水平，锚前(≤v2)/锚后(v3) 样本不可直接对比或混聚
+    semantics_version=3,
     config_semantics_version=cfg.get("semantics_version", 1),
     meta=dict(price=cfg["price"], mcap=cfg["mcap"], shares=cfg["shares"],
               fwd_shares=cfg["fwd_shares"], net_cash=cfg["net_cash"], fwd_label=cfg["fwd_label"],

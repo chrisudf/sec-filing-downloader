@@ -25,8 +25,24 @@ if old.get("mode", "standard") != mode:
 _sv_o, _sv_n = old.get("semantics_version", 1), new.get("semantics_version", 1)
 if _sv_o != _sv_n:
     print(f"⚠️  估值语义版本不同（v{_sv_o} → v{_sv_n}）：v2（2026-07-22）起有跨情景联动"
-          "约束与 SOTP 降级，倍数类假设（pe/m1/m2）的漂移不可直接读作判断层改了主意，"
-          "综合目标价口径也可能不同（两法 vs 三法均值）\n")
+          "约束与 SOTP 降级，v3（2026-08-14）起 base PE 默认锚历史 NTM 带子窗 P50——"
+          "倍数类假设（pe/m1/m2）的漂移不可直接读作判断层改了主意，"
+          "综合目标价口径与水平也可能不同\n")
+
+# 前瞻窗口对比：NTM 窗口随报告期滚动，跨季对比时不同是正常的（下面会如实打印）；
+# 但**同一报告期**内两次运行窗口不同 = 口径分裂，g/eps1/pe 全部不可直接对比——
+# 这正是趋势视图按 (fwd_label, semantics) 分组拒绝混聚的同一件事，两期对比也得拦
+_fw_o = (old.get("meta") or {}).get("fwd_label")
+_fw_n = (new.get("meta") or {}).get("fwd_label")
+_re_o = ((old.get("meta") or {}).get("vintage") or {}).get("report_end")
+_re_n = ((new.get("meta") or {}).get("vintage") or {}).get("report_end")
+if _fw_o != _fw_n:
+    if _re_o and _re_o == _re_n:
+        print(f"⚠️  同一报告期（{_re_o}）下前瞻窗口不同（{_fw_o} → {_fw_n}）：口径分裂，"
+              "②③ 里 g/eps1/PE/目标价的一切差异先归因于窗口，不要读作假设修正\n")
+    else:
+        print(f"ℹ️  前瞻窗口随报告期滚动：{_fw_o} → {_fw_n}"
+              "（跨季对比属正常；g/eps1 的分母窗口不同，幅度对比留意口径）\n")
 
 
 def chg(a, b, pct=False):

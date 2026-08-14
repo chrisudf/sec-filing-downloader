@@ -61,6 +61,9 @@ def _sample(val: dict, gate_clean: bool) -> dict:
         "run_ts": time.time(),
         "gate_clean": bool(gate_clean),
         "semantics_version": val.get("semantics_version"),
+        # PENDING_10Q 样本：TTM 基准来自 8-K 新闻稿滚动而非 XBRL，10-Q 落地后的
+        # 同格样本与它口径略有差异（override vs XBRL），读取侧可据此单独审视
+        "pending_10q": bool((val.get("meta", {}).get("vintage") or {}).get("pending_10q")),
         "price": val.get("meta", {}).get("price"),
         "fwd_label": val.get("meta", {}).get("fwd_label"),
         "adj_ni": val.get("adj_ni"), "adj_eps": val.get("adj_eps"),
@@ -81,7 +84,11 @@ def record(val: dict, gate_clean: bool, root: Path | None = None) -> Path | None
     # 掩盖了这个问题，但部署在 Linux 上时小写 ticker 会写进 vintages/aapl/ 而
     # load 去读 vintages/AAPL/，表现为"归档成功但趋势视图读不到"
     ticker = (val.get("ticker") or "").upper()
-    report_end = (val.get("meta", {}).get("vintage") or {}).get("report_end")
+    _vin = val.get("meta", {}).get("vintage") or {}
+    # PENDING_10Q 运行的归档键用前滚后的窗口末端（engine 写入 vintage_end）：
+    # 判断层已按 8-K 滚动 TTM，估的是新季度——归进旧 report_end 的格子会让
+    # 趋势视图把"最新业绩下的估值"当旧季度样本，10-Q 落地后的运行再与之混聚
+    report_end = _vin.get("vintage_end") or _vin.get("report_end")
     if not ticker or not report_end:
         return None  # 无 manifest 的手工运行没有报告期，不归档好过归到错误的格子
     d = root / "vintages" / ticker

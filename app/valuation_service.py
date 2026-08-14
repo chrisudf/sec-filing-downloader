@@ -596,8 +596,8 @@ async def _pipeline(job: dict, ticker: str, email: str) -> None:
                 stale = None
                 if prev.get("ticker") != ticker:
                     stale = "标的不符"
-                elif prev.get("semantics_version", 1) != 2:
-                    stale = f"语义版本 v{prev.get('semantics_version', 1)} != v2"
+                elif prev.get("semantics_version", 1) != 3:
+                    stale = f"语义版本 v{prev.get('semantics_version', 1)} != v3"
                 elif prev.get("manifest_latest") and latest_report \
                         and prev["manifest_latest"] != latest_report:
                     stale = f"出现新报告期 {latest_report}（上次基于 {prev['manifest_latest']}）"
@@ -709,8 +709,11 @@ async def _pipeline(job: dict, ticker: str, email: str) -> None:
     if judgment is None:
         raise RuntimeError(f"判断层输出两次校验失败：{last_err}")
 
-    # semantics_version=2（2026-07-22）：v2 一致性规则/诊断红旗/SOTP 降级口径，
-    # 仅描述 standard 模式（financials 沿用 v1 情景语义，恒为 1）。
+    # semantics_version=3（2026-08-14）：v2 的一致性规则/诊断红旗/SOTP 降级之上，
+    # 纳入判断层 PE 锚（66ad9c4 起注入历史 NTM 带、base 默认锚子窗 P50）——锚改变
+    # base PE 的产生方式与目标价水平，锚前样本与锚后样本混在趋势视图里聚合会把
+    # 语义变化读成基本面修正，必须靠版本号隔开。仅描述 standard 模式
+    # （financials 沿用 v1 情景语义，恒为 1）。
     # manifest_latest 直接进 cfg：bundle 里的 config_假设留档.json 与自动锚同源，
     # 显式 VALUATION_PREV_CONFIG 指向 bundle config 时报告期失效触发器才有指纹可查
     def _build_cfg(j: dict) -> dict:
@@ -724,8 +727,12 @@ async def _pipeline(job: dict, ticker: str, email: str) -> None:
                  price=round(price, 2), mcap=round(mcap / 1e6), shares=shares,
                  mode=mode, adr_multiple=adr_multiple,
                  currency=facts.get("currency", "USD"),
-                 semantics_version=2 if mode == "standard" else 1,
-                 manifest_latest=latest_report)
+                 semantics_version=3 if mode == "standard" else 1,
+                 manifest_latest=latest_report,
+                 # PENDING_10Q 标记进 cfg：engine 据此把 vintage 归档键前滚到 8-K
+                 # 覆盖的季度（fwd_window 已 +3 个月），否则这次运行会归进旧
+                 # report_end 的格子，趋势视图把"最新业绩下的估值"错当旧季度样本
+                 pending_10q=bool(pending_8k))
         # fwd_label 是可由 report_end 纯日期推导的事实，与 price/shares 同类：
         # 在此**覆盖**判断层的输出，让"选错财年"这个失败模式从构造上不存在。
         # 判断层若仍输出了该字段，静默被盖掉即可——prompt 已明确要求不要输出。
