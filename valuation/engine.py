@@ -121,7 +121,7 @@ def _pctile_rank(pcts, x):
     return 50.0
 
 
-def pe_band_check(scenario_name, pe, band, ddiag):
+def pe_band_check(scenario_name, pe, band, ddiag, label="PE", diag_key="pe_vs_history"):
     """目标 PE 相对该票自身历史「已实现前瞻 PE」分布的位置。
 
     口径对齐：band 由 fetch_facts 以 basis="ntm" 写入——分母是「该日已知的最新
@@ -135,6 +135,10 @@ def pe_band_check(scenario_name, pe, band, ddiag):
 
     阈值刻意保守：只在「该票历史上从未出现过的倍数」或「base 偏离中枢区间」时报
     yellow。低倍数本身不是错——价值下沿本就该落在历史低位附近，这里只要求留痕。
+
+    label/diag_key 参数化后同一套逻辑服务 financials 的 P/TBV 带（trailing 口径，
+    分母=当日已知每股 TBV，与 engine 的 tbv_ps 同构）——检查结构完全同型：
+    全窗 min/max 管「从未出现过」，base 管子窗中枢并集。
     """
     if not band or not band.get("pctiles"):
         return []
@@ -148,17 +152,17 @@ def pe_band_check(scenario_name, pe, band, ddiag):
     _rp = _rc.get("pctiles") or {}
     cpcts = _rp if ("10" in _rp and "90" in _rp) else pcts
     cwin = f"近{_rc['years']}年子窗" if cpcts is _rp else f"近{band['years']}年全窗"
-    ddiag["pe_vs_history"] = {
+    ddiag[diag_key] = {
         "pctile": round(rank, 1), "median": round(pcts["50"], 1),
         "p10": round(pcts["10"], 1), "p90": round(pcts["90"], 1),
         "min": round(band["min"], 1), "max": round(band["max"], 1),
         "anchor_window": cwin,
         "anchor_p50": (round(cpcts["50"], 1) if "50" in cpcts else None),
         "years": band["years"], "days": band["days"], "basis": band["basis"]}
-    ctx = (f"（近 {band['years']} 年已实现前瞻 PE：中位 {pcts['50']:.1f}x，"
+    ctx = (f"（近 {band['years']} 年已实现{label}：中位 {pcts['50']:.1f}x，"
            f"实际区间 {band['min']:.1f}~{band['max']:.1f}x，{band['days']} 个交易日）")
     if not band["min"] <= pe <= band["max"]:
-        return [["yellow", f"{scenario_name} 目标 PE {pe:.1f}x 落在该票近 {band['years']} 年"
+        return [["yellow", f"{scenario_name} 目标 {label} {pe:.1f}x 落在该票近 {band['years']} 年"
                            f"从未出现过的区间之外{ctx}——不必然是错，"
                            "但请在 rationale 中给出依据"]]
     if scenario_name == "base":
@@ -172,7 +176,7 @@ def pe_band_check(scenario_name, pe, band, ddiag):
             lo_ok = min(lo_ok, cpcts["50"] * (1 - ANCHOR_TOL))
             hi_ok = max(hi_ok, cpcts["50"] * (1 + ANCHOR_TOL))
         if not lo_ok <= pe <= hi_ok:
-            return [["yellow", f"base 目标 PE {pe:.1f}x 界外 {cwin} [P10,P90]="
+            return [["yellow", f"base 目标 {label} {pe:.1f}x 界外 {cwin} [P10,P90]="
                                f"[{cpcts['10']:.1f},{cpcts['90']:.1f}]x（并 P50±"
                                f"{ANCHOR_TOL:.0%} 后为 [{lo_ok:.1f},{hi_ok:.1f}]x，"
                                f"全窗第 {rank:.0f} 百分位）{ctx}——base 应为中枢情景"]]
@@ -239,6 +243,12 @@ if MODE == "financials":
         _wsum = BLEND_W["pe"] + BLEND_W["ptbv"]
         blend = ((pe_ps * BLEND_W["pe"] + ptbv_ps * BLEND_W["ptbv"]) / _wsum
                  if _wsum > 0 else (pe_ps + ptbv_ps) / 2)
+        # P/TBV 带检查（standard 的 pe_band_check 同一套逻辑，label 换 P/TBV）：
+        # financials 此前无 warnings/diagnostics 通道——TODO 里挂了两轮的项，
+        # 带子进来时必须一起开通，否则检查结果没地方去
+        ddiag = {}
+        warnings = pe_band_check(name, s["ptbv"], facts.get("ptbv_band"), ddiag,
+                                 label="P/TBV", diag_key="ptbv_vs_history")
         out["scenarios"][name] = dict(
             assumptions=s, rev1=round(rev1), ni1=round(ni1), eps1=round(eps1, 2),
             pe_target=round(pe_ps, 1), ptbv_ps=round(ptbv_ps, 1),
@@ -248,6 +258,7 @@ if MODE == "financials":
             fwd_pe=round(cfg["price"] / eps1, 1),
             method_spread=round(max(pe_ps, ptbv_ps) / min(pe_ps, ptbv_ps), 2)
             if min(pe_ps, ptbv_ps) > 0 else None,
+            diagnostics=ddiag, warnings=warnings,
         )
 
     # 敏感性：base 口径 justified P/TBV 每股价值 = f(WACC, 永续g)
@@ -281,6 +292,8 @@ if MODE == "financials":
         print(f"{n:5s}| EPS1 {v['eps1']:7.2f} | PE法 {v['pe_target']:8.1f} | "
               f"P/TBV法 {v['ptbv_ps']:8.1f} (justified {v['justified_ptbv']:.2f}x) | "
               f"综合 {v['blend']:8.1f} | {v['upside']:+.1%}")
+        for lv, msg in v["warnings"]:
+            print(f"      {'⛔' if lv == 'red' else '⚠️'} {msg}")
     sys.exit(0)
 
 # ================= standard：PE + DCF + SOTP =================

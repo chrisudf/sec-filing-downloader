@@ -65,6 +65,12 @@ NI_TAGS = ["NetIncomeLoss", "ProfitLossAttributableToOwnersOfParent", "ProfitLos
 # 分项 tag 同期并存时取大（CRCL：Revenues $2,747M vs 合同收入 $110M，取小静默错 25 倍）
 REV_TAGS = ["RevenueFromContractWithCustomerExcludingAssessedTax", "Revenues",
             "SalesRevenueNet", "Revenue", "RevenueFromContractsWithCustomers"]
+# TBV 组件 tag 与 fetch_facts.TAGS_FINANCIALS 一致（严格同源：engine 的
+# tbv = equity − goodwill − intangibles 用的正是这套 tag 的时点值）
+EQ_TAGS = ["StockholdersEquity",
+           "StockholdersEquityIncludingPortionAttributableToNoncontrollingInterest"]
+GW_TAGS = ["Goodwill"]
+IT_TAGS = ["IntangibleAssetsNetExcludingGoodwill", "FiniteLivedIntangibleAssetsNet"]
 SH_TAGS = ["WeightedAverageNumberOfDilutedSharesOutstanding",
            "AdjustedWeightedAverageShares", "WeightedAverageShares"]
 
@@ -96,19 +102,24 @@ def pick(facts, tags, kind, units, prefer_max=False):
                 continue
             for f in entries:
                 end, start = f.get("end"), f.get("start")
-                if start is None or end is None:
-                    continue
-                days = (date.fromisoformat(end) - date.fromisoformat(start)).days
-                if kind == "annual":
-                    if not 350 <= days <= 380:
+                if kind == "instant":
+                    # 时点科目（权益/商誉/无形）：无 start，只有期末快照
+                    if start is not None or end is None:
                         continue
-                    # AMZN 这类公司每个季报都申报一条 twelve-months-ended，长度同样落在
-                    # 350~380 天里（见 fetch_facts.py:221）。只按天数过滤会把 4 个季末
-                    # 都当成财年末，财年边界被切成四段、每段只剩 60 多个交易日。
-                    if f.get("fp", "FY") != "FY":
+                else:
+                    if start is None or end is None:
                         continue
-                if kind == "quarterly" and not 80 <= days <= 100:
-                    continue
+                    days = (date.fromisoformat(end) - date.fromisoformat(start)).days
+                    if kind == "annual":
+                        if not 350 <= days <= 380:
+                            continue
+                        # AMZN 这类公司每个季报都申报一条 twelve-months-ended，长度同样落在
+                        # 350~380 天里（见 fetch_facts.py:221）。只按天数过滤会把 4 个季末
+                        # 都当成财年末，财年边界被切成四段、每段只剩 60 多个交易日。
+                        if f.get("fp", "FY") != "FY":
+                            continue
+                    if kind == "quarterly" and not 80 <= days <= 100:
+                        continue
                 filed, val = f.get("filed", ""), float(f["val"])
                 r = rows.get(end)
                 if r is None:
@@ -505,6 +516,102 @@ def compute_band(ticker, email, years=5, basis="forward", include_series=False,
         out["series"] = series
     out["_sorted"] = sv
     return out
+
+
+def compute_ptbv_band(ticker, email, years=5, inputs=None):
+    """金融股历史 P/TBV 带（trailing 口径：当日已知最新每股有形账面价值）。
+
+    与 compute_band 输出 schema 兼容（pctiles/recent/min/max/days/basis/metric），
+    供 engine 金融股分支的带检查与判断层 P/TBV 锚注入。只有 trailing 口径——
+    TBV 是存量不是流量，"已实现 NTM"对它没有 PE/PS 那样的意义；银行估值惯例
+    也是当前 P/TBV vs 自身历史。时点科目免 TTM 加总与 Q4 推导，比 PE 带简单：
+    每股 TBV = (权益 − 商誉 − 无形)/加权稀释股数（与 engine.tbv_ps 同构），
+    可知日 = 各组件 first_filed 最大值。近零/负权益期照 near-zero 惯例剔除留痕。
+    """
+    ticker = ticker.upper()
+    if inputs is None:
+        inputs = load_inputs(ticker, email, years)
+    elif inputs.get("years", years) < years:
+        raise RuntimeError("inputs 的价格窗口比请求的 years 短，请重新 load_inputs")
+    facts, hist, splits = inputs["facts"], inputs["hist"], inputs["splits"]
+
+    eq = pick(facts, EQ_TAGS, "instant", {"USD"})
+    gw = pick(facts, GW_TAGS, "instant", {"USD"})
+    it = pick(facts, IT_TAGS, "instant", {"USD"})
+    sh_a = pick(facts, SH_TAGS, "annual", {"shares"})
+    sh_q = pick(facts, SH_TAGS, "quarterly", {"shares"})
+    split_notes = normalize_splits(sh_q, splits)
+    normalize_splits(sh_a, splits)
+    sh_q = derive_q4_avg(sh_q, sh_a)
+    if len(eq) < 4 or len(sh_q) < 4:
+        raise RuntimeError(f"{ticker} XBRL 不足（权益 {len(eq)} 期/股数 {len(sh_q)} 期），"
+                           "P/TBV 带需要季度级时点序列")
+
+    sh_items = sorted(sh_q.items())
+    pts = []
+    for e, v in sorted(eq.items()):
+        gwv = gw.get(e) or {"val": 0.0, "first_filed": ""}
+        itv = it.get(e) or {"val": 0.0, "first_filed": ""}
+        tbv = v["val"] - gwv["val"] - itv["val"]
+        # 股数配对：期末精确匹配优先，否则取期末前 100 天内最近的季度加权值
+        s_ = sh_q.get(e)
+        if s_ is None:
+            cand = [x for k, x in sh_items
+                    if 0 <= (date.fromisoformat(e) - date.fromisoformat(k)).days <= 100]
+            s_ = cand[-1] if cand else None
+        if not s_ or s_["val"] <= 0:
+            continue
+        known = max(x for x in (v["first_filed"], gwv.get("first_filed") or "",
+                                itv.get("first_filed") or "", s_["first_filed"]) if x)
+        pts.append({"period_end": e, "known_from": known, "tbv_ps": tbv / s_["val"]})
+    pts.sort(key=lambda p: p["known_from"])
+    if not pts:
+        raise RuntimeError(f"{ticker} 无法构造每股 TBV 序列")
+
+    start = years_ago(years).isoformat()
+    knowns = [p["known_from"] for p in pts]
+    series = []
+    for ts, row in hist.iterrows():
+        d = ts.date().isoformat()
+        if d < start:
+            continue
+        i = bisect.bisect_right(knowns, d) - 1
+        if i >= 0 and pts[i]["tbv_ps"] > 0:
+            series.append({"date": d, "close": float(row["Close"]),
+                           "ptbv": float(row["Close"]) / pts[i]["tbv_ps"],
+                           "tbv_ps": pts[i]["tbv_ps"], "period_end": pts[i]["period_end"]})
+    if len(series) < 60:
+        raise RuntimeError(f"{ticker} P/TBV 有效交易日仅 {len(series)} 天，样本不足")
+
+    tps = sorted(x["tbv_ps"] for x in series)
+    floor = 0.25 * pctile(tps, 50)
+    near_zero = [x["date"] for x in series if x["tbv_ps"] < floor]
+    if near_zero:
+        series = [x for x in series if x["tbv_ps"] >= floor]
+    if len(series) < 60:
+        raise RuntimeError(f"{ticker} 剔除权益趋零期后仅剩 {len(series)} 天，样本不足")
+
+    vals = [x["ptbv"] for x in series]
+    sv = sorted(vals)
+    pcts = {p: pctile(sv, p) for p in (1, 5, 10, 25, 50, 75, 90, 95, 99)}
+    recent = None
+    RECENT_YEARS = 3
+    if years > RECENT_YEARS:
+        rstart = years_ago(RECENT_YEARS).isoformat()
+        rsv = sorted(x["ptbv"] for x in series if x["date"] >= rstart)
+        if len(rsv) >= 60:
+            recent = {"years": RECENT_YEARS, "days": len(rsv),
+                      "min": rsv[0], "max": rsv[-1],
+                      "pctiles": {p: pctile(rsv, p) for p in (10, 25, 50, 75, 90)}}
+    cur = series[-1]
+    return {
+        "ticker": ticker, "cik": inputs["cik"], "basis": "trailing", "metric": "tbvps",
+        "years": years, "days": len(series),
+        "mean": statistics.mean(vals), "median": pcts[50], "stdev": statistics.pstdev(vals),
+        "min": sv[0], "max": sv[-1], "pctiles": pcts, "recent": recent, "current": cur,
+        "split_notes": split_notes, "near_zero_days": len(near_zero),
+        "near_zero_range": ([near_zero[0], near_zero[-1]] if near_zero else None),
+    }
 
 
 def main():

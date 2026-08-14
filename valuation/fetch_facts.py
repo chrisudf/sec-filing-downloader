@@ -353,7 +353,7 @@ if MODE == "standard":
 # 引擎是零联网的确定性计算层，带子必须在数据层备好。属非核心项：任何失败只记
 # pe_band_error 不阻断取数——但要留痕，不静默。VALUATION_NO_PE_BAND=1 可关闭。
 if os.environ.get("VALUATION_NO_PE_BAND") != "1":
-    from pe_band import compute_band, load_inputs
+    from pe_band import compute_band, compute_ptbv_band, load_inputs
     _pb_inputs = None
     try:
         # 一次下载（companyfacts + yfinance 历史价 + 拆股表），PE/PS 两份带子共用——
@@ -380,6 +380,21 @@ if os.environ.get("VALUATION_NO_PE_BAND") != "1":
             out["pe_band_error"] = f"{type(_e).__name__}: {_e}"
             print(f"警告: PE 带未生成（{out['pe_band_error']}）——目标 PE 越界诊断本次不生效",
                   file=sys.stderr)
+        # P/TBV 带（financials 模式）：金融股的估值锚是 P/B 系（E 带杠杆带周期，
+        # 一个坏账周期就能打没；净资产相对稳定）——图3 的教科书结论，repo 的
+        # financials 模式本来就按 P/TBV 建，带子给它历史分位锚。trailing 口径
+        # （TBV 是存量，无 "已实现 NTM" 语义），消费方=engine ptbv_band_check +
+        # 判断层 P/TBV 锚注入。
+        if MODE == "financials":
+            try:
+                _tb = compute_ptbv_band(TICKER, EMAIL, years=5, inputs=_pb_inputs)
+                out["ptbv_band"] = _tb
+                print(f"P/TBV带(trailing,{_tb['years']}y): 中位 {_tb['median']:.2f}x  区间 "
+                      f"{_tb['min']:.2f}~{_tb['max']:.2f}x  {_tb['days']} 个交易日")
+            except Exception as _e:
+                out["ptbv_band_error"] = f"{type(_e).__name__}: {_e}"
+                print(f"警告: P/TBV 带未生成（{out['ptbv_band_error']}）——目标 P/TBV "
+                      "越界诊断本次不生效", file=sys.stderr)
         # P/S 带（standard 模式）：同一套机械、分母换每股营收。近零利润票（COIN/
         # 微利期周期股）PE 带与 PE 腿一起失效，PS 是那个域的教科书参照——engine
         # 的近零利润守卫拿它给参考价。金融股不出（营收=总净收入口径，PS 无惯例）。

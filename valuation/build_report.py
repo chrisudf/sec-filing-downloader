@@ -313,9 +313,23 @@ if MODE == "financials":
                          for sc in ("bear", "base", "bull"))
     put(ws, "A25", f"方法离散度（PE法 vs P/TBV法 max/min）：{_spread}——离散大时两法分歧大，"
                    "综合可信度降低", GREEN, border=False)
-    put(ws, "A26", "判断层注记（均有财报原文出处）：", H2, border=False)
+    # 诊断红旗区（0057 起 financials 有 warnings 通道：P/TBV 带检查）——与 standard
+    # 相同的纪律：警告必须和 headline 数字同表出现，不能只活在引擎 stdout 里
+    _row = 26
+    _flags = [(sc, lv, msg) for sc in ("bear", "base", "bull")
+              for lv, msg in d["scenarios"][sc].get("warnings", [])]
+    if _flags:
+        put(ws, f"A{_row}", "合理性红旗（engine diagnostics）：",
+            Font(name="Arial", color="CC0000", bold=True, size=10), border=False)
+        _row += 1
+        for sc, lv, msg in _flags:
+            put(ws, f"A{_row}", f"{'⛔' if lv == 'red' else '⚠'} [{sc}] {msg}",
+                Font(name="Arial", color="CC0000" if lv == "red" else "B8860B", size=10),
+                border=False)
+            _row += 1
+    put(ws, f"A{_row}", "判断层注记（均有财报原文出处）：", H2, border=False)
     for j, note in enumerate(d["notes"]):
-        put(ws, f"A{27+j}", note, GREEN, border=False)
+        put(ws, f"A{_row+1+j}", note, GREEN, border=False)
 
     # ---------- 出处 ----------
     ws = wb.create_sheet("出处")

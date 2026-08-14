@@ -672,6 +672,26 @@ async def _pipeline(job: dict, ticker: str, email: str) -> None:
               "不接受——那会系统性压低所有标的。"
               "\n  若下方给出「上一次运行的假设（连续性基准）」，连续性优先——"
               "本锚只约束首次基线与失锚重建。")
+    # financials 的锚是 P/TBV 带（图3 的教科书结论：银行 E 带杠杆带周期，估值锚
+    # 是 P/B 系）——与 standard 的 PE 锚同一纪律结构，锚 s["ptbv"]
+    _tb = facts.get("ptbv_band") or {}
+    if mode == "financials" and _tb.get("pctiles"):
+        _rc2 = _tb.get("recent") or {}
+        _rp2 = _rc2.get("pctiles") or {}
+
+        def _pfmt2(pp):
+            return " / ".join(f"P{q} {pp[str(q)]:.2f}x" for q in (10, 25, 50, 75, 90)
+                              if str(q) in pp)
+        _aw2 = f"近{_rc2['years']}年" if _rp2 else f"近{_tb['years']}年"
+        band_meta = (
+            f"\n历史 P/TBV 带（trailing 口径，分母=当日已知每股有形账面价值，"
+            "与引擎 tbv_ps 同构）："
+            f"\n  全窗近{_tb['years']}年: {_pfmt2(_tb['pctiles'])}（{_tb['days']}天）"
+            + (f"\n  近{_rc2['years']}年子窗: {_pfmt2(_rp2)}（{_rc2['days']}天）" if _rp2 else "")
+            + f"\n  ← base 情景目标 P/TBV **默认锚{_aw2} P50**；bear/bull 参照 P25/P75"
+              " 量级再叠加各自情景的 ROTE/信贷假设。**base** 偏离 P50 ±15% 以上必须在"
+              " rationale.ptbv 给出财报证据（ROTE 结构变化、信贷周期位置、资本行动等）。"
+              "\n  若下方给出「上一次运行的假设（连续性基准）」，连续性优先。")
     # Rule of 40（fetch_facts 计算）：营收增速+利润率，「高倍数值不值得给」的对照
     # 标尺——分数高支撑倍数带上沿，分数低而倍数高 = 增速在烧钱换。给判断层做
     # pe/g 组合合理性的参照，不是硬规则（校验层不执法）。
