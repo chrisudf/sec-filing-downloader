@@ -319,18 +319,27 @@ if MODE == "standard":
             _prev4 = sum(v for _, v in _q8[:4])
             if _prev4 > 0:
                 ro40["rev_g_ttm"] = round(_cur4 / _prev4 - 1, 4)
-    _rev = (ttm.get("revenue") or {}).get("value")
+    # 利润率的分子分母必须同窗：营收 TTM 必须来自四季加总（有 "quarters" 键），
+    # 营业利润同理——任一侧退回 FY（"note" 路径）都会做出「FY 分子 ÷ TTM 分母」
+    # 的混窗利润率还标着 TTM。现金流的 YTD 差额口径本身即 TTM，但"退回最新年度"
+    # 变体是旧窗——留 caliber_note 一起展示，不静默
+    _rev_e = ttm.get("revenue") or {}
+    _rev = _rev_e.get("value") if "quarters" in _rev_e else None
     if _rev:
-        _op = (ttm.get("op_income") or {}).get("value")
-        _cfo = (ttm.get("cfo") or {}).get("value")
-        _cap = (ttm.get("capex") or {}).get("value")
-        _sbc = (ttm.get("sbc") or {}).get("value")
-        if _op is not None:
-            ro40["opm_ttm"] = round(_op / _rev, 4)
-        if _cfo is not None and _cap is not None:
-            ro40["fcf_margin_ttm"] = round((_cfo - _cap) / _rev, 4)
-        if _sbc is not None:
-            ro40["sbc_margin_ttm"] = round(_sbc / _rev, 4)
+        _op_e = ttm.get("op_income") or {}
+        _cfo_e, _cap_e = ttm.get("cfo") or {}, ttm.get("capex") or {}
+        _sbc_e = ttm.get("sbc") or {}
+        if "quarters" in _op_e and _op_e.get("value") is not None:
+            ro40["opm_ttm"] = round(_op_e["value"] / _rev, 4)
+        if _cfo_e.get("value") is not None and _cap_e.get("value") is not None:
+            ro40["fcf_margin_ttm"] = round((_cfo_e["value"] - _cap_e["value"]) / _rev, 4)
+            _stale_cf = [n for n in (_cfo_e.get("note"), _cap_e.get("note"))
+                         if n and "退回" in n]
+            if _stale_cf:
+                ro40["caliber_note"] = ("FCF 口径含退回旧财年的现金流项，"
+                                        "与 TTM 营收窗口不一致，FCF 分仅供参考")
+        if "quarters" in _sbc_e and _sbc_e.get("value") is not None:
+            ro40["sbc_margin_ttm"] = round(_sbc_e["value"] / _rev, 4)
     if "rev_g_ttm" in ro40:
         if "opm_ttm" in ro40:
             ro40["score_op"] = round(100 * (ro40["rev_g_ttm"] + ro40["opm_ttm"]), 1)

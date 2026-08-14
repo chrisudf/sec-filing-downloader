@@ -69,6 +69,8 @@ REV_TAGS = ["RevenueFromContractWithCustomerExcludingAssessedTax", "Revenues",
 # tbv = equity − goodwill − intangibles 用的正是这套 tag 的时点值）
 EQ_TAGS = ["StockholdersEquity",
            "StockholdersEquityIncludingPortionAttributableToNoncontrollingInterest"]
+SHOUT_TAGS = ["CommonStockSharesOutstanding"]          # us-gaap 时点流通股
+SHOUT_DEI = ["EntityCommonStockSharesOutstanding"]     # dei 封面页兜底
 GW_TAGS = ["Goodwill"]
 IT_TAGS = ["IntangibleAssetsNetExcludingGoodwill", "FiniteLivedIntangibleAssetsNet"]
 SH_TAGS = ["WeightedAverageNumberOfDilutedSharesOutstanding",
@@ -192,27 +194,36 @@ def normalize_splits(shares, splits):
     notes = []
     for sd, ratio in sorted(splits.items(), reverse=True):
         sd_s = sd.isoformat()
-        fixed = skipped = 0
+        # yfinance 的拆股日是 ex-date（首个已调整交易日），ASC 260 的重述触发点是
+        # 分配/生效日，可早 1-3 个日历日（NVDA 2024：分配周五 06-07，yfinance 06-10）。
+        # 落在缝里 filed 的文件已重述却会被判成拆前——留 4 天缓冲：缝内口径不可判，
+        # 保守不动并留痕（与缺 filed 同一处置），残留跳变哨兵兜底
+        sd_cut = (sd - timedelta(days=4)).isoformat()
+        fixed = skipped = ambiguous = 0
         for v in shares.values():
             filed = v.get("filed")
             if not filed:
                 skipped += 1
                 continue
-            if filed < sd_s:
+            if sd_cut <= filed < sd_s:
+                ambiguous += 1
+                continue
+            if filed < sd_cut:
                 v["val"] *= ratio
                 fixed += 1
+        _amb = (f"；{ambiguous} 期 filed 落在拆股日前 4 天缓冲窗内（分配日/ex-date 缝隙，"
+                "口径不可判）未动" if ambiguous else "")
+        _skp = f"；{skipped} 期缺 filed 日未动" if skipped else ""
         if fixed:
             notes.append(f"{sd_s} {ratio:g}:1 拆股 — {fixed} 期最新 filed 早于拆股日"
-                         "（拆前口径），已按比例回补"
-                         + (f"；{skipped} 期缺 filed 日未动" if skipped else ""))
+                         "（拆前口径），已按比例回补" + _amb + _skp)
         else:
             notes.append(f"{sd_s} {ratio:g}:1 拆股 — 全部期间 filed 晚于拆股日"
-                         "（XBRL 已追溯重述），无需调整"
-                         + (f"；{skipped} 期缺 filed 日未动" if skipped else ""))
+                         "（XBRL 已追溯重述），无需调整" + _amb + _skp)
     return notes
 
 
-def build_ttm_eps(ni_q, sh_q):
+def build_ttm_eps(ni_q, sh_q, anom_k=ANOM_K):
     """滚动四季 TTM EPS，附「最早可知日」= 四个季度里最晚的 filed 日。
 
     附一次性畸变标记（anomalous）：单季净利偏离同窗中位季 > ANOM_K 倍即整窗标记。
@@ -240,7 +251,7 @@ def build_ttm_eps(ni_q, sh_q):
         med = statistics.median(vals.values())
         anom_q, dev = max(((k, abs(x - med)) for k, x in vals.items()),
                           key=lambda t: t[1])
-        anomalous = bool(med) and dev > ANOM_K * abs(med)
+        anomalous = bool(anom_k) and bool(med) and dev > anom_k * abs(med)
         pts.append({"period_end": window[-1][0], "known_from": known,
                     "ttm_ni": sum(v["val"] for _, v in window),
                     "avg_diluted_shares": avg_sh,
@@ -292,7 +303,8 @@ def load_inputs(ticker, email, years=5):
     if hist.empty:
         raise RuntimeError(f"yfinance 取不到 {ticker} 价格")
     splits = {d.date(): float(r) for d, r in tk.splits.items() if r and float(r) != 1.0}
-    return {"cik": cik, "facts": facts, "hist": hist, "splits": splits, "years": years}
+    return {"cik": cik, "facts": facts, "dei": allf.get("dei") or {},
+            "hist": hist, "splits": splits, "years": years}
 
 
 def compute_band(ticker, email, years=5, basis="forward", include_series=False,
@@ -341,7 +353,10 @@ def compute_band(ticker, email, years=5, basis="forward", include_series=False,
             split_notes.append(f"⚠ {k1}→{k2} 相邻期股数跳变 {r:.2f}x——若非大额增发/"
                                "回购/并购，拆股口径归一可能有残留，请核对该期 filed 与拆股日")
 
-    pts = build_ttm_eps(ni_q, sh_q)
+    # 畸变守卫只对 eps 生效：ANOM_K=1.25 按净利一次性损益校准（AMZN 1.40x），
+    # 营收没有"一次性膨胀"的常见类似物，极端季节性票（游戏/税务软件 Q4 >2.25×
+    # 中位是常态结构）会被整段误剔——P/S 带宁可保留全部窗口
+    pts = build_ttm_eps(ni_q, sh_q, anom_k=(ANOM_K if metric == "eps" else None))
     if not pts:
         raise RuntimeError(f"{ticker} 无法构造连续四季 TTM EPS")
 
@@ -357,7 +372,7 @@ def compute_band(ticker, email, years=5, basis="forward", include_series=False,
     # 财年层面的一次性畸变（forward 口径的对应物）：FY 含畸变季则该年实现 EPS 同样
     # 不代表盈利能力，与亏损年同等处置——整年剔除并单独留痕
     anom_fys = []
-    for e in list(eps_fy):
+    for e in (list(eps_fy) if metric == "eps" else []):
         ae = date.fromisoformat(e)
         qv = [v["val"] for k, v in ni_q.items()
               if 0 <= (ae - date.fromisoformat(k)).days < 340]
@@ -395,6 +410,11 @@ def compute_band(ticker, email, years=5, basis="forward", include_series=False,
     knowns = [p["known_from"] for p in pts]
     series = []
     anom_days = {"trailing": 0, "ntm": 0}
+    stale_days = 0
+    # 陈旧点守卫：Q4 被 sanity gate 拒掉时 build_ttm_eps 会跳过含缺口的 4 个窗口，
+    # bisect 回退拿到的可能是 5 个季度前的点——「宁缺勿错」的缺必须真缺，
+    # 拿陈旧 EPS 除当期价格混进分布比缺一段更糟。>210 天（约缺一个季度以上）跳过留痕
+    STALE_DAYS = 210
     for ts, row in hist.iterrows():
         d = ts.date().isoformat()
         if d < start:
@@ -402,6 +422,10 @@ def compute_band(ticker, email, years=5, basis="forward", include_series=False,
         px = float(row["Close"])
         rec = {"date": d, "close": px}
         i = bisect.bisect_right(knowns, d) - 1
+        if i >= 0 and (date.fromisoformat(d)
+                       - date.fromisoformat(pts[i]["period_end"])).days > STALE_DAYS:
+            stale_days += 1
+            i = -1
         if i >= 0 and pts[i]["ttm_eps"] > 0:
             if pts[i].get("anomalous"):
                 anom_days["trailing"] += 1
@@ -499,7 +523,7 @@ def compute_band(ticker, email, years=5, basis="forward", include_series=False,
         "split_notes": split_notes, "dropped_fys": dropped,
         "anom_windows": [{"period_end": p["period_end"], "quarter": p["anom_q"]}
                          for p in by_end if p.get("anomalous")],
-        "anom_days": anom_days, "anom_fys": anom_fys,
+        "anom_days": anom_days, "anom_fys": anom_fys, "stale_days": stale_days,
         "near_zero_days": len(near_zero),
         "near_zero_range": ([near_zero[0], near_zero[-1]] if near_zero else None),
         "candidates": [{"name": n, "lo": lo, "hi": hi, "mid": (lo + hi) / 2,
@@ -538,23 +562,54 @@ def compute_ptbv_band(ticker, email, years=5, inputs=None):
     eq = pick(facts, EQ_TAGS, "instant", {"USD"})
     gw = pick(facts, GW_TAGS, "instant", {"USD"})
     it = pick(facts, IT_TAGS, "instant", {"USD"})
-    sh_a = pick(facts, SH_TAGS, "annual", {"shares"})
-    sh_q = pick(facts, SH_TAGS, "quarterly", {"shares"})
-    split_notes = normalize_splits(sh_q, splits)
-    normalize_splits(sh_a, splits)
-    sh_q = derive_q4_avg(sh_q, sh_a)
-    if len(eq) < 4 or len(sh_q) < 4:
-        raise RuntimeError(f"{ticker} XBRL 不足（权益 {len(eq)} 期/股数 {len(sh_q)} 期），"
+    # 分母 = **时点流通股**（us-gaap CommonStockSharesOutstanding，dei 封面页兜底）：
+    # TBV 是时点存量，除以当季加权平均是拿流量均值配存量——增发季（SOFI 型
+    # 一次性摊薄）加权数≈新股数的一半，每股 TBV 会被高估近一倍，带子整段失真。
+    # 时点股数同样按逐条 filed 规则做拆股归一。加权稀释只作最后兜底并留痕
+    #（engine 当前点 tbv_ps 用最新加权稀释是既有口径，差异在无增发季可忽略）。
+    sho = pick(facts, SHOUT_TAGS, "instant", {"shares"})
+    if len(sho) < 4 and inputs.get("dei"):
+        sho = pick(inputs["dei"], SHOUT_DEI, "instant", {"shares"})
+    shares_basis = "instant"
+    if len(sho) >= 4:
+        split_notes = normalize_splits(sho, splits)
+        sh_items = sorted(sho.items())
+    else:
+        shares_basis = "weighted_avg_fallback"
+        sh_a = pick(facts, SH_TAGS, "annual", {"shares"})
+        sh_q = pick(facts, SH_TAGS, "quarterly", {"shares"})
+        split_notes = normalize_splits(sh_q, splits)
+        normalize_splits(sh_a, splits)
+        sho = derive_q4_avg(sh_q, sh_a)
+        sh_items = sorted(sho.items())
+        split_notes.append("⚠ 无时点流通股 XBRL，分母退回加权稀释股数——增发季的"
+                           "每股 TBV 会被高估，带子仅供参考")
+    if len(eq) < 4 or len(sho) < 4:
+        raise RuntimeError(f"{ticker} XBRL 不足（权益 {len(eq)} 期/股数 {len(sho)} 期），"
                            "P/TBV 带需要季度级时点序列")
 
-    sh_items = sorted(sh_q.items())
+    # 商誉/无形 carry-forward：银行的余额表科目通常每季都报，但个别标的只在 10-K
+    # 报无形——缺季按 0 处理会让 TBV 逐季跳台阶，且与 engine「取最新时点值」的
+    # 口径相悖。取 ≤ 该期末的最近一期，其 first_filed 计入可知日；真无历史才是 0
+    _gw_items = sorted(gw.items())
+    _it_items = sorted(it.items())
+
+    def _carry(items, e):
+        prev = None
+        for k, x in items:
+            if k <= e:
+                prev = x
+            else:
+                break
+        return prev or {"val": 0.0, "first_filed": ""}
+
     pts = []
     for e, v in sorted(eq.items()):
-        gwv = gw.get(e) or {"val": 0.0, "first_filed": ""}
-        itv = it.get(e) or {"val": 0.0, "first_filed": ""}
+        gwv = _carry(_gw_items, e)
+        itv = _carry(_it_items, e)
         tbv = v["val"] - gwv["val"] - itv["val"]
-        # 股数配对：期末精确匹配优先，否则取期末前 100 天内最近的季度加权值
-        s_ = sh_q.get(e)
+        # 股数配对：期末精确匹配优先，否则取期末前 100 天内最近一期时点值
+        s_ = sho.get(e)
         if s_ is None:
             cand = [x for k, x in sh_items
                     if 0 <= (date.fromisoformat(e) - date.fromisoformat(k)).days <= 100]
@@ -571,12 +626,21 @@ def compute_ptbv_band(ticker, email, years=5, inputs=None):
     start = years_ago(years).isoformat()
     knowns = [p["known_from"] for p in pts]
     series = []
+    stale_days = 0
+    neg_days = []
     for ts, row in hist.iterrows():
         d = ts.date().isoformat()
         if d < start:
             continue
         i = bisect.bisect_right(knowns, d) - 1
-        if i >= 0 and pts[i]["tbv_ps"] > 0:
+        if i >= 0 and (date.fromisoformat(d)
+                       - date.fromisoformat(pts[i]["period_end"])).days > 210:
+            stale_days += 1     # 数据缺口时 bisect 会回退到跨季旧点，陈旧分母不入分布
+            continue
+        if i >= 0 and pts[i]["tbv_ps"] <= 0:
+            neg_days.append(d)  # 负/零 TBV 期照 near-zero 惯例留痕，不静默消失
+            continue
+        if i >= 0:
             series.append({"date": d, "close": float(row["Close"]),
                            "ptbv": float(row["Close"]) / pts[i]["tbv_ps"],
                            "tbv_ps": pts[i]["tbv_ps"], "period_end": pts[i]["period_end"]})
@@ -609,7 +673,11 @@ def compute_ptbv_band(ticker, email, years=5, inputs=None):
         "years": years, "days": len(series),
         "mean": statistics.mean(vals), "median": pcts[50], "stdev": statistics.pstdev(vals),
         "min": sv[0], "max": sv[-1], "pctiles": pcts, "recent": recent, "current": cur,
-        "split_notes": split_notes, "near_zero_days": len(near_zero),
+        "split_notes": split_notes, "shares_basis": shares_basis,
+        "stale_days": stale_days,
+        "neg_equity_days": len(neg_days),
+        "neg_equity_range": ([neg_days[0], neg_days[-1]] if neg_days else None),
+        "near_zero_days": len(near_zero),
         "near_zero_range": ([near_zero[0], near_zero[-1]] if near_zero else None),
     }
 
@@ -640,6 +708,7 @@ def main():
     P = "pe" if a.metric == "eps" else "ps"
     LBL = "PE" if a.metric == "eps" else "P/S"
     EW = "EPS" if a.metric == "eps" else "每股营收"
+    NUMW = "净利" if a.metric == "eps" else "营收"
     mean, sd_, cur, key = b["mean"], b["stdev"], b["current"], f"{P}_{a.basis}"
 
     basis_desc = {"forward": f"forward（分母 = 该财年最终实现的{EW}）",
@@ -652,11 +721,11 @@ def main():
     for n in b["split_notes"]:
         print(f"  拆股: {n}")
     if a.basis == "forward" and b["dropped_fys"]:
-        print(f"  剔除: 财年 {', '.join(b['dropped_fys'])} 净利为负或缺股数，"
-              "PE 无意义，整年不计入分布")
+        print(f"  剔除: 财年 {', '.join(b['dropped_fys'])} {NUMW}为负或缺股数，"
+              f"{LBL} 无意义，整年不计入分布")
     if a.basis == "forward" and b["anom_fys"]:
         print(f"  剔除: 财年 {', '.join(b['anom_fys'])} 含单季一次性畸变"
-              f"（偏离同年中位季 >{ANOM_K}x），实现 EPS 不代表盈利能力，整年不计入")
+              f"（偏离同年中位季 >{ANOM_K}x），实现{EW}不代表盈利能力，整年不计入")
     if b["anom_windows"] and a.basis in ("trailing", "ntm"):
         _tail = "、".join(f"{w['period_end']}(畸变季 {w['quarter']})"
                           for w in b["anom_windows"][-3:])
@@ -665,12 +734,15 @@ def main():
         # "剔除 26 个窗口却只影响 0 天"会被当成 bug 排查
         print(f"  剔除: 全历史 {len(b['anom_windows'])} 个 TTM 窗口含单季一次性畸变"
               f"（末几个: {_tail}）——影响本窗 trailing {b['anom_days']['trailing']} 天 / "
-              f"ntm {b['anom_days']['ntm']} 天；巨额一次性损益会把实现 EPS 吹大、"
-              "PE 假性变低，双侧剔除")
+              f"ntm {b['anom_days']['ntm']} 天；巨额一次性损益会把实现{EW}吹大、"
+              f"{LBL} 假性变低，双侧剔除")
+    if b.get("stale_days"):
+        print(f"  剔除: {b['stale_days']} 个交易日的最近已知点距该日 >210 天（数据缺口/"
+              "Q4 推导被拒）——陈旧分母不入分布")
     if b["near_zero_days"]:
         r = b["near_zero_range"]
-        print(f"  剔除: {b['near_zero_days']} 个交易日的 EPS 低于窗口中位数的 25%"
-              f"（{r[0]}~{r[1]}）——分母趋零，PE 无信息量")
+        print(f"  剔除: {b['near_zero_days']} 个交易日的{EW}低于窗口中位数的 25%"
+              f"（{r[0]}~{r[1]}）——分母趋零，{LBL} 无信息量")
     if a.basis == "ntm":
         print(f"  末点: {cur['date']} 收盘 {cur['close']:.2f} / 其后12个月实现{EW} "
               f"{cur['ntm_eps']:.2f} = {LBL} {cur[key]:.1f}x，处第 {rank_of(sv, cur[key]):.0f} 百分位")
@@ -679,7 +751,7 @@ def main():
     elif a.basis == "forward":
         print(f"  末点: {cur['date']} 收盘 {cur['close']:.2f} / FY{cur['fy']} 实现{EW} "
               f"{cur['fy_eps']:.2f} = {LBL} {cur[key]:.1f}x，处第 {rank_of(sv, cur[key]):.0f} 百分位")
-        print("       （forward 序列止于最近一个已披露年报的财年末；本财年至今无实现 EPS，"
+        print(f"       （forward 序列止于最近一个已披露年报的财年末；本财年至今无实现{EW}，"
               "要看当下位置请加 --basis trailing）")
     else:
         print(f"  最新: {cur['date']} 收盘 {cur['close']:.2f} / TTM {EW} {cur['ttm_eps']:.2f} "

@@ -87,6 +87,10 @@ bear \$37-\$87，根因是判断层对连续参数的独立采样叠加"情景�
   综合退化为 DCF(+SOTP)，红旗区给 P/S 参考价（facts.ps_band，不入综合）
 - **blend 权重政策**：`VALUATION_BLEND_W_PE/_DCF/_SOTP/_PTBV`（默认等权，行为不变）；
   权重随 valuation.json 进 Excel 公式与 compare/trend——改权重=改口径
+- **Rule of 40 注入**：营收 TTM 增速 + 营业利润率/FCF 口径（剔 SBC 变体）进 prompt
+  元数据与摘要——高倍数值不值得给的对照标尺，不执法
+- **financials v2（2026-08-14）**：base P/TBV 默认锚历史带（时点流通股分母）锚窗 P50
+  ±15% 证据纪律；financials 情景开通 warnings 通道（P/TBV 带检查）
 
 ## 判断层检查清单（写 config 前必做）
 

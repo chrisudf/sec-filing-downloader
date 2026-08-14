@@ -95,8 +95,9 @@
       输出 `diagnostics.pe_vs_history`（base 中枢=子窗 [P10,P90]∪P50±15%）；
       判断层 base PE 锚子窗 P50（valuation_service 注入）；交易区间行（摘要 27 行起）。
       `VALUATION_NO_PE_BAND=1` 可关。
-- [ ] `pe_band_check` 接 financials 模式：该模式 scenario dict 无 `warnings` 通道
-      （engine.py:135-144），要连带改 build_report 的红旗区渲染
+- [x] `pe_band_check` 接 financials 模式（2026-08-14 实装）：financials 情景开通
+      warnings/diagnostics 通道，P/TBV 带检查复用同一套逻辑（label 参数化），
+      build_report 金融股摘要增红旗区
 - [ ] **观察项：全窗 min/max 那条「从未出现过的倍数」检查是否已过松**（2026-08-10 记，
       先不改，攒观察）。一次性畸变剔除那版把 `ntm` 从 `ttm_eps>0` 的嵌套里解了出来
       （分母是未来窗口的 EPS，与当前已知 TTM 正负无关，负 TTM 期恰是周期底）——

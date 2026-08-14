@@ -102,6 +102,25 @@ def record(val: dict, gate_clean: bool, root: Path | None = None) -> Path | None
         except json.JSONDecodeError:
             pass  # 坏文件不阻断新运行，直接以新记录覆盖
     rec.setdefault("samples", []).append(_sample(val, gate_clean))
+    # 落地合并：pending 运行按 +3 日历月估计的 vintage_end 归档，与 10-Q 落地后的
+    # 真实 report_end 常差几天（52/53 周财历、月末日）——一旦真实格子写入，把
+    # ±7 天内"全 pending 样本"的幻影格子并进来删掉，趋势视图不再多出假报告期
+    if not _vin.get("pending_10q"):
+        _re = date.fromisoformat(report_end)
+        for g in list(d.glob("*.json")):
+            k = g.stem
+            if k == report_end:
+                continue
+            try:
+                if abs((date.fromisoformat(k) - _re).days) > 7:
+                    continue
+                old = json.loads(g.read_text(encoding="utf-8"))
+            except (ValueError, json.JSONDecodeError):
+                continue
+            smp = old.get("samples") or []
+            if smp and all(x.get("pending_10q") for x in smp):
+                rec["samples"] = smp + rec["samples"]
+                g.unlink(missing_ok=True)
     tmp = d / f".{report_end}.json.tmp"
     tmp.write_text(json.dumps(rec, ensure_ascii=False, indent=1), encoding="utf-8")
     os.replace(tmp, f)

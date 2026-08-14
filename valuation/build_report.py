@@ -637,8 +637,11 @@ metrics = [
     ("TTM 调整后 EPS", "='情景假设'!$B$28", FM_EPS, d["adj_note"]),
     ("调整后 Trailing PE", "=B4/B11", FM_X, "现价 / TTM 调整后 EPS"),
     (f"{FWD} EPS（合理）", "='情景假设'!$C$34", FM_EPS, "合理情景假设下的前瞻期(NTM) EPS"),
-    ("Forward PE（合理）", "=B4/B13", FM_X, ""),
-    ("PEG（合理）", "=B14/('情景假设'!$C$4*100)", "0.00", "Forward PE / 营收增速"),
+    # base EPS<=0（近零利润守卫域）时 =B4/B13 会渲染负 PE 或 #DIV/0!——IF 判空，
+    # 与 engine 的 fwd_pe=None 同一处置
+    ("Forward PE（合理）", "=IF('情景假设'!$C$34<=0,\"n.m.\",B4/B13)", FM_X, ""),
+    ("PEG（合理）", "=IF(ISNUMBER(B14),B14/('情景假设'!$C$4*100),\"n.m.\")",
+     "0.00", "Forward PE / 营收增速"),
     ("EV/EBIT (TTM)", "=(B5-B6)/'情景假设'!$B$20", FM_X, ""),
     ("FCF 收益率 (TTM)", "='情景假设'!$B$25/B5", FM_PCT, ""),
     ("反向 DCF 隐含增速（base 口径条件）", d["reverse_dcf"], FM_PCT,
@@ -649,13 +652,18 @@ metrics = [
 # 静态值不联动（增速/利润率不在工作簿内），放 metrics 末行（第 19 行），
 # 不移动任何 verify_report 交叉核对的单元格
 _r40 = d.get("rule_of_40") or {}
-if _r40.get("score_op") is not None:
+if _r40.get("score_op") is not None or _r40.get("score_fcf") is not None:
     metrics.append((
-        "Rule of 40（TTM）", _r40["score_op"], "0.0",
-        f"营收增速 {_r40.get('rev_g_ttm', 0):+.1%} + 营业利润率 {_r40.get('opm_ttm', 0):.1%}"
+        "Rule of 40（TTM）",
+        _r40.get("score_op") if _r40.get("score_op") is not None else _r40["score_fcf"],
+        "0.0",
+        f"营收增速 {_r40.get('rev_g_ttm', 0):+.1%}"
+        + (f" + 营业利润率 {_r40.get('opm_ttm', 0):.1%}" if _r40.get("opm_ttm") is not None
+           else "（营业利润无数据，显示 FCF 口径）")
         + (f"；FCF 口径 {_r40['score_fcf']:.1f} 分" if _r40.get("score_fcf") is not None else "")
         + (f"（剔 SBC 后 {_r40['score_fcf_ex_sbc']:.1f}，SBC 占营收 "
            f"{_r40['sbc_margin_ttm']:.1%}）" if _r40.get("score_fcf_ex_sbc") is not None else "")
+        + (f"。⚠ {_r40['caliber_note']}" if _r40.get("caliber_note") else "")
         + "。软件/平台类 >40 算优秀——分数低而倍数高 = 增速在烧钱换"))
 r = 11
 for label, v, fmt, note in metrics:

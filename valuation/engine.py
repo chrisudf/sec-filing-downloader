@@ -212,9 +212,10 @@ if MODE == "financials":
 
     out = dict(
         ticker=cfg["ticker"], name=cfg["name"], date=cfg["date"], mode="financials",
-        # financials 情景语义恒为 v1（无一致性联动/锚）；显式写出，趋势视图按
-        # (fwd_label, semantics_version) 复合键聚合时金融股样本才不会落进 "v?" 组
-        semantics_version=1,
+        # financials 语义 v2（2026-08-14）：P/TBV 带锚（判断层注入 + ptbv_band_check）
+        # 改变 base ptbv 的产生方式与目标价水平——与 standard v2→v3 的理由同构，
+        # 锚前(v1)/锚后(v2) 金融股样本在 trend/compare 里必须按版本隔离
+        semantics_version=2,
         blend_weights={m: BLEND_W[m] for m in ("pe", "ptbv")},
         meta=dict(price=cfg["price"], mcap=cfg["mcap"], shares=cfg["shares"],
                   fwd_shares=cfg["fwd_shares"], fwd_label=cfg["fwd_label"],
@@ -321,7 +322,10 @@ out = dict(
     # PE 的产生方式与目标价水平，锚前(≤v2)/锚后(v3) 样本不可直接对比或混聚
     semantics_version=3,
     config_semantics_version=cfg.get("semantics_version", 1),
-    blend_weights={m: BLEND_W[m] for m in ("pe", "dcf", "sotp")},
+    # 只记录可能参与综合的腿：SOTP 降级为参考项时 W_SOTP 惰性——记进去会让
+    # compare/trend 把两次数值完全相同的运行当成口径不同
+    blend_weights={m: BLEND_W[m]
+                   for m in (("pe", "dcf") + (("sotp",) if sotp_in_blend else ()))},
     meta=dict(price=cfg["price"], mcap=cfg["mcap"], shares=cfg["shares"],
               fwd_shares=cfg["fwd_shares"], net_cash=cfg["net_cash"], fwd_label=cfg["fwd_label"],
               seg1=cfg["seg1"], seg2=cfg["seg2"], seg1_share=cfg["seg1_share"],
@@ -383,6 +387,12 @@ for name, s in cfg["scenarios"].items():
             warnings.append(["yellow", f"综合目标价隐含 P/调整后净利 {p_ni:.1f}x（界外 [6,60]）"])
     if spread and spread > 2:
         warnings.append(["yellow", f"方法离散度 {spread}x（>2x）——各法分歧大，综合可信度降低"])
+    if dcf_ps <= 0 and "dcf" in blend_methods:
+        # margins 全程深负 + 净现金为负时 DCF 腿可以合法算出 <=0——PE 腿又被守卫
+        # 退出时，负数会独腿成为"综合目标价"无声进产线。red：打回判断层复审
+        warnings.append(["red", f"DCF 每股价值 {dcf_ps:.1f} <= 0（FCF 路径全程亏损或"
+                                "净现金深负）——综合失去有效支撑腿，请修正 margins 路径"
+                                "或声明永久受损"])
     if pe_nm:
         _ps_ref = ""
         _psb = facts.get("ps_band") or {}

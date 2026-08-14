@@ -98,8 +98,10 @@ def main():
         if used:
             groups = {}
             for s in used:
+                # 旧金融股样本无 semantics_version（engine 当时不输出）→ 视为 v1；
+                # standard 样本自 vintages 引入起恒有值，不受影响
                 _k = (f"{s.get('fwd_label') or '?'}"
-                      f"｜v{s.get('semantics_version') or '?'}")
+                      f"｜v{s.get('semantics_version') or 1}")
                 # blend 权重非默认也是口径（等权与缺省视为同一组，兼容旧样本）
                 _bw = {k: v for k, v in (s.get("blend_weights") or {}).items()
                        if isinstance(v, (int, float)) and abs(v - 1) > 1e-9}
@@ -121,6 +123,7 @@ def main():
         rows.append({
             "report_end": r["report_end"], "n": n, "dropped": dropped, "mixed": mixed,
             "fwd_label": used[0].get("fwd_label"),
+            "semantics": used[0].get("semantics_version") or 1,
             "blend": blend, "blend_sd": sd,
             "eps1": agg(used, SC, "eps1")[0], "pe": agg(used, SC, "pe")[0],
             "pe_pctile": agg(used, SC, "pe_pctile")[0],
@@ -182,6 +185,11 @@ def main():
                 tag = f"|Δ|/SE = {ratio:.2f} → {verdict}"
             else:
                 tag = "样本不足（需每期 ≥2 次运行）→ 无法判定"
+            # 复合键只隔离同格混聚；跨报告期的语义切换（v2→v3 锚上线）表现为
+            # 前后两行版本不同——变化里混着语义变化，显著性判定必须打折说明
+            if p.get("semantics") != q.get("semantics"):
+                tag += (f"  ⚠ 语义 v{p.get('semantics')}→v{q.get('semantics')}，"
+                        "变化含口径成分，先归因语义再谈基本面")
             print(f"  {p['report_end']} → {q['report_end']}  "
                   f"{p['blend']:,.1f} → {q['blend']:,.1f} ({d:+.1%})  |  {tag}")
 

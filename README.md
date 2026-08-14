@@ -74,8 +74,8 @@ sec-filing-downloader/
 ├── static/
 │   └── index.html             # 深色主题单页前端（原生 JS，无构建步骤）
 ├── valuation/                 # 估值确定性计算层 + 判断层提示词
-│   ├── fetch_facts.py         # XBRL companyfacts 取数（多标签合并/Q4推导/TTM/SBC/PE带）
-│   ├── pe_band.py             # 历史 PE 分位带（forward/trailing/ntm 三口径 + 畸变剔除 + 逆向匹配）
+│   ├── fetch_facts.py         # XBRL companyfacts 取数（多标签合并/Q4推导/TTM/SBC/带子/Ro40）
+│   ├── pe_band.py             # 历史 PE/P.S/P.TBV 分位带（三口径 + 畸变剔除 + 逆向匹配）
 │   ├── extract_sections.py    # 财报关键章节定位（分部/税率/capex/流动性）
 │   ├── judgment_prompt.md     # 判断层提示词（假设 schema + 检查清单）
 │   ├── engine.py              # PE 法 / 十年 FCFF DCF / SOTP / 反向 DCF / 交易区间 / 敏感性

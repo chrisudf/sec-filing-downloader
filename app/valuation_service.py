@@ -609,8 +609,9 @@ async def _pipeline(job: dict, ticker: str, email: str) -> None:
                 stale = None
                 if prev.get("ticker") != ticker:
                     stale = "标的不符"
-                elif prev.get("semantics_version", 1) != 3:
-                    stale = f"语义版本 v{prev.get('semantics_version', 1)} != v3"
+                elif prev.get("semantics_version", 1) != (3 if mode == "standard" else 2):
+                    stale = (f"语义版本 v{prev.get('semantics_version', 1)} != "
+                             f"v{3 if mode == 'standard' else 2}")
                 elif prev.get("manifest_latest") and latest_report \
                         and prev["manifest_latest"] != latest_report:
                     stale = f"出现新报告期 {latest_report}（上次基于 {prev['manifest_latest']}）"
@@ -697,13 +698,16 @@ async def _pipeline(job: dict, ticker: str, email: str) -> None:
     # pe/g 组合合理性的参照，不是硬规则（校验层不执法）。
     ro40_meta = ""
     _r40 = facts.get("rule_of_40") or {}
-    if mode == "standard" and _r40.get("score_op") is not None:
+    if mode == "standard" and (_r40.get("score_op") is not None
+                               or _r40.get("score_fcf") is not None):
         ro40_meta = (
-            f"\nRule of 40（TTM）：营收增速 {_r40.get('rev_g_ttm', 0):+.1%} + 营业利润率 "
-            f"{_r40.get('opm_ttm', 0):.1%} = {_r40['score_op']:.0f} 分"
+            "\nRule of 40（TTM）：营收增速 " + f"{_r40.get('rev_g_ttm', 0):+.1%}"
+            + (f" + 营业利润率 {_r40.get('opm_ttm', 0):.1%} = {_r40['score_op']:.0f} 分"
+               if _r40.get("score_op") is not None else "（营业利润无数据，OP 口径缺）")
             + (f"；FCF 口径 {_r40['score_fcf']:.0f} 分" if _r40.get("score_fcf") is not None else "")
             + (f"（剔 SBC 后 {_r40['score_fcf_ex_sbc']:.0f} 分，SBC 占营收 "
                f"{_r40['sbc_margin_ttm']:.1%}）" if _r40.get("score_fcf_ex_sbc") is not None else "")
+            + (f"\n  ⚠ 口径注意：{_r40['caliber_note']}" if _r40.get("caliber_note") else "")
             + "\n  ← 软件/平台类 >40 算优秀。用作 pe/g 组合合理性的对照：分数低于 40"
               " 而你给的目标倍数落在历史带上沿时，rationale.pe 里要说清为什么。")
     prompt = (f"{base_prompt}\n\n# 服务器注入的元数据（不要输出这些字段）\n"
@@ -775,7 +779,7 @@ async def _pipeline(job: dict, ticker: str, email: str) -> None:
                  price=round(price, 2), mcap=round(mcap / 1e6), shares=shares,
                  mode=mode, adr_multiple=adr_multiple,
                  currency=facts.get("currency", "USD"),
-                 semantics_version=3 if mode == "standard" else 1,
+                 semantics_version=3 if mode == "standard" else 2,
                  manifest_latest=latest_report,
                  # PENDING_10Q 标记进 cfg：engine 据此把 vintage 归档键前滚到 8-K
                  # 覆盖的季度（fwd_window 已 +3 个月），否则这次运行会归进旧

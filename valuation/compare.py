@@ -24,10 +24,10 @@ if old.get("mode", "standard") != mode:
     print(f"⚠️  两次运行模式不同（{old.get('mode')} → {mode}），仅对比公共字段\n")
 _sv_o, _sv_n = old.get("semantics_version", 1), new.get("semantics_version", 1)
 if _sv_o != _sv_n:
-    print(f"⚠️  估值语义版本不同（v{_sv_o} → v{_sv_n}）：v2（2026-07-22）起有跨情景联动"
-          "约束与 SOTP 降级，v3（2026-08-14）起 base PE 默认锚历史 NTM 带子窗 P50——"
-          "倍数类假设（pe/m1/m2）的漂移不可直接读作判断层改了主意，"
-          "综合目标价口径与水平也可能不同\n")
+    print(f"⚠️  估值语义版本不同（v{_sv_o} → v{_sv_n}）：standard v2（2026-07-22）起有跨情景"
+          "联动约束与 SOTP 降级、v3（2026-08-14）起 base PE 默认锚历史 NTM 带子窗 P50；"
+          "financials v2（2026-08-14）起 base P/TBV 锚历史带——倍数类假设的漂移不可"
+          "直接读作判断层改了主意，综合目标价口径与水平也可能不同\n")
 
 # blend 权重对比：权重是口径不是假设——等权与缺省（老文件无该键）视为等价
 def _wnorm(w):
