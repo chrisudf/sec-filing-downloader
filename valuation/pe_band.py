@@ -280,10 +280,23 @@ def build_ttm_eps(ni_q, sh_q, anom_k=ANOM_K):
         if not known:
             continue
         vals = {k: v["val"] for k, v in window}
-        med = statistics.median(vals.values())
-        anom_q, dev = max(((k, abs(x - med)) for k, x in vals.items()),
-                          key=lambda t: t[1])
-        anomalous = bool(anom_k) and bool(med) and dev > anom_k * abs(med)
+        # leave-one-out 判据（0061）：逐季与"其余三季的中位"比。旧判据拿全窗四季
+        # 中位当基准——窗内两季同向畸变时中位被拖走、偏离缩水到门槛之下
+        # （GOOG 2026H1 连续两季股权重估实测漏网：Q1'26 那扇窗 dev/median<1.25）。
+        # 拿掉自己再取中位，三季里至多一季脏、中位必落在干净季上，单季/双季畸变
+        # 同判据覆盖。代价：对超高速 ramp（NVDA 2023 型）更敏感，会多剔几扇窗——
+        # 该类窗口 PE 离散度本就极大，剔除且留痕好过静默混入（与 ANOM_K 注释同）。
+        items = list(vals.items())
+        anom_q, worst = None, 0.0
+        for j, (k, x) in enumerate(items):
+            others = [y for i2, (_, y) in enumerate(items) if i2 != j]
+            med_o = statistics.median(others)
+            if not med_o:
+                continue
+            r = abs(x - med_o) / abs(med_o)
+            if r > worst:
+                worst, anom_q = r, k
+        anomalous = bool(anom_k) and worst > anom_k
         pts.append({"period_end": window[-1][0], "known_from": known,
                     "ttm_ni": sum(v["val"] for _, v in window),
                     "avg_diluted_shares": avg_sh,
@@ -425,8 +438,15 @@ def compute_band(ticker, email, years=5, basis="forward", include_series=False,
               if 0 <= (ae - date.fromisoformat(k)).days < 340]
         if len(qv) != 4:
             continue
-        med = statistics.median(qv)
-        if med and max(abs(x - med) for x in qv) > ANOM_K * abs(med):
+        # 与 build_ttm_eps 同一 leave-one-out 判据（财年 = 固定四季窗）
+        hit = False
+        for j, x in enumerate(qv):
+            others = [y for i2, y in enumerate(qv) if i2 != j]
+            med_o = statistics.median(others)
+            if med_o and abs(x - med_o) / abs(med_o) > ANOM_K:
+                hit = True
+                break
+        if hit:
             del eps_fy[e]
             anom_fys.append(e)
 
