@@ -564,7 +564,10 @@ def compute_band(ticker, email, years=5, basis="forward", include_series=False,
     if years > RECENT_YEARS:
         rstart = years_ago(RECENT_YEARS).isoformat()
         rsv = sorted(s[key] for s in series if s["date"] >= rstart)
-        if len(rsv) >= 60:
+        # 子窗与全窗同一覆盖门槛（250 天）：GOOG 实测全窗兜底修回 490 天后，
+        # 子窗仍只剩 ~60 天被污染的尾巴——60 天的 P50 拿去当锚比没有锚更糟。
+        # 子窗不够厚就回退全窗（消费侧的 recent→pctiles 回退链天然接住）
+        if len(rsv) >= 250:
             recent = {"years": RECENT_YEARS, "days": len(rsv),
                       "min": rsv[0], "max": rsv[-1],
                       "pctiles": {p: pctile(rsv, p) for p in (10, 25, 50, 75, 90)}}
@@ -734,7 +737,7 @@ def compute_ptbv_band(ticker, email, years=5, inputs=None):
     if years > RECENT_YEARS:
         rstart = years_ago(RECENT_YEARS).isoformat()
         rsv = sorted(x["ptbv"] for x in series if x["date"] >= rstart)
-        if len(rsv) >= 60:
+        if len(rsv) >= 250:   # 子窗与全窗同一覆盖门槛，理由见 compute_band
             recent = {"years": RECENT_YEARS, "days": len(rsv),
                       "min": rsv[0], "max": rsv[-1],
                       "pctiles": {p: pctile(rsv, p) for p in (10, 25, 50, 75, 90)}}
