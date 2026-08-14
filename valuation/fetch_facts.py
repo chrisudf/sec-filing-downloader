@@ -353,23 +353,48 @@ if MODE == "standard":
 # 引擎是零联网的确定性计算层，带子必须在数据层备好。属非核心项：任何失败只记
 # pe_band_error 不阻断取数——但要留痕，不静默。VALUATION_NO_PE_BAND=1 可关闭。
 if os.environ.get("VALUATION_NO_PE_BAND") != "1":
+    from pe_band import compute_band, load_inputs
+    _pb_inputs = None
     try:
-        from pe_band import compute_band
-        # basis="ntm"：必须与 engine 的前瞻期同源。engine 算 rev1 = TTM×(1+g)，
-        # 前瞻期恒为 NTM 而非财年（见 valuation_service.fwd_window）。用 forward
-        # （按财年切）只在 report_end = 财年末时才对，AMZN/META 这类 12 月财年公司
-        # 在 Q1/Q2/Q3 报告期会系统性错位，pe_vs_history 的分位数就不可信。
-        _band = compute_band(TICKER, EMAIL, years=5, basis="ntm")
-        _band.pop("_sorted", None)
-        out["pe_band"] = _band
-        # 口径/年数一律从 _band 自身字段拼：写死字符串会在换 basis 时静默说谎
-        # （曾切到 ntm 后仍打印 "forward"，排查与回归对比都会被带偏）
-        print(f"PE带({_band['basis']},{_band['years']}y): 中位 {_band['median']:.1f}x  区间 "
-              f"{_band['min']:.1f}~{_band['max']:.1f}x  {_band['days']} 个交易日")
+        # 一次下载（companyfacts + yfinance 历史价 + 拆股表），PE/PS 两份带子共用——
+        # compute_band 各自下载会翻倍 SEC/yfinance 请求且容易撞限速
+        _pb_inputs = load_inputs(TICKER, EMAIL, years=5)
     except Exception as _e:
         out["pe_band_error"] = f"{type(_e).__name__}: {_e}"
-        print(f"警告: PE 带未生成（{out['pe_band_error']}）——目标 PE 越界诊断本次不生效",
+        print(f"警告: 带子数据未取到（{out['pe_band_error']}）——PE/PS 带本次不生成",
               file=sys.stderr)
+    if _pb_inputs:
+        try:
+            # basis="ntm"：必须与 engine 的前瞻期同源。engine 算 rev1 = TTM×(1+g)，
+            # 前瞻期恒为 NTM 而非财年（见 valuation_service.fwd_window）。用 forward
+            # （按财年切）只在 report_end = 财年末时才对，AMZN/META 这类 12 月财年公司
+            # 在 Q1/Q2/Q3 报告期会系统性错位，pe_vs_history 的分位数就不可信。
+            _band = compute_band(TICKER, EMAIL, years=5, basis="ntm", inputs=_pb_inputs)
+            _band.pop("_sorted", None)
+            out["pe_band"] = _band
+            # 口径/年数一律从 _band 自身字段拼：写死字符串会在换 basis 时静默说谎
+            # （曾切到 ntm 后仍打印 "forward"，排查与回归对比都会被带偏）
+            print(f"PE带({_band['basis']},{_band['years']}y): 中位 {_band['median']:.1f}x  区间 "
+                  f"{_band['min']:.1f}~{_band['max']:.1f}x  {_band['days']} 个交易日")
+        except Exception as _e:
+            out["pe_band_error"] = f"{type(_e).__name__}: {_e}"
+            print(f"警告: PE 带未生成（{out['pe_band_error']}）——目标 PE 越界诊断本次不生效",
+                  file=sys.stderr)
+        # P/S 带（standard 模式）：同一套机械、分母换每股营收。近零利润票（COIN/
+        # 微利期周期股）PE 带与 PE 腿一起失效，PS 是那个域的教科书参照——engine
+        # 的近零利润守卫拿它给参考价。金融股不出（营收=总净收入口径，PS 无惯例）。
+        if MODE == "standard":
+            try:
+                _psb = compute_band(TICKER, EMAIL, years=5, basis="ntm",
+                                    metric="rps", inputs=_pb_inputs)
+                _psb.pop("_sorted", None)
+                out["ps_band"] = _psb
+                print(f"P/S带({_psb['basis']},{_psb['years']}y): 中位 {_psb['median']:.2f}x  区间 "
+                      f"{_psb['min']:.2f}~{_psb['max']:.2f}x  {_psb['days']} 个交易日")
+            except Exception as _e:
+                out["ps_band_error"] = f"{type(_e).__name__}: {_e}"
+                print(f"警告: P/S 带未生成（{out['ps_band_error']}）——近零利润参照本次不生效",
+                      file=sys.stderr)
 
 json.dump(out, open(OUT, "w", encoding="utf-8"), ensure_ascii=False, indent=1)
 q = out["revenue_quarterly"]

@@ -42,6 +42,11 @@ import httpx
 # 但展示层的数直接是错的。
 BASIS_KEY = {"forward": "pe_forward", "trailing": "pe_trailing", "ntm": "pe_ntm"}
 
+# 指标维度（metric）正交于口径维度（basis）：eps -> pe_*（分母=每股净利），
+# rps -> ps_*（分母=每股营收，P/S 带）。整套机械（filed 可知日/拆股归一/Q4 推导/
+# 分位带/子窗/畸变剔除）对两个指标同构——P/S 带给近零利润票（COIN/微利期周期股）
+# 提供 PE 失效时的参照，engine 的近零利润守卫消费它。
+
 # 一次性畸变窗口判定：单季净利偏离同窗中位季超过 ANOM_K 倍（双侧）。校准点
 # （AMZN 真实数据实测）：2026-06-30 窗口（2025Q3~2026Q2，末季含 ~$42B 税后
 # Anthropic 重估）偏离 1.40 倍——1.5 恰好漏掉动机案例，故取 1.25；正常零售
@@ -56,6 +61,10 @@ BASIS_KEY = {"forward": "pe_forward", "trailing": "pe_trailing", "ntm": "pe_ntm"
 ANOM_K = 1.25
 
 NI_TAGS = ["NetIncomeLoss", "ProfitLossAttributableToOwnersOfParent", "ProfitLoss"]
+# 营收 tag 与 fetch_facts.TAGS_STANDARD/TAGS_IFRS 的 revenue 候选一致；总营收 tag 与
+# 分项 tag 同期并存时取大（CRCL：Revenues $2,747M vs 合同收入 $110M，取小静默错 25 倍）
+REV_TAGS = ["RevenueFromContractWithCustomerExcludingAssessedTax", "Revenues",
+            "SalesRevenueNet", "Revenue", "RevenueFromContractsWithCustomers"]
 SH_TAGS = ["WeightedAverageNumberOfDilutedSharesOutstanding",
            "AdjustedWeightedAverageShares", "WeightedAverageShares"]
 
@@ -69,10 +78,12 @@ def resolve_cik(ticker, headers):
     raise SystemExit(f"SEC EDGAR 中未找到 {ticker}")
 
 
-def pick(facts, tags, kind, units):
+def pick(facts, tags, kind, units, prefer_max=False):
     """{期末: {"val","filed","first_filed"}}。
 
     val 取 filed **最新**（重述/换标签后的口径更准）；可知日取 filed **最早**。
+    prefer_max（营收用）：同期同 filed 打平取较大者——总营收与分项 tag 并存时取小
+    是静默错误（fetch_facts.pick 的 CRCL 教训，此处同规则）。
     两者必须分开：同一期会在后续财报里作为比较期反复出现，若拿最新 filed 当可知日，
     2024 年的季度会被标成 2026 年才可知，整条 PE 序列退化成「远古 EPS 除当期价格」。
     """
@@ -103,7 +114,8 @@ def pick(facts, tags, kind, units):
                 if r is None:
                     rows[end] = {"val": val, "filed": filed, "first_filed": filed}
                     continue
-                if filed > r["filed"]:
+                if filed > r["filed"] or (prefer_max and filed == r["filed"]
+                                          and val > r["val"]):
                     r["val"], r["filed"] = val, filed
                 if filed and (not r["first_filed"] or filed < r["first_filed"]):
                     r["first_filed"] = filed
@@ -248,11 +260,12 @@ def coverage(sv, lo, hi):
     return 100.0 * (bisect.bisect_right(sv, hi) - bisect.bisect_left(sv, lo)) / len(sv)
 
 
-def compute_band(ticker, email, years=5, basis="forward", include_series=False):
-    """算出历史 PE 分布，返回纯数据 dict（不打印）。
+def load_inputs(ticker, email, years=5):
+    """一次下载，供多份带子（pe/ps 指标）共用：companyfacts + yfinance 历史价 + 拆股表。
 
-    供 CLI 与 fetch_facts.py 共用——engine.py 是零联网的确定性计算层，
-    带子必须由数据层算好塞进 facts.json，不能让引擎自己去取。
+    compute_band 每次自行下载是已知病灶（2 个 SEC 请求 + 1 次 yfinance 历史价），
+    多指标时代价翻倍还容易撞限速——fetch_facts 先 load 一次再喂给各 compute_band。
+    hist 回看 years+1 年：inputs 只能喂给 years 不大于它的 compute_band。
     """
     ticker = ticker.upper()
     H = {"User-Agent": f"sec-filing-downloader pe_band ({email})"}
@@ -262,21 +275,42 @@ def compute_band(ticker, email, years=5, basis="forward", include_series=False):
     facts = allf.get("us-gaap") or allf.get("ifrs-full")
     if not facts:
         raise RuntimeError(f"{ticker}（CIK {cik}）没有 us-gaap/ifrs-full 数据")
-
-    ni_a = pick(facts, NI_TAGS, "annual", {"USD"})
-    ni_q = derive_q4(pick(facts, NI_TAGS, "quarterly", {"USD"}), ni_a)
-    if len(ni_q) < 4:
-        raise RuntimeError(f"{ticker} 季度 XBRL 不足（净利 {len(ni_q)} 期）"
-                         "——外国发行人常无季度 XBRL，本工具需要季度序列")
-    sh_a = pick(facts, SH_TAGS, "annual", {"shares"})
-    sh_q = pick(facts, SH_TAGS, "quarterly", {"shares"})
-
     import yfinance as yf
     tk = yf.Ticker(ticker)
     hist = tk.history(period=f"{years + 1}y", auto_adjust=False)
     if hist.empty:
         raise RuntimeError(f"yfinance 取不到 {ticker} 价格")
     splits = {d.date(): float(r) for d, r in tk.splits.items() if r and float(r) != 1.0}
+    return {"cik": cik, "facts": facts, "hist": hist, "splits": splits, "years": years}
+
+
+def compute_band(ticker, email, years=5, basis="forward", include_series=False,
+                 metric="eps", inputs=None):
+    """算出历史 PE/P.S 分布，返回纯数据 dict（不打印）。
+
+    供 CLI 与 fetch_facts.py 共用——engine.py 是零联网的确定性计算层，
+    带子必须由数据层算好塞进 facts.json，不能让引擎自己去取。
+    metric="eps"（PE 带，默认）或 "rps"（P/S 带，分母=每股营收）；
+    inputs=load_inputs(...) 可复用已下载数据，None 则自行下载。
+    """
+    ticker = ticker.upper()
+    if inputs is None:
+        inputs = load_inputs(ticker, email, years)
+    elif inputs.get("years", years) < years:
+        raise RuntimeError("inputs 的价格窗口比请求的 years 短，请重新 load_inputs")
+    facts, hist, splits = inputs["facts"], inputs["hist"], inputs["splits"]
+    cik = inputs["cik"]
+    NUM_TAGS, P = (NI_TAGS, "pe") if metric == "eps" else (REV_TAGS, "ps")
+    NUM_WORD = "净利" if metric == "eps" else "营收"
+
+    ni_a = pick(facts, NUM_TAGS, "annual", {"USD"}, prefer_max=(metric == "rps"))
+    ni_q = derive_q4(pick(facts, NUM_TAGS, "quarterly", {"USD"},
+                          prefer_max=(metric == "rps")), ni_a)
+    if len(ni_q) < 4:
+        raise RuntimeError(f"{ticker} 季度 XBRL 不足（{NUM_WORD} {len(ni_q)} 期）"
+                         "——外国发行人常无季度 XBRL，本工具需要季度序列")
+    sh_a = pick(facts, SH_TAGS, "annual", {"shares"})
+    sh_q = pick(facts, SH_TAGS, "quarterly", {"shares"})
     # 归一必须在 derive_q4_avg **之前**：Q4 = 4×FY − Σ3Q 的均值式要求 FY 与三个
     # 季度同口径。旧顺序（先推导后归一）在拆股年会先用混口径推出垃圾 Q4、
     # 再对垃圾整段乘系数——两步各错一次
@@ -284,7 +318,7 @@ def compute_band(ticker, email, years=5, basis="forward", include_series=False):
     normalize_splits(sh_a, splits)
     sh_q = derive_q4_avg(sh_q, sh_a)
     if len(sh_q) < 4:
-        raise RuntimeError(f"{ticker} 季度 XBRL 不足（净利 {len(ni_q)} 期/股数 {len(sh_q)} 期）"
+        raise RuntimeError(f"{ticker} 季度 XBRL 不足（{NUM_WORD} {len(ni_q)} 期/股数 {len(sh_q)} 期）"
                          "——外国发行人常无季度 XBRL，本工具需要季度序列")
     # 残留口径跳变哨兵：逐条 filed 规则的兜底（yfinance 拆股日偏差、罕见的不重述
     # 再申报都会在相邻期股数上留下台阶）。只留痕不修数——修数需要能定位口径边界，
@@ -361,7 +395,7 @@ def compute_band(ticker, email, years=5, basis="forward", include_series=False):
             if pts[i].get("anomalous"):
                 anom_days["trailing"] += 1
             else:
-                rec["pe_trailing"] = px / pts[i]["ttm_eps"]
+                rec[f"{P}_trailing"] = px / pts[i]["ttm_eps"]
                 rec["ttm_eps"] = pts[i]["ttm_eps"]
                 rec["ttm_period"] = pts[i]["period_end"]
         if i >= 0:
@@ -372,19 +406,19 @@ def compute_band(ticker, email, years=5, basis="forward", include_series=False):
             else:
                 ntm_eps = ntm_after.get(pts[i]["period_end"])
                 if ntm_eps:
-                    rec["pe_ntm"] = px / ntm_eps
+                    rec[f"{P}_ntm"] = px / ntm_eps
                     rec["ntm_eps"] = ntm_eps
         fy = fy_of(d)
         if fy and fy in eps_fy:
-            rec["pe_forward"] = px / eps_fy[fy]
+            rec[f"{P}_forward"] = px / eps_fy[fy]
             rec["fy_eps"] = eps_fy[fy]
             rec["fy"] = fy
-        if any(k in rec for k in ("pe_trailing", "pe_forward", "pe_ntm")):
+        if any(k in rec for k in (f"{P}_trailing", f"{P}_forward", f"{P}_ntm")):
             series.append(rec)
 
-    key = BASIS_KEY[basis]
+    key = f"{P}_{basis}"
     # 对照档固定选 trailing（唯一一档不依赖后见之明，任何标的都必然有值）
-    other = "pe_trailing" if basis != "trailing" else "pe_forward"
+    other = f"{P}_trailing" if basis != "trailing" else f"{P}_forward"
     series = [s for s in series if key in s]
     if len(series) < 60:
         raise RuntimeError(
@@ -399,7 +433,8 @@ def compute_band(ticker, email, years=5, basis="forward", include_series=False):
     # engine.pe_band_check 正是用 min/max 判"该票从未出现过的倍数"，被污染就失效。
     # 规则：剔除 EPS < 窗口内 EPS 中位数 25% 的交易日（此时 PE 已是中位倍数的 4 倍
     # 以上，纯由分母塌缩造成）。forward 口径按亏损财年整年剔除是同一思路的离散版。
-    EPS_KEY = {"pe_forward": "fy_eps", "pe_trailing": "ttm_eps", "pe_ntm": "ntm_eps"}[key]
+    EPS_KEY = {f"{P}_forward": "fy_eps", f"{P}_trailing": "ttm_eps",
+               f"{P}_ntm": "ntm_eps"}[key]
     eps_all = sorted(s[EPS_KEY] for s in series if s.get(EPS_KEY))
     near_zero = []
     if eps_all:
@@ -444,7 +479,8 @@ def compute_band(ticker, email, years=5, basis="forward", include_series=False):
                         "high": seg[-1], "days": len(seg)})
 
     out = {
-        "ticker": ticker, "cik": cik, "basis": basis, "years": years, "days": len(series),
+        "ticker": ticker, "cik": cik, "basis": basis, "metric": metric,
+        "years": years, "days": len(series),
         "mean": mean, "median": pcts[50], "stdev": sd_, "min": sv[0], "max": sv[-1],
         "pctiles": pcts, "recent": recent, "fiscal_years": fy_rows, "current": cur,
         "other_basis": other.split("_")[1],
@@ -481,22 +517,29 @@ def main():
                          "trailing=按当日已公告的滚动TTM EPS；"
                          "ntm=按该日已知最新TTM期末之后12个月实现的EPS"
                          "（与 engine 的前瞻期严格同源；较日历日起算最多滞后一季）")
+    ap.add_argument("--metric", choices=("eps", "rps"), default="eps",
+                    help="eps=PE 带（默认）；rps=P/S 带（分母=每股营收，"
+                         "近零利润票的参照——PE 失效的域换 PS 是教科书答案）")
     ap.add_argument("--match")
     ap.add_argument("--out")
     a = ap.parse_args()
 
     try:
-        b = compute_band(a.ticker, a.email, a.years, a.basis, include_series=bool(a.out))
+        b = compute_band(a.ticker, a.email, a.years, a.basis,
+                         include_series=bool(a.out), metric=a.metric)
     except RuntimeError as e:
         raise SystemExit(str(e))
     sv = b.pop("_sorted")
-    mean, sd_, cur, key = b["mean"], b["stdev"], b["current"], BASIS_KEY[a.basis]
+    P = "pe" if a.metric == "eps" else "ps"
+    LBL = "PE" if a.metric == "eps" else "P/S"
+    EW = "EPS" if a.metric == "eps" else "每股营收"
+    mean, sd_, cur, key = b["mean"], b["stdev"], b["current"], f"{P}_{a.basis}"
 
-    basis_desc = {"forward": "forward（分母 = 该财年最终实现的稀释 EPS）",
-                  "trailing": "trailing（分母 = 当日已公告的滚动四季 EPS）",
-                  "ntm": "ntm（分母 = 该日已知最新 TTM 期末之后 12 个月实现的 EPS，"
+    basis_desc = {"forward": f"forward（分母 = 该财年最终实现的{EW}）",
+                  "trailing": f"trailing（分母 = 当日已公告的滚动四季{EW}）",
+                  "ntm": f"ntm（分母 = 该日已知最新 TTM 期末之后 12 个月实现的{EW}，"
                          "与 engine 前瞻期同源）"}[a.basis]
-    print(f"\n=== {b['ticker']} 历史 PE 带 · {basis_desc} ===")
+    print(f"\n=== {b['ticker']} 历史 {LBL} 带 · {basis_desc} ===")
     print(f"近 {a.years} 年，{b['days']} 个交易日 | XBRL CIK {b['cik']} | "
           "价格 yfinance 日收盘（拆股调整）")
     for n in b["split_notes"]:
@@ -522,18 +565,18 @@ def main():
         print(f"  剔除: {b['near_zero_days']} 个交易日的 EPS 低于窗口中位数的 25%"
               f"（{r[0]}~{r[1]}）——分母趋零，PE 无信息量")
     if a.basis == "ntm":
-        print(f"  末点: {cur['date']} 收盘 {cur['close']:.2f} / 其后12个月实现 EPS "
-              f"{cur['ntm_eps']:.2f} = PE {cur[key]:.1f}x，处第 {rank_of(sv, cur[key]):.0f} 百分位")
+        print(f"  末点: {cur['date']} 收盘 {cur['close']:.2f} / 其后12个月实现{EW} "
+              f"{cur['ntm_eps']:.2f} = {LBL} {cur[key]:.1f}x，处第 {rank_of(sv, cur[key]):.0f} 百分位")
         print("       （ntm 序列止于「最近一个满 4 季度已披露」的日子；这是刻意的后见之明，"
               "用途是给 engine 的目标 PE 提供同口径历史分布，不是交易信号）")
     elif a.basis == "forward":
-        print(f"  末点: {cur['date']} 收盘 {cur['close']:.2f} / FY{cur['fy']} 实现 EPS "
-              f"{cur['fy_eps']:.2f} = PE {cur[key]:.1f}x，处第 {rank_of(sv, cur[key]):.0f} 百分位")
+        print(f"  末点: {cur['date']} 收盘 {cur['close']:.2f} / FY{cur['fy']} 实现{EW} "
+              f"{cur['fy_eps']:.2f} = {LBL} {cur[key]:.1f}x，处第 {rank_of(sv, cur[key]):.0f} 百分位")
         print("       （forward 序列止于最近一个已披露年报的财年末；本财年至今无实现 EPS，"
               "要看当下位置请加 --basis trailing）")
     else:
-        print(f"  最新: {cur['date']} 收盘 {cur['close']:.2f} / TTM EPS {cur['ttm_eps']:.2f} "
-              f"（{cur['ttm_period']} 期末）= PE {cur[key]:.1f}x，"
+        print(f"  最新: {cur['date']} 收盘 {cur['close']:.2f} / TTM {EW} {cur['ttm_eps']:.2f} "
+              f"（{cur['ttm_period']} 期末）= {LBL} {cur[key]:.1f}x，"
               f"处第 {rank_of(sv, cur[key]):.0f} 百分位")
     print(f"\n分布: 均值 {mean:.2f}  中位数 {b['median']:.2f}  σ {sd_:.2f}  "
           f"最低 {b['min']:.2f}  最高 {b['max']:.2f}")
@@ -547,7 +590,7 @@ def main():
         print(f"  对照 {b['other_basis']} 口径中位数 {b['other_basis_median']:.2f}"
               f"（两者之比 {b['other_basis_median'] / b['median']:.2f}x ≈ 期间 EPS 增速，"
               "两个口径的带子不可混用）")
-    print("  注意：均值 ≠ 中位数 ≠ (min+max)/2。PE 序列右偏时 (min+max)/2 会系统性偏高。")
+    print(f"  注意：均值 ≠ 中位数 ≠ (min+max)/2。{LBL} 序列右偏时 (min+max)/2 会系统性偏高。")
     print(f"  (min+max)/2 = {(b['min'] + b['max']) / 2:.2f}   vs   真中位数 {b['median']:.2f}")
 
     print(f"\n{'候选带':<14}{'下沿':>8}{'上沿':>8}{'中点':>8}{'半宽%':>8}{'覆盖率':>9}")
@@ -556,7 +599,7 @@ def main():
               f"{100 * (c['hi'] - c['mid']) / c['mid']:>7.1f}%{c['coverage_pct']:>8.1f}%")
 
     # 逐财年实现 PE：某条带子是否真框住了每一年，只能这样核对
-    print(f"\n{'财年(期末)':<14}{'最低PE':>9}{'中位PE':>9}{'最高PE':>9}{'天数':>7}")
+    print(f"\n{'财年(期末)':<14}{'最低' + LBL:>9}{'中位' + LBL:>9}{'最高' + LBL:>9}{'天数':>7}")
     for f in b["fiscal_years"]:
         print(f"{f['fy_end']:<14}{f['low']:>9.2f}{f['median']:>9.2f}"
               f"{f['high']:>9.2f}{f['days']:>7}")
