@@ -78,6 +78,80 @@ def tail(dic, n):
     return [k for k, _ in items], [v for _, v in items]
 
 
+def _pctile_rank(pcts, x):
+    """从稀疏分位点表反查 x 的百分位（线性插值）。facts.json 里 key 是字符串。"""
+    ks = sorted(int(k) for k in pcts)
+    vals = [pcts[str(k)] for k in ks]
+    if x <= vals[0]:
+        return float(ks[0])
+    if x >= vals[-1]:
+        return float(ks[-1])
+    for i in range(len(ks) - 1):
+        if vals[i] <= x <= vals[i + 1]:
+            span = vals[i + 1] - vals[i]
+            f = (x - vals[i]) / span if span > 0 else 0.0
+            return ks[i] + f * (ks[i + 1] - ks[i])
+    return 50.0
+
+
+def pe_band_check(scenario_name, pe, band, ddiag):
+    """目标 PE 相对该票自身历史「已实现前瞻 PE」分布的位置。
+
+    口径对齐：band 由 fetch_facts 以 basis="ntm" 写入——分母是「该日之后 12 个月
+    实际实现的稀释 EPS」；引擎的 s["pe"] 乘的是 eps1 = TTM×(1+g)，前瞻期同样是
+    NTM（见 valuation_service.fwd_window）。两者严格同源，可直接比分位。
+    band["basis"] 字段可核对；若哪天改回 forward（按财年切），只在 report_end =
+    财年末时才对得上，AMZN/META 这类 12 月财年公司在 Q1~Q3 报告期会系统性错位。
+
+    两者都是 GAAP 基础；判断层若改用剔 SBC 的非 GAAP EPS，分母变大、PE 变小，
+    本诊断会系统性偏低，届时不可直接采信。
+
+    阈值刻意保守：只在「该票历史上从未出现过的倍数」或「base 偏离中枢区间」时报
+    yellow。低倍数本身不是错——价值下沿本就该落在历史低位附近，这里只要求留痕。
+    """
+    if not band or not band.get("pctiles"):
+        return []
+    pcts = band["pctiles"]
+    rank = _pctile_rank(pcts, pe)
+    # base 中枢检查用与判断层 PE 锚同一个窗（近 3 年子窗，见 valuation_service 的
+    # band_meta 注入）：锚了子窗 P50 却按全窗 [P10,P90] 打旗会自相矛盾——全窗含
+    # 2021 regime，子窗中位低于全窗 P10 的票（倍数已下台阶）恰好每次被冤枉。
+    # min/max 的「从未出现过」检查仍看全窗（问题本来就是全历史范围的）。
+    _rc = (band.get("recent") or {})
+    _rp = _rc.get("pctiles") or {}
+    cpcts = _rp if ("10" in _rp and "90" in _rp) else pcts
+    cwin = f"近{_rc['years']}年子窗" if cpcts is _rp else f"近{band['years']}年全窗"
+    ddiag["pe_vs_history"] = {
+        "pctile": round(rank, 1), "median": round(pcts["50"], 1),
+        "p10": round(pcts["10"], 1), "p90": round(pcts["90"], 1),
+        "min": round(band["min"], 1), "max": round(band["max"], 1),
+        "anchor_window": cwin,
+        "anchor_p50": (round(cpcts["50"], 1) if "50" in cpcts else None),
+        "years": band["years"], "days": band["days"], "basis": band["basis"]}
+    ctx = (f"（近 {band['years']} 年已实现前瞻 PE：中位 {pcts['50']:.1f}x，"
+           f"实际区间 {band['min']:.1f}~{band['max']:.1f}x，{band['days']} 个交易日）")
+    if not band["min"] <= pe <= band["max"]:
+        return [["yellow", f"{scenario_name} 目标 PE {pe:.1f}x 落在该票近 {band['years']} 年"
+                           f"从未出现过的区间之外{ctx}——不必然是错，"
+                           "但请在 rationale 中给出依据"]]
+    if scenario_name == "base":
+        # 容许区间 = 子窗 [P10,P90] ∪ 锚 P50 的 ±ANCHOR_TOL——prompt 里写的锚纪律就是
+        # 「偏离 P50 ±15% 以上要给证据」，若这里只按 [P10,P90] 打旗，倍数分布窄的票
+        # （MSFT/AMZN 子窗半宽仅 ±12%）会出现"按纪律给了证据的偏离照样吃黄旗"，
+        # 两层规则各说各话。取并集后：纪律内不打旗，纪律外必打旗，口径一致。
+        ANCHOR_TOL = 0.15
+        lo_ok, hi_ok = cpcts["10"], cpcts["90"]
+        if "50" in cpcts:
+            lo_ok = min(lo_ok, cpcts["50"] * (1 - ANCHOR_TOL))
+            hi_ok = max(hi_ok, cpcts["50"] * (1 + ANCHOR_TOL))
+        if not lo_ok <= pe <= hi_ok:
+            return [["yellow", f"base 目标 PE {pe:.1f}x 界外 {cwin} [P10,P90]="
+                               f"[{cpcts['10']:.1f},{cpcts['90']:.1f}]x（并 P50±"
+                               f"{ANCHOR_TOL:.0%} 后为 [{lo_ok:.1f},{hi_ok:.1f}]x，"
+                               f"全窗第 {rank:.0f} 百分位）{ctx}——base 应为中枢情景"]]
+    return []
+
+
 ttm = facts["ttm"]
 rev0 = ttm["revenue"]["value"] / 1e6
 
@@ -248,6 +322,7 @@ for name, s in cfg["scenarios"].items():
             warnings.append(["yellow", f"综合目标价隐含 P/调整后净利 {p_ni:.1f}x（界外 [6,60]）"])
     if spread and spread > 2:
         warnings.append(["yellow", f"方法离散度 {spread}x（>2x）——各法分歧大，综合可信度降低"])
+    warnings += pe_band_check(name, s["pe"], facts.get("pe_band"), ddiag)
 
     out["scenarios"][name] = dict(
         assumptions=s, rev1=round(rev1), op1=round(op1), ni1=round(ni1),
@@ -265,6 +340,27 @@ if abs(_dev) > 0.35:
     out["scenarios"]["base"]["warnings"].append(
         ["yellow", f"base 综合较现价偏离 {_dev:+.0%}（>±35%）——请核对 base 假设"
                    "或在注记中显式说明为何与市场定价分歧"])
+
+# ---- 价值交易区间：历史已实现 NTM PE 分位 × base 前瞻 EPS ----
+# 与三情景互为对照：情景是「基本面情景各自的公允价」（bear=EPS↓×PE↓ 双压），
+# 这行回答「按该票自己的历史倍数分布，base 盈利下会交易在哪个区间」——
+# 参考表用手拍带子回答的问题，这里用分位数回答。锚窗优先近 3 年子窗
+# （pe_band.recent，避开 2021 regime），回退全窗；facts.json round-trip 后
+# recent.pctiles 的键是字符串（与 pctiles 同，见 _pctile_rank 注）。
+_band = facts.get("pe_band") or {}
+_rc = _band.get("recent") or {}
+_use = _rc.get("pctiles") or _band.get("pctiles") or {}
+if all(q in _use for q in ("10", "25", "50", "75", "90")):
+    _e1 = out["scenarios"]["base"]["eps1"]
+    _tr_pe = {q: round(float(_use[q]), 2) for q in ("10", "25", "50", "75", "90")}
+    out["trading_range"] = dict(
+        basis=_band.get("basis"),
+        window=(f"近{_rc['years']}年" if _rc.get("pctiles") else f"近{_band.get('years')}年"),
+        days=(_rc.get("days") if _rc.get("pctiles") else _band.get("days")),
+        eps1_base=_e1, pe=_tr_pe,
+        px={q: round(v * _e1, 1) for q, v in _tr_pe.items()},
+        full_window_p50=(round(float(_band["pctiles"]["50"]), 2)
+                         if _band.get("pctiles") else None))
 
 # 反向 DCF：base 口径下现价隐含的起始增速
 s = cfg["scenarios"]["base"]
@@ -309,6 +405,11 @@ print(f"===== {cfg['ticker']} @ ${cfg['price']} (semantics v{out['semantics_vers
 print(f"TTM: rev {ttm_m['revenue']:,} op {ttm_m['op_income']:,} adjNI {cfg['adj_ni']:,} "
       f"adjEPS {out['adj_eps']} FCF {ttm_m['fcf']:,}")
 print(f"反向DCF隐含起始增速: {out['reverse_dcf']:.1%}（base 利润率/WACC 条件下）")
+if out.get("trading_range"):
+    _tr = out["trading_range"]
+    print(f"交易区间（{_tr['window']}已实现 NTM PE 分位 × base EPS {_tr['eps1_base']}）: "
+          f"P25~P75 {_tr['px']['25']}~{_tr['px']['75']}  中位 {_tr['px']['50']}"
+          f"  宽区间 P10~P90 {_tr['px']['10']}~{_tr['px']['90']}")
 if not sotp_in_blend:
     print(f"SOTP 降级为参考项（主分部利润占比 {cfg['seg1_share']:.0%} >= 85%），综合 = PE/DCF 均值")
 for n, v in out["scenarios"].items():

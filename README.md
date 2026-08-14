@@ -74,12 +74,16 @@ sec-filing-downloader/
 ├── static/
 │   └── index.html             # 深色主题单页前端（原生 JS，无构建步骤）
 ├── valuation/                 # 估值确定性计算层 + 判断层提示词
-│   ├── fetch_facts.py         # XBRL companyfacts 取数（多标签合并/Q4推导/TTM）
+│   ├── fetch_facts.py         # XBRL companyfacts 取数（多标签合并/Q4推导/TTM/SBC/PE带）
+│   ├── pe_band.py             # 历史 PE 分位带（forward/trailing 双口径 + 逆向匹配）
 │   ├── extract_sections.py    # 财报关键章节定位（分部/税率/capex/流动性）
 │   ├── judgment_prompt.md     # 判断层提示词（假设 schema + 检查清单）
 │   ├── engine.py              # PE 法 / 十年 FCFF DCF / SOTP / 反向 DCF / 敏感性
 │   ├── build_report.py        # 六表 Excel（假设=黄色活格，全表公式联动）
 │   ├── verify_report.py       # formulas 包独立复算，16 项交叉核对
+│   ├── compare.py             # 两次运行对比（基本面/假设漂移/结论变动）
+│   ├── vintages.py            # 估值快照归档：按报告期存，同期多次运行=多样本
+│   ├── trend.py               # N 期趋势视图：变化 vs 组内采样噪声的显著性对照
 │   └── README.md              # 流水线用法与 config schema
 ├── jobs/                      # 估值任务工作目录（gitignore）
 ├── reports/                   # 手动生成的报告（gitignore）
@@ -178,6 +182,28 @@ $env:SEC_EMAIL = "you@example.com"                       # 或环境变量（仅
 ### `GET /api/valuation/{job_id}` / `GET /api/valuation/{job_id}/result`
 
 轮询进度（九个步骤逐步显示）；完成后下载 zip（财报原件 + manifest + 估值 Excel + 假设留档 config.json）。
+
+## 📈 跨期跟踪（CLI）
+
+价值投资的实际用法是"新财报出来 → 基本面变没变 → 更新估值"，两个工具覆盖这一步：
+
+```bash
+# 两期对比：基本面变化 / 假设漂移 / 结论变动
+python valuation/compare.py 旧_valuation.json 新_valuation.json
+
+# N 期趋势：一行一个报告期，看估计值被怎么修正
+python valuation/trend.py MSFT
+python valuation/trend.py MSFT --ingest 历史bundle里的*_valuation.json   # 回填归档
+```
+
+`trend.py` 与普通趋势表的区别在于**把季度间的变化和同一报告期内的采样噪声放在一起看**。
+判断层有运行间噪声（MSFT 实测 base 综合目标价 CV 2.4%，NVDA bear CV≈12%），
+所以 vintage 按**报告期**归档、同期多次运行存为多个样本，相邻期用
+`|Δ|/SE`（`SE=sqrt(sd1²/n1+sd2²/n2)`）判断变化是否可与噪声区分：
+`<1` 噪声内 / `1~2` 弱信号 / `≥2` 显著。这不是统计检验（n=3 时秩检验到不了 p<0.05），
+只是把噪声量级摆到变化旁边做量纲对照——**要有意义，每个报告期至少跑 3 次**。
+
+归档在 `vintages/{TICKER}/{report_end}.json`，服务端每次估值完成后自动写入。
 
 ## ⚠️ SEC 使用注意
 

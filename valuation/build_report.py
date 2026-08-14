@@ -675,9 +675,47 @@ _spread = " / ".join(f"{sc} {d['scenarios'][sc].get('method_spread') or '—'}x"
 put(ws, "A26", f"方法离散度（同情景{_mth} max/min）：{_spread}——离散大说明各法分歧大，"
                "综合目标价可信度降低，应分别看各法并参考反向 DCF", GREEN, border=False)
 
+# 价值交易区间：历史已实现 NTM PE 分位 × base 前瞻 EPS——与上方三情景互为对照
+# （情景=基本面情景各自的公允价，bear 是 EPS↓×PE↓ 双压；这块回答「按该票自己的
+# 历史倍数分布，base 盈利下会交易在哪个区间」）。PE 分位是引擎从 facts.pe_band
+# 取的常量，价格行/距现价行是活公式（改 base EPS 或现价即联动）。
+# 布局固定从 27 行起：verify_report 交叉核对 D30（P50 价格），改布局须同步。
+_row = 27
+_tr = d.get("trading_range")
+if _tr:
+    put(ws, f"A{_row}", f"价值交易区间（{_tr['window']}已实现 NTM PE 分位 × base 前瞻 EPS）",
+        H2, border=False)
+    _row += 1
+    _qs = [q for q in ("10", "25", "50", "75", "90") if q in _tr["pe"]]
+    put(ws, f"A{_row}", "历史 PE 分位", BOLD, fill=HDRFILL)
+    for j, q in enumerate(_qs):
+        put(ws, f"{get_column_letter(2+j)}{_row}", f"P{q}", BOLD, fill=HDRFILL)
+    _row += 1
+    put(ws, f"A{_row}", "PE (×)", BOLD)
+    for j, q in enumerate(_qs):
+        put(ws, f"{get_column_letter(2+j)}{_row}", _tr["pe"][q], BLUE, fmt=FM_X)
+    _row += 1
+    put(ws, f"A{_row}", "× base 前瞻 EPS", BOLD)
+    for j in range(len(_qs)):
+        col = get_column_letter(2 + j)
+        put(ws, f"{col}{_row}", f"={col}{_row-1}*'情景假设'!$C$34", BLACK, fmt=FM_PX)
+    _row += 1
+    put(ws, f"A{_row}", "距现价", BOLD)
+    for j in range(len(_qs)):
+        col = get_column_letter(2 + j)
+        put(ws, f"{col}{_row}", f"={col}{_row-1}/$B$4-1", BLACK, fmt=FM_PCT)
+    _row += 1
+    put(ws, f"A{_row}", f"注：分位取自 {_tr['days']} 个交易日的逐日已实现 NTM PE"
+                        f"（basis={_tr['basis']}，一次性畸变窗口已双侧剔除"
+                        + (f"；5年全窗中位 {_tr['full_window_p50']}x 供对照"
+                           if _tr.get("full_window_p50") else "")
+                        + "）。P25~P75 为核心区间——「按历史倍数该在哪交易」，"
+                          "与上方情景估值（基本面公允价）分歧本身即是信号。",
+        GREEN, border=False)
+    _row += 2
+
 # v2 诊断红旗区：engine diagnostics 的 red/yellow 警告逐条落进摘要——
 # 警告和 headline 数字必须出现在同一张表上，不能只活在引擎 stdout 里
-_row = 27
 _flags = [(sc, lv, msg) for sc in ("bear", "base", "bull")
           for lv, msg in d["scenarios"][sc].get("warnings", [])]
 if _flags:

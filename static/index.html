@@ -384,6 +384,13 @@ $("valBtn").addEventListener("click", async () => {
       if (st.status === "done") {
         const parts = Object.entries(st.summary || {}).map(
           ([k, v]) => `${k} $${v.blend}（${(v.upside * 100).toFixed(0)}%）`);
+        // 交易区间与三情景并列：情景=基本面公允价，区间=按历史倍数该在哪交易
+        // lo/hi/mid 三个都要判：服务端是逐档 .get() 取的，缺一档就会渲染出
+        // "$undefined~$undefined"——宁可整块不出
+        const tr = st.trading_range;
+        const trTxt = tr && tr.lo != null && tr.hi != null && tr.mid != null
+          ? `；交易区间（${tr.window}PE带×baseEPS）$${tr.lo}~$${tr.hi}，中位 $${tr.mid}`
+          : "";
         const resultRes = await fetch(`/api/valuation/${job_id}/result`);
         if (!resultRes.ok) throw new Error(`下载报告失败（HTTP ${resultRes.status}）`);
         const blob = await resultRes.blob();
@@ -392,7 +399,7 @@ $("valBtn").addEventListener("click", async () => {
         a.download = `${ticker}_valuation_bundle.zip`;
         a.click();
         URL.revokeObjectURL(a.href);
-        setValStatus("ok", `完成！综合目标价：${parts.join("， ")}。已下载 zip（报告+财报+假设留档）`);
+        setValStatus("ok", `完成！综合目标价：${parts.join("， ")}${trTxt}。已下载 zip（报告+财报+假设留档）`);
         break;
       }
       setValStatus("busy", st.step_label || st.step);

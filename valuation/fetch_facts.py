@@ -14,6 +14,7 @@
   tag 映射 + 现汇折算美元（yfinance），历史序列按同一现汇折算（恒定汇率口径）
 """
 import json
+import os
 import sys
 import time
 from datetime import date, timedelta
@@ -45,6 +46,11 @@ TAGS_STANDARD = {
     "current_debt": ["DebtCurrent", "LongTermDebtCurrent"],
     "commercial_paper": ["CommercialPaper"],
     "shares_diluted": ["WeightedAverageNumberOfDilutedSharesOutstanding"],
+    # 股权激励（现金流量表加回项）：卖方"non-GAAP EPS"多半是剔了 SBC 的口径，
+    # 而 SBC 是真实成本（稀释已体现在稀释股数里，但费用被剔了两次都不算过分）。
+    # 取来供判断层做"SBC 调整后 PE"对照——AMZN/META 这类占净利两位数百分比。
+    "sbc": ["ShareBasedCompensation", "AllocatedShareBasedCompensationExpense",
+            "ShareBasedCompensationArrangementByShareBasedPaymentAwardCompensationCost"],
 }
 INSTANT_STANDARD = {"cash", "st_securities", "lt_securities", "lt_debt",
                     "current_debt", "commercial_paper"}
@@ -65,6 +71,7 @@ TAGS_FINANCIALS = {
     "intangibles": ["IntangibleAssetsNetExcludingGoodwill", "FiniteLivedIntangibleAssetsNet"],
     "cash": ["CashAndCashEquivalentsAtCarryingValue"],
     "shares_diluted": ["WeightedAverageNumberOfDilutedSharesOutstanding"],
+    "sbc": ["ShareBasedCompensation", "AllocatedShareBasedCompensationExpense"],
 }
 INSTANT_FINANCIALS = {"equity", "goodwill", "intangibles", "cash"}
 
@@ -243,9 +250,11 @@ def ttm_via_ytd(tag_names, annual, fy_end=""):
 
 # Q4 = 年度 - 前三季 只对可加总的流量科目成立；加权平均股数/EPS 不可加总
 # （FY 加权股数 ≈ 四季平均而非加总，硬推会得到大负数并被当成最新股数消费）
-DERIVE_Q4 = {"revenue", "op_income", "net_income", "pretax_income"}
+DERIVE_Q4 = {"revenue", "op_income", "net_income", "pretax_income", "sbc"}
 INCOME_ITEMS = ("revenue", "pretax_income", "net_income") if MODE == "financials" \
     else ("revenue", "op_income", "net_income")
+# sbc 参与 TTM 但不进 INCOME_ITEMS：它不是核心科目，缺失只应留空、不该让整只票不适配
+TTM_ITEMS = INCOME_ITEMS + (("sbc",) if "sbc" in TAGS else ())
 
 out = {"ticker": TICKER, "cik": CIK, "mode": MODE, "taxonomy": TAXONOMY,
        "currency": CURRENCY, "fx_to_usd": FX}
@@ -266,7 +275,7 @@ for name in TAGS:
     out[name + "_quarterly"] = dict(sorted(quarterly.items()))
 
 ttm = {}
-for name in INCOME_ITEMS:
+for name in TTM_ITEMS:
     q = out[name + "_quarterly"]
     a = out[name + "_annual"]
     done = False
@@ -293,6 +302,28 @@ if MODE == "standard":
 out["ttm"] = ttm
 out["data_latest"] = max(max(out["revenue_annual"], default=""),
                          max(out["revenue_quarterly"], default=""))
+
+# ---- 历史「已实现前瞻 PE」分布：供 engine.py 的目标 PE 越界诊断（pe_band_check）
+# 引擎是零联网的确定性计算层，带子必须在数据层备好。属非核心项：任何失败只记
+# pe_band_error 不阻断取数——但要留痕，不静默。VALUATION_NO_PE_BAND=1 可关闭。
+if os.environ.get("VALUATION_NO_PE_BAND") != "1":
+    try:
+        from pe_band import compute_band
+        # basis="ntm"：必须与 engine 的前瞻期同源。engine 算 rev1 = TTM×(1+g)，
+        # 前瞻期恒为 NTM 而非财年（见 valuation_service.fwd_window）。用 forward
+        # （按财年切）只在 report_end = 财年末时才对，AMZN/META 这类 12 月财年公司
+        # 在 Q1/Q2/Q3 报告期会系统性错位，pe_vs_history 的分位数就不可信。
+        _band = compute_band(TICKER, EMAIL, years=5, basis="ntm")
+        _band.pop("_sorted", None)
+        out["pe_band"] = _band
+        # 口径/年数一律从 _band 自身字段拼：写死字符串会在换 basis 时静默说谎
+        # （曾切到 ntm 后仍打印 "forward"，排查与回归对比都会被带偏）
+        print(f"PE带({_band['basis']},{_band['years']}y): 中位 {_band['median']:.1f}x  区间 "
+              f"{_band['min']:.1f}~{_band['max']:.1f}x  {_band['days']} 个交易日")
+    except Exception as _e:
+        out["pe_band_error"] = f"{type(_e).__name__}: {_e}"
+        print(f"警告: PE 带未生成（{out['pe_band_error']}）——目标 PE 越界诊断本次不生效",
+              file=sys.stderr)
 
 json.dump(out, open(OUT, "w", encoding="utf-8"), ensure_ascii=False, indent=1)
 q = out["revenue_quarterly"]
