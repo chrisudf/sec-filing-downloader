@@ -96,7 +96,8 @@ def _check_rev_override(d: dict) -> None:
 
 def _validate_judgment(d: dict, mode: str = "standard",
                        rev0: float | None = None,
-                       fcf_margin: float | None = None) -> None:
+                       fcf_margin: float | None = None,
+                       band: dict | None = None) -> None:
     """LLM 输出的硬校验：结构、边界、margins 长度。不合格直接拒绝重试。
 
     v2（semantics_version=2, 2026-07-22）新增：
@@ -107,7 +108,7 @@ def _validate_judgment(d: dict, mode: str = "standard",
       市场对可修复的周期谷底给看穿周期的倍数；判断为永久受损时可设
       permanent_impairment=true + impairment_note（原文出处）豁免
     - margins 谷底下限 0.4×当前 TTM FCF 利润率（同一豁免）
-    rev0/fcf_margin 由调用方从 facts 传入；为 None 时跳过对应规则。"""
+    rev0/fcf_margin/band 由调用方从 facts 传入；为 None 时跳过对应规则。"""
     if mode == "financials":
         _validate_judgment_financials(d)
         return
@@ -135,6 +136,15 @@ def _validate_judgment(d: dict, mode: str = "standard",
     if not isinstance(d["notes"], list) or not d["notes"]:
         raise ValueError("notes 必须是非空数组")
     _check_rev_override(d)
+    # pe 下限的 band 证据放行：锚纪律命令 base 默认锚子窗 P50，而历史 P50×1.15 < 8
+    # 的低倍数票（汽车/能源类，GM/F 历史 NTM P50 约 4.5~7）上，[8,60] 静态下限与锚
+    # 互相矛盾——唯一合法值 pe=8 必然吃黄旗或烧光 retry。带子本身就是"该票长期在
+    # 8x 以下交易"的证据：此时下限放宽到 max(4, 0.6×锚窗P10)——低于历史 P10 打六折
+    # 仍属崩盘定价，照旧走 permanent_impairment 通道。带子缺失时回退静态 8。
+    pe_floor = 8.0
+    _bp = ((band or {}).get("recent") or {}).get("pctiles") or (band or {}).get("pctiles") or {}
+    if "10" in _bp and "50" in _bp and _bp["50"] * 1.15 < 8:
+        pe_floor = max(4.0, round(0.6 * _bp["10"], 1))
     for sc in ("bear", "base", "bull"):
         if sc not in d["scenarios"]:
             raise ValueError(f"缺少情景 {sc}")
@@ -159,9 +169,12 @@ def _validate_judgment(d: dict, mode: str = "standard",
             raise ValueError(f"{sc}: opm/tax 越界")
         _imp = (s.get("permanent_impairment") is True
                 and str(s.get("impairment_note") or "").strip() != "")
-        if not (4 if _imp else 8) <= s["pe"] <= 60:
-            raise ValueError(f"{sc}.pe 需在 [8, 60]——低于 8x 的『目标 PE』属于崩盘/永久受损"
-                             "定价，须设 permanent_impairment=true + impairment_note（下限放宽至 4）")
+        if not (4 if _imp else pe_floor) <= s["pe"] <= 60:
+            raise ValueError(
+                f"{sc}.pe 需在 [{pe_floor:g}, 60]——低于下限的『目标 PE』属于崩盘/永久受损"
+                "定价，须设 permanent_impairment=true + impairment_note（下限放宽至 4）"
+                + ("" if pe_floor != 8.0 else
+                   "；历史 NTM 带子窗 P50×1.15<8 的低倍数票下限会自动放宽至 max(4, 0.6×子窗P10)"))
         if not 0 <= s["m1"] <= 60 or not 0 <= s["m2"] <= 60:
             raise ValueError(f"{sc}.m1/m2 需在 [0, 60]")
         for k in ("g", "g0"):
@@ -687,7 +700,7 @@ async def _pipeline(job: dict, ticker: str, email: str) -> None:
             judgment = _parse_json(raw)
             _validate_judgment(judgment, mode,
                                rev0=float(judgment.get("ttm_revenue_override") or rev0_m),
-                               fcf_margin=fcfm)
+                               fcf_margin=fcfm, band=facts.get("pe_band"))
             # 陈旧 XBRL（外国发行人 6-K 无季度框架）下，没有原文重锚的 TTM 会让
             # 全部情景锚在多年前的营收基准上——硬性要求判断层给 override。
             # PENDING_10Q（业绩 8-K 已出、10-Q 未交）同理：不重锚等于用上季度
@@ -778,7 +791,7 @@ async def _pipeline(job: dict, ticker: str, email: str) -> None:
             revised = _parse_json(await _claude(retry_p))
             _validate_judgment(revised, mode,
                                rev0=float(revised.get("ttm_revenue_override") or rev0_m),
-                               fcf_margin=fcfm)
+                               fcf_margin=fcfm, band=facts.get("pe_band"))
             # 陈旧 XBRL / PENDING_10Q 的强制 override 在复审通道同样成立——revised
             # 整体替换 judgment，若复审输出丢掉 override，全部情景会锚回旧营收基准
             if ((stale_days > 550 or pending_8k)
