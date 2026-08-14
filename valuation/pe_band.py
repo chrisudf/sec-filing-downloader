@@ -19,7 +19,8 @@
 - **TTM EPS = TTM 净利 ÷ 四季平均稀释股数**：EPS 和加权平均股数都不可跨季加总
   （见 fetch_facts.py:244），净利可以——所以在分子上加总，分母取四季均值。
 - **拆股归一**：yfinance 的 Close 已按拆股调整，XBRL 的股数未必（companyfacts 只在
-  后续财报把该期做比较期时才追溯重述）。按拆股日检测股数序列有无跳变再决定是否回补，
+  后续财报把该期做比较期时才追溯重述——重述是**逐条**的，不是整段的）。按每条记录
+  自己的最新 filed 日判定口径：filed 早于拆股生效日的记录必为拆前口径，逐条回补；
   否则 AAPL 4:1 / AMZN 20:1 这类会把拆股前整段 PE 算错一个数量级。
 - **一次性畸变双侧剔除**：near-zero 地板只挡分母塌缩，挡不住分母膨胀——巨额一次性
   收益（AMZN 2026Q2 $53.4B Anthropic 重估）会把实现 EPS 吹大、PE 假性变低，带子的
@@ -127,6 +128,12 @@ def derive_q4_avg(quarterly, annual):
     fetch_facts.py:244 说「加权股数不可加总」，指的是 年度−前三季 那个**和式**
     （会得到大负数）；股数是均值不是和，均值式 4×FY−Σ3 才成立。公司不报 Q4 10-Q，
     不补这一期的话每个滚动四季窗口都缺一角，TTM 序列会直接为空。
+
+    调用前提：输入序列已过 normalize_splits——均值式要求 FY 与三个季度同口径，
+    混用拆前/拆后口径会推出垃圾 Q4。gate 是口径归一失效时的兜底，×÷1.5 对数对称
+    （旧值 0.5/2 宽到连 20:1 混口径都放行过）：单季 50% 级别的增发/回购跳变仍在
+    容忍内，2:1 以上的残留口径混用会被拒掉；5:4 这类小比例混用 gate 拦不住，
+    第一道防线是 normalize_splits 的逐条 filed 判定。
     """
     for a_end, a in annual.items():
         ae = date.fromisoformat(a_end)
@@ -136,34 +143,49 @@ def derive_q4_avg(quarterly, annual):
             continue
         vals = [v["val"] for v in in_year.values()]
         q4 = 4 * a["val"] - sum(vals)
-        if 0.5 * min(vals) < q4 < 2 * max(vals):  # 越界说明口径不一致（如跨拆股），宁缺勿错
+        if 2 / 3 * min(vals) < q4 < 1.5 * max(vals):  # 越界=口径不一致或数据异常，宁缺勿错
             quarterly[a_end] = {"val": q4, "filed": a["filed"],
                                 "first_filed": a["first_filed"]}
     return dict(sorted(quarterly.items()))
 
 
 def normalize_splits(shares, splits):
-    """XBRL 旧期股数可能是拆股前口径；按拆股日检测跳变，有跳变才回补。
+    """XBRL 股数序列的拆股口径归一：filed 早于拆股生效日的记录必为拆前口径，逐条回补。
 
-    未重述时 后/前 ≈ 拆股比（20:1 就是 ~20），已重述时 ≈ 1——两种情形差一个
-    数量级，用 0.75×比例 当阈值足够稳，不会被增发/回购的百分之几噪声误触发。
+    判据是确定性的：会计准则（ASC 260）要求拆股后发出的报告对**所有列报期间**追溯
+    重述加权股数，而一份在拆股生效前 filed 的文件不可能反映尚未发生的拆股——
+    所以「该期最新 filed 日 vs 拆股日」逐条决定口径，不需要猜。
+
+    旧实现按「拆股日前后各 2 期均值的跳变」整段判断，两个实测会咬人的洞：
+    ① XBRL 重述是逐条的——拆股后的新报告只重述其比较期（±4 个季度左右），更老的
+      期间永远停留在拆前口径。探测点（紧邻拆股日的期间）恰恰是最先被重述的，
+      obs≈1 → 判「已重述」→ 更老的拆前期间整段漏掉（NVDA 2024-06 10:1 实测：
+      ntm band min 5.1 vs 修复后 17.9，带子被静默拉宽）。
+    ② 反向拆股（ratio<1）时「obs > ratio*0.75」恒真：已重述（obs≈1）同样满足
+      0.1×0.75 的门槛，会把重述好的序列再乘 0.1，凭空错一个数量级。
+    逐条判定天然覆盖两个象限与多次拆股（filed 早于两次拆股的记录依次吃到两个系数）。
+    缺 filed 日的记录无法判定，保守不动并留痕。
     """
     notes = []
     for sd, ratio in sorted(splits.items(), reverse=True):
         sd_s = sd.isoformat()
-        items = sorted(shares.items())
-        before = [v["val"] for k, v in items if k < sd_s][-2:]
-        after = [v["val"] for k, v in items if k >= sd_s][:2]
-        if not before or not after:
-            continue
-        obs = (sum(after) / len(after)) / (sum(before) / len(before))
-        if obs > ratio * 0.75:
-            for k, v in shares.items():
-                if k < sd_s:
-                    v["val"] *= ratio
-            notes.append(f"{sd_s} {ratio:g}:1 拆股 — XBRL 旧期为拆股前口径，已按比例回补")
+        fixed = skipped = 0
+        for v in shares.values():
+            filed = v.get("filed")
+            if not filed:
+                skipped += 1
+                continue
+            if filed < sd_s:
+                v["val"] *= ratio
+                fixed += 1
+        if fixed:
+            notes.append(f"{sd_s} {ratio:g}:1 拆股 — {fixed} 期最新 filed 早于拆股日"
+                         "（拆前口径），已按比例回补"
+                         + (f"；{skipped} 期缺 filed 日未动" if skipped else ""))
         else:
-            notes.append(f"{sd_s} {ratio:g}:1 拆股 — XBRL 已追溯重述，无需调整")
+            notes.append(f"{sd_s} {ratio:g}:1 拆股 — 全部期间 filed 晚于拆股日"
+                         "（XBRL 已追溯重述），无需调整"
+                         + (f"；{skipped} 期缺 filed 日未动" if skipped else ""))
     return notes
 
 
@@ -243,11 +265,11 @@ def compute_band(ticker, email, years=5, basis="forward", include_series=False):
 
     ni_a = pick(facts, NI_TAGS, "annual", {"USD"})
     ni_q = derive_q4(pick(facts, NI_TAGS, "quarterly", {"USD"}), ni_a)
-    sh_a = pick(facts, SH_TAGS, "annual", {"shares"})
-    sh_q = derive_q4_avg(pick(facts, SH_TAGS, "quarterly", {"shares"}), sh_a)
-    if len(ni_q) < 4 or len(sh_q) < 4:
-        raise RuntimeError(f"{ticker} 季度 XBRL 不足（净利 {len(ni_q)} 期/股数 {len(sh_q)} 期）"
+    if len(ni_q) < 4:
+        raise RuntimeError(f"{ticker} 季度 XBRL 不足（净利 {len(ni_q)} 期）"
                          "——外国发行人常无季度 XBRL，本工具需要季度序列")
+    sh_a = pick(facts, SH_TAGS, "annual", {"shares"})
+    sh_q = pick(facts, SH_TAGS, "quarterly", {"shares"})
 
     import yfinance as yf
     tk = yf.Ticker(ticker)
@@ -255,8 +277,24 @@ def compute_band(ticker, email, years=5, basis="forward", include_series=False):
     if hist.empty:
         raise RuntimeError(f"yfinance 取不到 {ticker} 价格")
     splits = {d.date(): float(r) for d, r in tk.splits.items() if r and float(r) != 1.0}
+    # 归一必须在 derive_q4_avg **之前**：Q4 = 4×FY − Σ3Q 的均值式要求 FY 与三个
+    # 季度同口径。旧顺序（先推导后归一）在拆股年会先用混口径推出垃圾 Q4、
+    # 再对垃圾整段乘系数——两步各错一次
     split_notes = normalize_splits(sh_q, splits)
     normalize_splits(sh_a, splits)
+    sh_q = derive_q4_avg(sh_q, sh_a)
+    if len(sh_q) < 4:
+        raise RuntimeError(f"{ticker} 季度 XBRL 不足（净利 {len(ni_q)} 期/股数 {len(sh_q)} 期）"
+                         "——外国发行人常无季度 XBRL，本工具需要季度序列")
+    # 残留口径跳变哨兵：逐条 filed 规则的兜底（yfinance 拆股日偏差、罕见的不重述
+    # 再申报都会在相邻期股数上留下台阶）。只留痕不修数——修数需要能定位口径边界，
+    # 启发式做不到，上面的教训就是这么来的
+    _sq = sorted(sh_q.items())
+    for (k1, v1), (k2, v2) in zip(_sq, _sq[1:]):
+        r = v2["val"] / v1["val"] if v1["val"] else 0
+        if r and not 2 / 3 < r < 1.5:
+            split_notes.append(f"⚠ {k1}→{k2} 相邻期股数跳变 {r:.2f}x——若非大额增发/"
+                               "回购/并购，拆股口径归一可能有残留，请核对该期 filed 与拆股日")
 
     pts = build_ttm_eps(ni_q, sh_q)
     if not pts:
