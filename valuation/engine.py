@@ -364,8 +364,15 @@ if abs(_dev) > 0.35:
 _band = facts.get("pe_band") or {}
 _rc = _band.get("recent") or {}
 _use = _rc.get("pctiles") or _band.get("pctiles") or {}
-if all(q in _use for q in ("10", "25", "50", "75", "90")):
-    _e1 = out["scenarios"]["base"]["eps1"]
+_e1 = out["scenarios"]["base"]["eps1"]
+# base eps1<=0 时整块跳过：PE 分位 × 负 EPS 会渲染出负的"交易区间"贯穿
+# Excel/前端（opm 校验只保证 op1>0，other_income 无下界，op1+other_income
+# 可以为负）。负盈利下"按历史倍数该在哪交易"本身无意义——显式说原因。
+if _e1 <= 0 and _use:
+    out["scenarios"]["base"]["warnings"].append(
+        ["yellow", f"base 前瞻 EPS {_e1:.2f} <= 0——交易区间（历史 PE 分位 × base EPS）"
+                   "无意义，本次不出该块"])
+if _e1 > 0 and all(q in _use for q in ("10", "25", "50", "75", "90")):
     _tr_pe = {q: round(float(_use[q]), 2) for q in ("10", "25", "50", "75", "90")}
     out["trading_range"] = dict(
         basis=_band.get("basis"),
