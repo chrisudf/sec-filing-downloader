@@ -75,6 +75,8 @@ GW_TAGS = ["Goodwill"]
 IT_TAGS = ["IntangibleAssetsNetExcludingGoodwill", "FiniteLivedIntangibleAssetsNet"]
 SH_TAGS = ["WeightedAverageNumberOfDilutedSharesOutstanding",
            "AdjustedWeightedAverageShares", "WeightedAverageShares"]
+# 稀释 EPS（股数兜底反推用）：US GAAP + IFRS
+EPS_TAGS = ["EarningsPerShareDiluted", "DilutedEarningsLossPerShare"]
 
 
 def resolve_cik(ticker, headers):
@@ -223,6 +225,36 @@ def normalize_splits(shares, splits):
     return notes
 
 
+def backfill_shares_from_eps(sh, ni, eps_rows):
+    """稀释股数缺季用 净利÷稀释EPS 反推。
+
+    双类股（GOOG 的 Class A/C）把加权稀释股数按股份类别打了 XBRL 维度，
+    companyfacts 只保留无维度的合并口径——GOOG 实测 2019-2023 十八个季度
+    有净利没股数，TTM 点只长出 7 个、NTM 配对仅 3 对，整条带子瘦成 61 天。
+    净利与稀释 EPS 都有合并口径值，相除即隐含加权稀释股数。
+
+    精度：EPS 两位小数舍入，误差 ≈ 0.005/|EPS|（重述后季度 EPS ~0.3-3 →
+    0.2%~1.6%），对分位带足够；|EPS|<0.05 时舍入误差 >10%，不反推。
+    口径：EPS 是每股科目，重述文件里已按拆股调整——隐含股数的拆股基准
+    跟随 **EPS 条目的 filed 日**，normalize_splits 的逐条 filed 规则照常归一。
+    """
+    added = 0
+    for k, nv in ni.items():
+        if k in sh:
+            continue
+        ev = eps_rows.get(k)
+        if not ev or not ev.get("val") or abs(ev["val"]) < 0.05:
+            continue
+        val = nv["val"] / ev["val"]
+        if val <= 0:
+            continue
+        sh[k] = {"val": val, "filed": ev["filed"],
+                 "first_filed": max(nv.get("first_filed") or "",
+                                    ev.get("first_filed") or "")}
+        added += 1
+    return added
+
+
 def build_ttm_eps(ni_q, sh_q, anom_k=ANOM_K):
     """滚动四季 TTM EPS，附「最早可知日」= 四个季度里最晚的 filed 日。
 
@@ -334,11 +366,26 @@ def compute_band(ticker, email, years=5, basis="forward", include_series=False,
                          "——外国发行人常无季度 XBRL，本工具需要季度序列")
     sh_a = pick(facts, SH_TAGS, "annual", {"shares"})
     sh_q = pick(facts, SH_TAGS, "quarterly", {"shares"})
+    # 股数兜底（0060）：反推的分子必须是净利（与 EPS 同分子），与本带 metric 无关。
+    # 兜底在归一之前——隐含条目带 EPS 侧的 filed 日，逐条拆股规则照常适用
+    eps_q = pick(facts, EPS_TAGS, "quarterly", {"USD/shares"})
+    eps_a = pick(facts, EPS_TAGS, "annual", {"USD/shares"})
+    if metric == "eps":
+        ni4sh_a, ni4sh_q = ni_a, ni_q
+    else:
+        ni4sh_a = pick(facts, NI_TAGS, "annual", {"USD"})
+        ni4sh_q = derive_q4(pick(facts, NI_TAGS, "quarterly", {"USD"}), dict(ni4sh_a))
+    imp_q = backfill_shares_from_eps(sh_q, ni4sh_q, eps_q)
+    imp_a = backfill_shares_from_eps(sh_a, ni4sh_a, eps_a)
     # 归一必须在 derive_q4_avg **之前**：Q4 = 4×FY − Σ3Q 的均值式要求 FY 与三个
     # 季度同口径。旧顺序（先推导后归一）在拆股年会先用混口径推出垃圾 Q4、
     # 再对垃圾整段乘系数——两步各错一次
     split_notes = normalize_splits(sh_q, splits)
     normalize_splits(sh_a, splits)
+    if imp_q or imp_a:
+        split_notes.append(f"股数兜底: {imp_q} 个季度 + {imp_a} 个财年由 净利÷稀释EPS 反推"
+                           "（股数 XBRL 仅按股份类别维度申报，companyfacts 无合并口径；"
+                           "EPS 舍入误差 ~0.2-1.6%）")
     sh_q = derive_q4_avg(sh_q, sh_a)
     if len(sh_q) < 4:
         raise RuntimeError(f"{ticker} 季度 XBRL 不足（{NUM_WORD} {len(ni_q)} 期/股数 {len(sh_q)} 期）"
