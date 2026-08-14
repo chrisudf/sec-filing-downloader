@@ -652,18 +652,26 @@ for j, h in enumerate(["投资情景", "PE 法目标价", "DCF 每股价值",
                        "综合目标价", "距现价", "一年后目标价"]):
     put(ws, f"{get_column_letter(1+j)}21", h, BOLD, fill=HDRFILL)
 scen_rows = [
-    ("🚀 乐观 (Bull)", "D", "=DCF!$B$48", "=SOTP!$E$12"),
-    ("⚖️ 合理 (Base)", "C", "=DCF!$B$32", "=SOTP!$D$12"),
-    ("🛡️ 悲观 (Bear)", "B", "=DCF!$B$16", "=SOTP!$C$12"),
+    ("🚀 乐观 (Bull)", "D", "bull", "=DCF!$B$48", "=SOTP!$E$12"),
+    ("⚖️ 合理 (Base)", "C", "base", "=DCF!$B$32", "=SOTP!$D$12"),
+    ("🛡️ 悲观 (Bear)", "B", "bear", "=DCF!$B$16", "=SOTP!$C$12"),
 ]
-_blend_rng = "B{r}:D{r}" if _sotp_in else "B{r}:C{r}"
 r = 22
-for label, ac, dcf_f, sotp_f in scen_rows:
+_nm_rows = []
+for label, ac, key, dcf_f, sotp_f in scen_rows:
     put(ws, f"A{r}", label, BOLD)
     put(ws, f"B{r}", f"='情景假设'!${ac}$35", GREEN, fmt=FM_PX)
     put(ws, f"C{r}", dcf_f, GREEN, fmt=FM_PX)
     put(ws, f"D{r}", sotp_f, GREEN, fmt=FM_PX)
-    c = put(ws, f"E{r}", f"=AVERAGE({_blend_rng.format(r=r)})", BLACK, fmt=FM_PX)
+    # 综合公式必须与引擎的 blend_methods 同构：PE 腿 n.m. 的情景（近零/负利润
+    # 守卫）不入综合，写死 AVERAGE(B:D) 会让 verify_report 的交叉核对假 FAIL。
+    # 老 valuation.json 无该键，回退旧行为（pe+dcf+按降级开关的 sotp）
+    _bm = (d["scenarios"][key].get("blend_methods")
+           or ["pe", "dcf"] + (["sotp"] if _sotp_in else []))
+    _cells = [f"{c_}{r}" for m, c_ in (("pe", "B"), ("dcf", "C"), ("sotp", "D")) if m in _bm]
+    if "pe" not in _bm:
+        _nm_rows.append(label)
+    c = put(ws, f"E{r}", f"=AVERAGE({','.join(_cells)})", BLACK, fmt=FM_PX)
     c.fill = GREENFILL if r != 24 else REDFILL
     c.font = Font(name="Arial", bold=True, size=10)
     put(ws, f"F{r}", f"=E{r}/$B$4-1", BLACK, fmt=FM_PCT)
@@ -680,6 +688,9 @@ ws.conditional_formatting.add(
 _note25 = "注：一年后目标价 = 综合目标价 × (1+该情景 WACC)，即公允价值按要求回报率滚动一年（未扣股息）"
 if not _sotp_in:
     _note25 += f"；SOTP 不入综合（主分部利润占比 {d['meta']['seg1_share']:.0%} >= 85%，与 PE 法为同一笔盈利）"
+if _nm_rows:
+    _note25 += ("；" + "、".join(_nm_rows)
+                + " 的 PE 腿 n.m. 不入综合（近零/负利润守卫，见红旗区 P/S 参考）")
 put(ws, "A25", _note25, GREEN, border=False)
 _mth = "三法" if _sotp_in else "PE/DCF 两法"
 _spread = " / ".join(f"{sc} {d['scenarios'][sc].get('method_spread') or '—'}x"

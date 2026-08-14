@@ -310,9 +310,18 @@ for name, s in cfg["scenarios"].items():
     sotp_eq = (op1 * cfg["seg1_share"] * s["m1"]
                + op1 * (1 - cfg["seg1_share"]) * s["m2"] + cfg["net_cash"])
     sotp_ps = sotp_eq / cfg["shares"]
-    methods = [pe_target, dcf_ps] + ([sotp_ps] if sotp_in_blend else [])
+    # 近零利润守卫：eps1<=0 或情景 opm<2% 时 PE 腿病态——盈利不是市场给这类票
+    # 定价的基础，「近零盈利 × 正常倍数 ≈ 0」不是估值是除法事故（COIN 实测
+    # g 全负 + opm≈0，PE 腿把 blend 拖出 60% 全距）。PE 腿标 n.m. 退出综合，
+    # 综合退化为 DCF(+SOTP)；有 ps_band 时在红旗区给 P/S 参考价（不入综合）。
+    # pe_target 仍照算并展示——退出综合 ≠ 隐藏。
+    pe_nm = eps1 <= 0 or s["opm"] < 0.02
+    blend_methods = ((["pe"] if not pe_nm else [])
+                     + ["dcf"] + (["sotp"] if sotp_in_blend else []))
+    methods = ([] if pe_nm else [pe_target]) + [dcf_ps] + ([sotp_ps] if sotp_in_blend else [])
     blend = sum(methods) / len(methods)
-    spread = (round(max(methods) / min(methods), 2) if min(methods) > 0 else None)
+    spread = (round(max(methods) / min(methods), 2)
+              if len(methods) > 1 and min(methods) > 0 else None)
 
     # ---- v2 经济合理性诊断（red=假设可修复，服务层可据此打回判断层一次；
     #      yellow=呈现层警示。全部随报告红旗区展示，不静默）----
@@ -336,6 +345,24 @@ for name, s in cfg["scenarios"].items():
             warnings.append(["yellow", f"综合目标价隐含 P/调整后净利 {p_ni:.1f}x（界外 [6,60]）"])
     if spread and spread > 2:
         warnings.append(["yellow", f"方法离散度 {spread}x（>2x）——各法分歧大，综合可信度降低"])
+    if pe_nm:
+        _ps_ref = ""
+        _psb = facts.get("ps_band") or {}
+        _psp = (_psb.get("recent") or {}).get("pctiles") or _psb.get("pctiles") or {}
+        if "50" in _psp and cfg["fwd_shares"]:
+            _rps1 = rev1 / cfg["fwd_shares"]
+            ddiag["ps_ref"] = {
+                "basis": _psb.get("basis"),
+                "window": ("recent" if (_psb.get("recent") or {}).get("pctiles") else "full"),
+                "ps_p50": round(float(_psp["50"]), 2), "rps1": round(_rps1, 2),
+                "px": {q: round(float(_psp[q]) * _rps1, 1)
+                       for q in ("25", "50", "75") if q in _psp}}
+            _ps_ref = (f"；P/S 参考（不入综合）：历史 P/S P50 {float(_psp['50']):.2f}x × "
+                       f"{name} 每股营收 {_rps1:.2f} ≈ {float(_psp['50']) * _rps1:.1f}")
+        warnings.append(["yellow",
+                         f"{name} PE 腿 n.m.（eps1 {eps1:.2f} / opm {s['opm']:.1%}——近零或"
+                         "负利润下『盈利×倍数』无定价意义），综合退化为 "
+                         + ("DCF+SOTP" if sotp_in_blend else "DCF") + _ps_ref])
     warnings += pe_band_check(name, s["pe"], facts.get("pe_band"), ddiag)
 
     out["scenarios"][name] = dict(
@@ -343,7 +370,11 @@ for name, s in cfg["scenarios"].items():
         eps1=round(eps1, 2), pe_target=round(pe_target, 1),
         dcf_ps=round(dcf_ps, 1), sotp_ps=round(sotp_ps, 1),
         blend=round(blend, 1), upside=round(blend / cfg["price"] - 1, 4),
-        fwd_pe=round(cfg["price"] / eps1, 1),
+        # eps1<=0 时 fwd_pe 是负数假读数，置 None（报告/归档按缺失处理）
+        fwd_pe=round(cfg["price"] / eps1, 1) if eps1 > 0 else None,
+        # blend 由哪几条腿构成——build_report 的综合公式必须与引擎同构，
+        # 否则 verify_report 的交叉核对会在 PE 腿 n.m. 时假 FAIL
+        blend_methods=blend_methods,
         method_spread=spread, diagnostics=ddiag, warnings=warnings,
     )
 
@@ -365,14 +396,15 @@ _band = facts.get("pe_band") or {}
 _rc = _band.get("recent") or {}
 _use = _rc.get("pctiles") or _band.get("pctiles") or {}
 _e1 = out["scenarios"]["base"]["eps1"]
-# base eps1<=0 时整块跳过：PE 分位 × 负 EPS 会渲染出负的"交易区间"贯穿
-# Excel/前端（opm 校验只保证 op1>0，other_income 无下界，op1+other_income
-# 可以为负）。负盈利下"按历史倍数该在哪交易"本身无意义——显式说原因。
-if _e1 <= 0 and _use:
+# base PE 腿 n.m.（eps1<=0 或 opm<2%，与情景守卫同判据）时整块跳过：PE 分位 ×
+# 近零/负 EPS 渲染出的"交易区间"是除法事故不是估值（opm 校验只保证 op1>0，
+# other_income 无下界，op1+other_income 可以为负）。显式说原因，不静默。
+_base_pe_nm = "pe" not in out["scenarios"]["base"]["blend_methods"]
+if _base_pe_nm and _use:
     out["scenarios"]["base"]["warnings"].append(
-        ["yellow", f"base 前瞻 EPS {_e1:.2f} <= 0——交易区间（历史 PE 分位 × base EPS）"
-                   "无意义，本次不出该块"])
-if _e1 > 0 and all(q in _use for q in ("10", "25", "50", "75", "90")):
+        ["yellow", f"base PE 腿 n.m.（前瞻 EPS {_e1:.2f}）——交易区间（历史 PE 分位 × "
+                   "base EPS）无意义，本次不出该块；参考红旗区的 P/S 参考价"])
+if not _base_pe_nm and all(q in _use for q in ("10", "25", "50", "75", "90")):
     _tr_pe = {q: round(float(_use[q]), 2) for q in ("10", "25", "50", "75", "90")}
     out["trading_range"] = dict(
         basis=_band.get("basis"),
