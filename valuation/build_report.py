@@ -107,7 +107,7 @@ if MODE == "financials":
             put(ws, f"{col}{r}", S[sc]["assumptions"][key], BLUE, fmt=fmt, fill=YELLOW)
         put(ws, f"E{r}", note, GREEN)
         r += 1
-    put(ws, "A11", "下一财年稀释股本 (M)", BOLD)
+    put(ws, "A11", "前瞻期(NTM)稀释股本 (M)", BOLD)
     put(ws, "B11", M["fwd_shares"], BLUE, fmt="#,##0", fill=YELLOW)
     put(ws, "E11", "三情景共用", GREEN)
 
@@ -130,11 +130,22 @@ if MODE == "financials":
         put(ws, f"E{r}", note, GREEN, wrap=True)
         r += 1
     put(ws, "A20", "TTM 调整后 EPS", BOLD)
-    put(ws, "B20", "=B17/B19", BLACK, fmt=FM_EPS)
+    put(ws, "B20", "=B17/B19", BLACK, fmt=FM_EPS)      # EPS 用加权稀释（GAAP 口径）
     put(ws, "A21", "每股 TBV", BOLD)
-    put(ws, "B21", "=B18/B19", BLACK, fmt=FM_PX)
+    # 分母指向 B23（时点流通股）而不是 B19（加权稀释）：与引擎 tbv_ps、ptbv_band 的
+    # 历史序列三者同源，否则 verify_report 的「每股TBV」交叉核对会 FAIL。
+    # 新增行放 23 而不是插进上面的事实块——插入会把 20/21/22 全部顶移，
+    # 而下游 calc_rows 与 verify_report 都按绝对行号引用 $B$21。
+    put(ws, "B21", "=B18/B23", BLACK, fmt=FM_PX)
     put(ws, "A22", "TTM ROTE（调整后）", BOLD)
     put(ws, "B22", "=B17/B18", BLACK, fmt=FM_PCT)
+    put(ws, "A23", "时点流通股 (M)", BOLD)
+    put(ws, "B23", M.get("tbv_shares") or M["shares"], BLUE, fmt="#,##0")
+    put(ws, "E23", "每股 TBV 的分母（"
+        + ("us-gaap 时点流通股" if M.get("tbv_shares_basis") == "instant"
+           else "⚠ 无时点流通股 XBRL，退回加权稀释——增发季每股 TBV 会被高估")
+        + "）。TBV 是时点存量，配加权平均稀释股数等于流量均值配存量；"
+          "历史 P/TBV 带同样按时点股数计算，两者必须同源", GREEN, wrap=True)
 
     put(ws, "A24", "情景计算（公式）", H2, border=False)
     calc_rows = [
@@ -264,7 +275,7 @@ if MODE == "financials":
     metrics = [
         ("TTM 调整后 EPS", "='情景假设'!$B$20", FM_EPS, d["adj_note"]),
         ("调整后 Trailing PE", "=B4/B11", FM_X, "现价 / TTM 调整后 EPS"),
-        (f"{FWD} EPS（合理）", "='情景假设'!$C$27", FM_EPS, "合理情景假设下的下一财年 EPS"),
+        (f"{FWD} EPS（合理）", "='情景假设'!$C$27", FM_EPS, "合理情景假设下的前瞻期(NTM) EPS"),
         ("Forward PE（合理）", "=B4/B13", FM_X, ""),
         ("当前 P/TBV", "=B4/'情景假设'!$B$21", FM_X2, "现价 / 每股有形账面价值"),
         ("justified P/TBV（合理）", "='情景假设'!$C$30", FM_X2,
@@ -287,7 +298,14 @@ if MODE == "financials":
         put(ws, f"A{r}", label, BOLD)
         put(ws, f"B{r}", f"='情景假设'!${ac}$28", GREEN, fmt=FM_PX)
         put(ws, f"C{r}", f"='情景假设'!${ac}$31", GREEN, fmt=FM_PX)
-        c = put(ws, f"D{r}", f"=AVERAGE(B{r}:C{r})", BLACK, fmt=FM_PX)
+        _bw = d.get("blend_weights") or {}
+        if any(abs(_bw.get(m, 1) - 1) > 1e-9 for m in ("pe", "ptbv")):
+            _den = _bw.get("pe", 1) + _bw.get("ptbv", 1)
+            _f = (f"=(B{r}*{_bw.get('pe', 1):g}+C{r}*{_bw.get('ptbv', 1):g})/{_den:g}"
+                  if _den > 0 else f"=AVERAGE(B{r}:C{r})")
+        else:
+            _f = f"=AVERAGE(B{r}:C{r})"
+        c = put(ws, f"D{r}", _f, BLACK, fmt=FM_PX)
         c.fill = GREENFILL if r != 23 else REDFILL
         c.font = Font(name="Arial", bold=True, size=10)
         put(ws, f"E{r}", f"=D{r}/$B$4-1", BLACK, fmt=FM_PCT)
@@ -306,9 +324,23 @@ if MODE == "financials":
                          for sc in ("bear", "base", "bull"))
     put(ws, "A25", f"方法离散度（PE法 vs P/TBV法 max/min）：{_spread}——离散大时两法分歧大，"
                    "综合可信度降低", GREEN, border=False)
-    put(ws, "A26", "判断层注记（均有财报原文出处）：", H2, border=False)
+    # 诊断红旗区（0057 起 financials 有 warnings 通道：P/TBV 带检查）——与 standard
+    # 相同的纪律：警告必须和 headline 数字同表出现，不能只活在引擎 stdout 里
+    _row = 26
+    _flags = [(sc, lv, msg) for sc in ("bear", "base", "bull")
+              for lv, msg in d["scenarios"][sc].get("warnings", [])]
+    if _flags:
+        put(ws, f"A{_row}", "合理性红旗（engine diagnostics）：",
+            Font(name="Arial", color="CC0000", bold=True, size=10), border=False)
+        _row += 1
+        for sc, lv, msg in _flags:
+            put(ws, f"A{_row}", f"{'⛔' if lv == 'red' else '⚠'} [{sc}] {msg}",
+                Font(name="Arial", color="CC0000" if lv == "red" else "B8860B", size=10),
+                border=False)
+            _row += 1
+    put(ws, f"A{_row}", "判断层注记（均有财报原文出处）：", H2, border=False)
     for j, note in enumerate(d["notes"]):
-        put(ws, f"A{27+j}", note, GREEN, border=False)
+        put(ws, f"A{_row+1+j}", note, GREEN, border=False)
 
     # ---------- 出处 ----------
     ws = wb.create_sheet("出处")
@@ -371,7 +403,7 @@ for label, key, fmt, note in params:
         put(ws, f"{col}{r}", S[sc]["assumptions"][key], BLUE, fmt=fmt, fill=YELLOW)
     put(ws, f"E{r}", note, GREEN)
     r += 1
-put(ws, "A14", "下一财年稀释股本 (M)", BOLD)
+put(ws, "A14", "前瞻期(NTM)稀释股本 (M)", BOLD)
 put(ws, "B14", d["meta"]["fwd_shares"], BLUE, fmt="#,##0", fill=YELLOW)
 put(ws, "E14", "回购小幅缩减；三情景共用", GREEN)
 put(ws, "A15", "年化其他收益 ($M)", BOLD)
@@ -575,7 +607,7 @@ for col in "BCDEFG":
 ws.column_dimensions["H"].width = 72
 put(ws, "A1", f"{d['name']} / {T} 估值分析", TITLE, border=False)
 put(ws, "A2", f"sec-filing-downloader + SEC XBRL · {d['date']} · 分析工具输出，不构成投资建议", GREEN, border=False)
-_caliber = "目标价口径：综合目标价 = 当前公允价值（锚定下一财年盈利与 DCF 现值，≈未来12个月视角）"
+_caliber = "目标价口径：综合目标价 = 当前公允价值（锚定前瞻期 NTM 盈利与 DCF 现值，窗口见情景假设表）"
 if d["meta"].get("adr_multiple", 1.0) != 1.0:
     _caliber += f"；价格为 ADR（1 ADR = {d['meta']['adr_multiple']:g} 普通股，股本已折算）"
 if d["meta"].get("currency", "USD") != "USD":
@@ -615,15 +647,37 @@ for cell, v in [("A10", "指标"), ("B10", "数值"), ("H10", "说明")]:
 metrics = [
     ("TTM 调整后 EPS", "='情景假设'!$B$28", FM_EPS, d["adj_note"]),
     ("调整后 Trailing PE", "=B4/B11", FM_X, "现价 / TTM 调整后 EPS"),
-    (f"{FWD} EPS（合理）", "='情景假设'!$C$34", FM_EPS, "合理情景假设下的下一财年 EPS"),
-    ("Forward PE（合理）", "=B4/B13", FM_X, ""),
-    ("PEG（合理）", "=B14/('情景假设'!$C$4*100)", "0.00", "Forward PE / 营收增速"),
-    ("EV/EBIT (TTM)", "=(B5-B6)/'情景假设'!$B$20", FM_X, ""),
+    (f"{FWD} EPS（合理）", "='情景假设'!$C$34", FM_EPS, "合理情景假设下的前瞻期(NTM) EPS"),
+    # base EPS<=0（近零利润守卫域）时 =B4/B13 会渲染负 PE 或 #DIV/0!——IF 判空，
+    # 与 engine 的 fwd_pe=None 同一处置
+    ("Forward PE（合理）", "=IF('情景假设'!$C$34<=0,\"n.m.\",B4/B13)", FM_X, ""),
+    ("PEG（合理）", "=IF(ISNUMBER(B14),B14/('情景假设'!$C$4*100),\"n.m.\")",
+     "0.00", "Forward PE / 营收增速"),
+    # TTM 营业利润为负时 EV/EBIT 是负倍数，会被当成"极便宜"读——与上面两格同一处置
+    ("EV/EBIT (TTM)", "=IF('情景假设'!$B$20>0,(B5-B6)/'情景假设'!$B$20,\"n.m.\")", FM_X,
+     "TTM 营业利润为负时不适用"),
     ("FCF 收益率 (TTM)", "='情景假设'!$B$25/B5", FM_PCT, ""),
     ("反向 DCF 隐含增速（base 口径条件）", d["reverse_dcf"], FM_PCT,
      "现价隐含的 DCF 起始增速（10年线性衰减）——条件于 base 的利润率路径与 WACC，"
      "base 假设错则此值同错；Python 引擎计算"),
 ]
+# Rule of 40（fetch_facts 计算，engine 透传）：高倍数值不值得给的标尺——
+# 静态值不联动（增速/利润率不在工作簿内），放 metrics 末行（第 19 行），
+# 不移动任何 verify_report 交叉核对的单元格
+_r40 = d.get("rule_of_40") or {}
+if _r40.get("score_op") is not None or _r40.get("score_fcf") is not None:
+    metrics.append((
+        "Rule of 40（TTM）",
+        _r40.get("score_op") if _r40.get("score_op") is not None else _r40["score_fcf"],
+        "0.0",
+        f"营收增速 {_r40.get('rev_g_ttm', 0):+.1%}"
+        + (f" + 营业利润率 {_r40.get('opm_ttm', 0):.1%}" if _r40.get("opm_ttm") is not None
+           else "（营业利润无数据，显示 FCF 口径）")
+        + (f"；FCF 口径 {_r40['score_fcf']:.1f} 分" if _r40.get("score_fcf") is not None else "")
+        + (f"（剔 SBC 后 {_r40['score_fcf_ex_sbc']:.1f}，SBC 占营收 "
+           f"{_r40['sbc_margin_ttm']:.1%}）" if _r40.get("score_fcf_ex_sbc") is not None else "")
+        + (f"。⚠ {_r40['caliber_note']}" if _r40.get("caliber_note") else "")
+        + "。软件/平台类 >40 算优秀——分数低而倍数高 = 增速在烧钱换"))
 r = 11
 for label, v, fmt, note in metrics:
     put(ws, f"A{r}", label, BOLD)
@@ -640,18 +694,39 @@ for j, h in enumerate(["投资情景", "PE 法目标价", "DCF 每股价值",
                        "综合目标价", "距现价", "一年后目标价"]):
     put(ws, f"{get_column_letter(1+j)}21", h, BOLD, fill=HDRFILL)
 scen_rows = [
-    ("🚀 乐观 (Bull)", "D", "=DCF!$B$48", "=SOTP!$E$12"),
-    ("⚖️ 合理 (Base)", "C", "=DCF!$B$32", "=SOTP!$D$12"),
-    ("🛡️ 悲观 (Bear)", "B", "=DCF!$B$16", "=SOTP!$C$12"),
+    ("🚀 乐观 (Bull)", "D", "bull", "=DCF!$B$48", "=SOTP!$E$12"),
+    ("⚖️ 合理 (Base)", "C", "base", "=DCF!$B$32", "=SOTP!$D$12"),
+    ("🛡️ 悲观 (Bear)", "B", "bear", "=DCF!$B$16", "=SOTP!$C$12"),
 ]
-_blend_rng = "B{r}:D{r}" if _sotp_in else "B{r}:C{r}"
 r = 22
-for label, ac, dcf_f, sotp_f in scen_rows:
+_nm_rows = []
+for label, ac, key, dcf_f, sotp_f in scen_rows:
     put(ws, f"A{r}", label, BOLD)
     put(ws, f"B{r}", f"='情景假设'!${ac}$35", GREEN, fmt=FM_PX)
     put(ws, f"C{r}", dcf_f, GREEN, fmt=FM_PX)
     put(ws, f"D{r}", sotp_f, GREEN, fmt=FM_PX)
-    c = put(ws, f"E{r}", f"=AVERAGE({_blend_rng.format(r=r)})", BLACK, fmt=FM_PX)
+    # 综合公式必须与引擎的 blend_methods 同构：PE 腿 n.m. 的情景（近零/负利润
+    # 守卫）不入综合，写死 AVERAGE(B:D) 会让 verify_report 的交叉核对假 FAIL。
+    # 老 valuation.json 无该键，回退旧行为（pe+dcf+按降级开关的 sotp）
+    _bm = (d["scenarios"][key].get("blend_methods")
+           or ["pe", "dcf"] + (["sotp"] if _sotp_in else []))
+    _pairs = [(m, c_) for m, c_ in (("pe", "B"), ("dcf", "C"), ("sotp", "D")) if m in _bm]
+    _cells = [f"{c_}{r}" for _, c_ in _pairs]
+    # 注释要如实说出哪条腿缺席：亏损情景 SOTP 腿也会被剔（op1<=0），只写"PE 腿"
+    # 会让读表的人对不上 E 列公式
+    _gone = [n_ for m, n_ in (("pe", "PE 法"), ("sotp", "SOTP")) if m not in _bm
+             and (m != "sotp" or _sotp_in)]
+    if _gone:
+        _nm_rows.append(f"{label} 的 {'/'.join(_gone)}")
+    # 权重非默认时综合=显式加权公式（与引擎 BLEND_W 同构），默认等权保持 AVERAGE
+    _bw = d.get("blend_weights") or {}
+    if any(abs(_bw.get(m, 1) - 1) > 1e-9 for m, _ in _pairs):
+        _den = sum(_bw.get(m, 1) for m, _ in _pairs)
+        _num = "+".join(f"{c_}{r}*{_bw.get(m, 1):g}" for m, c_ in _pairs)
+        _bf = f"=({_num})/{_den:g}" if _den > 0 else f"=AVERAGE({','.join(_cells)})"
+    else:
+        _bf = f"=AVERAGE({','.join(_cells)})"
+    c = put(ws, f"E{r}", _bf, BLACK, fmt=FM_PX)
     c.fill = GREENFILL if r != 24 else REDFILL
     c.font = Font(name="Arial", bold=True, size=10)
     put(ws, f"F{r}", f"=E{r}/$B$4-1", BLACK, fmt=FM_PCT)
@@ -668,6 +743,9 @@ ws.conditional_formatting.add(
 _note25 = "注：一年后目标价 = 综合目标价 × (1+该情景 WACC)，即公允价值按要求回报率滚动一年（未扣股息）"
 if not _sotp_in:
     _note25 += f"；SOTP 不入综合（主分部利润占比 {d['meta']['seg1_share']:.0%} >= 85%，与 PE 法为同一笔盈利）"
+if _nm_rows:
+    _note25 += ("；" + "、".join(_nm_rows)
+                + " n.m. 不入综合（近零/负利润守卫，综合口径逐档不同，见红旗区 P/S 参考）")
 put(ws, "A25", _note25, GREEN, border=False)
 _mth = "三法" if _sotp_in else "PE/DCF 两法"
 _spread = " / ".join(f"{sc} {d['scenarios'][sc].get('method_spread') or '—'}x"
@@ -679,7 +757,8 @@ put(ws, "A26", f"方法离散度（同情景{_mth} max/min）：{_spread}——�
 # （情景=基本面情景各自的公允价，bear 是 EPS↓×PE↓ 双压；这块回答「按该票自己的
 # 历史倍数分布，base 盈利下会交易在哪个区间」）。PE 分位是引擎从 facts.pe_band
 # 取的常量，价格行/距现价行是活公式（改 base EPS 或现价即联动）。
-# 布局固定从 27 行起：verify_report 交叉核对 D30（P50 价格），改布局须同步。
+# 布局契约：块从 27 行起、价格行=起始行+3。verify_report 的检查列按同一 _qs 规则
+# 动态推导（不再写死 D30），但行号仍以此为契约——改起始行须两边同步。
 _row = 27
 _tr = d.get("trading_range")
 if _tr:
@@ -745,7 +824,12 @@ sources = [
     ("调整后净利", d["adj_note"]),
     ("净现金", d["net_cash_note"]),
     ("估值语义版本", (f"semantics_version={d.get('semantics_version', 1)}"
-                     + ("（v2, 2026-07-22：跨情景一致性规则 / SOTP 降级 / 诊断红旗；"
+                     + ("（v3, 2026-08-14：v2 之上 base 目标 PE 默认锚历史 NTM 带"
+                        "近3年子窗 P50、偏离 ±15% 须给证据；"
+                        f"config 声明版本 v{d.get('config_semantics_version', 1)}；"
+                        "锚前(≤v2)与锚后(v3) 的倍数假设与目标价水平不可直接对比）"
+                        if d.get("semantics_version", 1) >= 3 else
+                        "（v2, 2026-07-22：跨情景一致性规则 / SOTP 降级 / 诊断红旗；"
                         f"config 声明版本 v{d.get('config_semantics_version', 1)}；"
                         "v1 与 v2 的倍数假设与综合口径不可直接对比）"
                         if d.get("semantics_version", 1) >= 2 else

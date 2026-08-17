@@ -71,9 +71,14 @@ TAGS_FINANCIALS = {
     "intangibles": ["IntangibleAssetsNetExcludingGoodwill", "FiniteLivedIntangibleAssetsNet"],
     "cash": ["CashAndCashEquivalentsAtCarryingValue"],
     "shares_diluted": ["WeightedAverageNumberOfDilutedSharesOutstanding"],
+    # 时点流通股 = 每股 TBV 的正确分母。TBV 是时点存量，除以当季**加权平均**稀释
+    # 股数等于拿流量均值配存量——增发季（SOFI 型一次性摊薄）加权数≈期末股数的
+    # 一半，每股 TBV 会被高估近一倍。P/TBV 历史带自 0058 起已改用时点股数
+    # （pe_band.ptbv_band），引擎当前点必须同源，否则"当前倍数 vs 历史锚"是两个口径。
+    "shares_outstanding": ["CommonStockSharesOutstanding"],
     "sbc": ["ShareBasedCompensation", "AllocatedShareBasedCompensationExpense"],
 }
-INSTANT_FINANCIALS = {"equity", "goodwill", "intangibles", "cash"}
+INSTANT_FINANCIALS = {"equity", "goodwill", "intangibles", "cash", "shares_outstanding"}
 
 # IFRS 外国发行人（20-F）：概念名映射到与 standard 相同的输出键，下游无感知
 TAGS_IFRS = {
@@ -303,27 +308,123 @@ out["ttm"] = ttm
 out["data_latest"] = max(max(out["revenue_annual"], default=""),
                          max(out["revenue_quarterly"], default=""))
 
+# ---- Rule of 40（standard 模式）：营收增速 + 利润率，"高倍数值不值得给"的标尺
+# （软件/平台业惯例：>40 分算优秀——增速是在换未来利润还是单纯烧钱）。
+# 营收增速 = TTM vs 上一个 TTM（最近 8 个离散季度，逐 gap 校验），比单季 YoY 稳；
+# 利润率给两个口径：营业利润率（主）与 FCF 利润率——FCF 把 SBC 加了回来
+# （SBC 是真实成本），剔 SBC 变体一并给出，SBC 占营收比高的票两者差十几分。
+# 非核心项：任何一项算不出只留空，不阻断取数。
+if MODE == "standard":
+    ro40 = {}
+    _q8 = list(out["revenue_quarterly"].items())[-8:]
+    if len(_q8) == 8:
+        _ends = [date.fromisoformat(k) for k, _ in _q8]
+        if all(80 <= (_ends[i + 1] - _ends[i]).days <= 100 for i in range(7)):
+            _cur4 = sum(v for _, v in _q8[4:])
+            _prev4 = sum(v for _, v in _q8[:4])
+            if _prev4 > 0:
+                ro40["rev_g_ttm"] = round(_cur4 / _prev4 - 1, 4)
+    # 利润率的分子分母必须同窗：营收 TTM 必须来自四季加总（有 "quarters" 键），
+    # 营业利润同理——任一侧退回 FY（"note" 路径）都会做出「FY 分子 ÷ TTM 分母」
+    # 的混窗利润率还标着 TTM。现金流的 YTD 差额口径本身即 TTM，但"退回最新年度"
+    # 变体是旧窗——留 caliber_note 一起展示，不静默
+    _rev_e = ttm.get("revenue") or {}
+    _rev = _rev_e.get("value") if "quarters" in _rev_e else None
+    if _rev:
+        _op_e = ttm.get("op_income") or {}
+        _cfo_e, _cap_e = ttm.get("cfo") or {}, ttm.get("capex") or {}
+        _sbc_e = ttm.get("sbc") or {}
+        if "quarters" in _op_e and _op_e.get("value") is not None:
+            ro40["opm_ttm"] = round(_op_e["value"] / _rev, 4)
+        if _cfo_e.get("value") is not None and _cap_e.get("value") is not None:
+            ro40["fcf_margin_ttm"] = round((_cfo_e["value"] - _cap_e["value"]) / _rev, 4)
+            _stale_cf = [n for n in (_cfo_e.get("note"), _cap_e.get("note"))
+                         if n and "退回" in n]
+            if _stale_cf:
+                ro40["caliber_note"] = ("FCF 口径含退回旧财年的现金流项，"
+                                        "与 TTM 营收窗口不一致，FCF 分仅供参考")
+        if "quarters" in _sbc_e and _sbc_e.get("value") is not None:
+            ro40["sbc_margin_ttm"] = round(_sbc_e["value"] / _rev, 4)
+    if "rev_g_ttm" in ro40:
+        if "opm_ttm" in ro40:
+            ro40["score_op"] = round(100 * (ro40["rev_g_ttm"] + ro40["opm_ttm"]), 1)
+        if "fcf_margin_ttm" in ro40:
+            ro40["score_fcf"] = round(100 * (ro40["rev_g_ttm"] + ro40["fcf_margin_ttm"]), 1)
+            if "sbc_margin_ttm" in ro40:
+                ro40["score_fcf_ex_sbc"] = round(
+                    100 * (ro40["rev_g_ttm"] + ro40["fcf_margin_ttm"] - ro40["sbc_margin_ttm"]), 1)
+    if ro40:
+        out["rule_of_40"] = ro40
+        if "score_op" in ro40:
+            print(f"Rule of 40: 营收增速 {ro40.get('rev_g_ttm', 0):+.1%} + "
+                  f"OPM {ro40.get('opm_ttm', 0):.1%} = {ro40['score_op']:.0f} 分"
+                  + (f"（FCF 口径 {ro40['score_fcf']:.0f}"
+                     + (f"，剔 SBC {ro40['score_fcf_ex_sbc']:.0f}"
+                        if "score_fcf_ex_sbc" in ro40 else "") + "）"
+                     if "score_fcf" in ro40 else ""))
+
 # ---- 历史「已实现前瞻 PE」分布：供 engine.py 的目标 PE 越界诊断（pe_band_check）
 # 引擎是零联网的确定性计算层，带子必须在数据层备好。属非核心项：任何失败只记
 # pe_band_error 不阻断取数——但要留痕，不静默。VALUATION_NO_PE_BAND=1 可关闭。
 if os.environ.get("VALUATION_NO_PE_BAND") != "1":
+    from pe_band import compute_band, compute_ptbv_band, load_inputs
+    _pb_inputs = None
     try:
-        from pe_band import compute_band
-        # basis="ntm"：必须与 engine 的前瞻期同源。engine 算 rev1 = TTM×(1+g)，
-        # 前瞻期恒为 NTM 而非财年（见 valuation_service.fwd_window）。用 forward
-        # （按财年切）只在 report_end = 财年末时才对，AMZN/META 这类 12 月财年公司
-        # 在 Q1/Q2/Q3 报告期会系统性错位，pe_vs_history 的分位数就不可信。
-        _band = compute_band(TICKER, EMAIL, years=5, basis="ntm")
-        _band.pop("_sorted", None)
-        out["pe_band"] = _band
-        # 口径/年数一律从 _band 自身字段拼：写死字符串会在换 basis 时静默说谎
-        # （曾切到 ntm 后仍打印 "forward"，排查与回归对比都会被带偏）
-        print(f"PE带({_band['basis']},{_band['years']}y): 中位 {_band['median']:.1f}x  区间 "
-              f"{_band['min']:.1f}~{_band['max']:.1f}x  {_band['days']} 个交易日")
+        # 一次下载（companyfacts + yfinance 历史价 + 拆股表），PE/PS 两份带子共用——
+        # compute_band 各自下载会翻倍 SEC/yfinance 请求且容易撞限速
+        _pb_inputs = load_inputs(TICKER, EMAIL, years=5)
     except Exception as _e:
         out["pe_band_error"] = f"{type(_e).__name__}: {_e}"
-        print(f"警告: PE 带未生成（{out['pe_band_error']}）——目标 PE 越界诊断本次不生效",
+        print(f"警告: 带子数据未取到（{out['pe_band_error']}）——PE/PS 带本次不生成",
               file=sys.stderr)
+    if _pb_inputs:
+        try:
+            # basis="ntm"：必须与 engine 的前瞻期同源。engine 算 rev1 = TTM×(1+g)，
+            # 前瞻期恒为 NTM 而非财年（见 valuation_service.fwd_window）。用 forward
+            # （按财年切）只在 report_end = 财年末时才对，AMZN/META 这类 12 月财年公司
+            # 在 Q1/Q2/Q3 报告期会系统性错位，pe_vs_history 的分位数就不可信。
+            _band = compute_band(TICKER, EMAIL, years=5, basis="ntm", inputs=_pb_inputs)
+            _band.pop("_sorted", None)
+            out["pe_band"] = _band
+            # 口径/年数一律从 _band 自身字段拼：写死字符串会在换 basis 时静默说谎
+            # （曾切到 ntm 后仍打印 "forward"，排查与回归对比都会被带偏）
+            print(f"PE带({_band['basis']},{_band['years']}y): 中位 {_band['median']:.1f}x  区间 "
+                  f"{_band['min']:.1f}~{_band['max']:.1f}x  {_band['days']} 个交易日"
+                  + ("  ⚠覆盖不足,锚停用" if _band.get("thin_coverage") else ""))
+        except Exception as _e:
+            out["pe_band_error"] = f"{type(_e).__name__}: {_e}"
+            print(f"警告: PE 带未生成（{out['pe_band_error']}）——目标 PE 越界诊断本次不生效",
+                  file=sys.stderr)
+        # P/TBV 带（financials 模式）：金融股的估值锚是 P/B 系（E 带杠杆带周期，
+        # 一个坏账周期就能打没；净资产相对稳定）——图3 的教科书结论，repo 的
+        # financials 模式本来就按 P/TBV 建，带子给它历史分位锚。trailing 口径
+        # （TBV 是存量，无 "已实现 NTM" 语义），消费方=engine ptbv_band_check +
+        # 判断层 P/TBV 锚注入。
+        if MODE == "financials":
+            try:
+                _tb = compute_ptbv_band(TICKER, EMAIL, years=5, inputs=_pb_inputs)
+                out["ptbv_band"] = _tb
+                print(f"P/TBV带(trailing,{_tb['years']}y): 中位 {_tb['median']:.2f}x  区间 "
+                      f"{_tb['min']:.2f}~{_tb['max']:.2f}x  {_tb['days']} 个交易日")
+            except Exception as _e:
+                out["ptbv_band_error"] = f"{type(_e).__name__}: {_e}"
+                print(f"警告: P/TBV 带未生成（{out['ptbv_band_error']}）——目标 P/TBV "
+                      "越界诊断本次不生效", file=sys.stderr)
+        # P/S 带（standard 模式）：同一套机械、分母换每股营收。近零利润票（COIN/
+        # 微利期周期股）PE 带与 PE 腿一起失效，PS 是那个域的教科书参照——engine
+        # 的近零利润守卫拿它给参考价。金融股不出（营收=总净收入口径，PS 无惯例）。
+        if MODE == "standard":
+            try:
+                _psb = compute_band(TICKER, EMAIL, years=5, basis="ntm",
+                                    metric="rps", inputs=_pb_inputs)
+                _psb.pop("_sorted", None)
+                out["ps_band"] = _psb
+                print(f"P/S带({_psb['basis']},{_psb['years']}y): 中位 {_psb['median']:.2f}x  区间 "
+                      f"{_psb['min']:.2f}~{_psb['max']:.2f}x  {_psb['days']} 个交易日")
+            except Exception as _e:
+                out["ps_band_error"] = f"{type(_e).__name__}: {_e}"
+                print(f"警告: P/S 带未生成（{out['ps_band_error']}）——近零利润参照本次不生效",
+                      file=sys.stderr)
 
 json.dump(out, open(OUT, "w", encoding="utf-8"), ensure_ascii=False, indent=1)
 q = out["revenue_quarterly"]

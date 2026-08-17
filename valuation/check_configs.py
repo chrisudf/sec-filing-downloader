@@ -51,11 +51,15 @@ def main(argv):
         cfg = json.load(open(p, encoding="utf-8"))
         ticker = cfg.get("ticker") or os.path.basename(p).split("_")[0]
         mode = cfg.get("mode") or "standard"
-        rev0 = fcfm = None
+        rev0 = fcfm = band = None
         depth = "边界+排序"
         fp = _facts_for(ticker, facts_dir)
         if fp and mode == "standard":
-            ttm = json.load(open(fp, encoding="utf-8"))["ttm"]
+            fj = json.load(open(fp, encoding="utf-8"))
+            # band 必须与产线同源传入：0050 起低倍数票 pe 下限带 band 自适应，
+            # 不传会用静态 8 误拦产线能过的 config（回归工具比产线严=假警报）
+            band = fj.get("pe_band")
+            ttm = fj["ttm"]
             try:
                 rev0 = ttm["revenue"]["value"] / 1e6
                 fcfm = ((ttm["cfo"]["value"] - ttm["capex"]["value"])
@@ -64,7 +68,7 @@ def main(argv):
             except (KeyError, TypeError, ZeroDivisionError):
                 rev0 = fcfm = None   # facts 不全就退回边界检查，不让工具自己崩
         try:
-            _validate_judgment(cfg, mode, rev0=rev0, fcf_margin=fcfm)
+            _validate_judgment(cfg, mode, rev0=rev0, fcf_margin=fcfm, band=band)
             print(f"{ticker:8s} {mode:11s} {depth:10s} PASS")
         except Exception as e:                      # noqa: BLE001 — 校验层抛什么都算拦截
             fails += 1
