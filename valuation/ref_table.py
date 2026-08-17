@@ -187,6 +187,17 @@ def main():
             raise SystemExit(f"overrides.{T}.band 必须严格升序 [低 < 中 < 高]：{_b!r}"
                              "（反序会产出反向的价值区间与负覆盖率）")
         band_src = f"override（{ov.get('band_note', '手拍')}）"
+    elif band.get("thin_coverage"):
+        # 覆盖不足的带子不能当证据——与 engine / valuation_service / pe_band_check
+        # 同一个闸门（0059 起：<250 天的分布没有锚的话语权）。这个分支是两个 PR
+        # 合流后才出现的：本分支从 main 开出时 compute_band 还不产出该字段。
+        # 本表唯一的带子输入就是它，停用即无区间可出，所以直接要求手拍并留痕，
+        # 而不是悄悄拿薄样本的 P25/P75 给一个没有历史背书的区间披上分位数外衣。
+        raise SystemExit(
+            f"{T} 历史{a.basis} PE 带覆盖不足（仅 {band.get('days')} 个交易日 / "
+            f"{band.get('years')} 年，原始数据缺口）——本表不拿薄样本的分位当带子。\n"
+            f"  请在 {a.overrides} 里为 {T} 手拍 band（并写 band_note 留痕），"
+            "或放宽 --years 后重试。")
     elif rp:
         lo, mid, hi = _p(rp, 25), _p(rp, 50), _p(rp, 75)
         band_src = f"近{rc['years']}年{a.basis}分位 P25/P50/P75"
