@@ -32,6 +32,7 @@ ref_table_overrides.example.json）:
 """
 import argparse
 import json
+import math
 import os
 import sys
 from datetime import date
@@ -86,7 +87,12 @@ def one_time_warning(trend):
     if not trend or "0y" not in trend or "+1y" not in trend:
         return None
     t0, t1 = trend["0y"], trend["+1y"]
-    if not (t0.get("90daysAgo") and t0.get("current") and t1.get("90daysAgo") and t1.get("current")):
+    vals = [t0.get("90daysAgo"), t0.get("current"), t1.get("90daysAgo"), t1.get("current")]
+    # 四个值必须**全为正且有限**才谈得上"变动百分比"：亏损或零穿越下除法没有方向
+    # 意义——-1.00 → -0.50 是亏损腰斩（利好）却算出 j0=-50%，-0.10 → +0.50 是转盈
+    # 却算出 -600%，两者都会触发一条完全反向的"疑似一次性项目"预警。原来的
+    # truthy 判断只挡住了 0 和 None，负数照过。
+    if not all(isinstance(v, (int, float)) and math.isfinite(v) and v > 0 for v in vals):
         return None
     j0 = t0["current"] / t0["90daysAgo"] - 1
     j1 = t1["current"] / t1["90daysAgo"] - 1
@@ -113,17 +119,23 @@ def fy_labels(band):
 
 
 def snapshot(ticker, row, keep=True):
-    """追加本次快照（原子写，惯例同 vintages）。返回历史行（含本次）。"""
-    SNAP_DIR.mkdir(exist_ok=True)
+    """追加本次快照（原子写，惯例同 vintages）。返回历史行（含本次）。
+
+    keep=False（--no-snapshot）时**一个字节都不落盘**，连目录都不建：只读检出
+    /只读挂载下也要能出预览。已存在的目录照读，用于拼历史行。
+    """
     f = SNAP_DIR / f"{ticker}.json"
     rec = {"ticker": ticker, "rows": []}
     if f.exists():
         try:
-            rec = json.loads(f.read_text(encoding="utf-8"))
+            _r = json.loads(f.read_text(encoding="utf-8"))
+            # 快照文件被写成数组/标量时不能往下走：rows.setdefault 会 AttributeError
+            rec = _r if isinstance(_r, dict) else rec
         except json.JSONDecodeError:
             pass
     rec.setdefault("rows", []).append(row)
     if keep:
+        SNAP_DIR.mkdir(exist_ok=True)
         tmp = SNAP_DIR / f".{ticker}.json.tmp"
         tmp.write_text(json.dumps(rec, ensure_ascii=False, indent=1), encoding="utf-8")
         os.replace(tmp, f)
@@ -158,7 +170,22 @@ def main():
 
     # 带子：override 优先（照抄参考表的入口），否则近3年子窗 P25/50/75，回退全窗
     if ov.get("band"):
-        lo, mid, hi = (float(x) for x in ov["band"])
+        # 手拍带子是外部输入边界，必须在这里校验：长度不对会抛 unpack traceback，
+        # 反序/非正会让下游算出负覆盖率、反向价值区间和 nan 定位——都是"看起来
+        # 出了数其实全错"的形态，比直接报错难查得多
+        _b = ov["band"]
+        if not isinstance(_b, (list, tuple)) or len(_b) != 3:
+            raise SystemExit(f"overrides.{T}.band 必须是三个数 [PE低, PE中, PE高]，"
+                             f"实际收到：{_b!r}")
+        try:
+            lo, mid, hi = (float(x) for x in _b)
+        except (TypeError, ValueError) as e:
+            raise SystemExit(f"overrides.{T}.band 含非数值：{_b!r}") from e
+        if not all(math.isfinite(v) and v > 0 for v in (lo, mid, hi)):
+            raise SystemExit(f"overrides.{T}.band 三个值必须为正且有限：{_b!r}")
+        if not lo < mid < hi:
+            raise SystemExit(f"overrides.{T}.band 必须严格升序 [低 < 中 < 高]：{_b!r}"
+                             "（反序会产出反向的价值区间与负覆盖率）")
         band_src = f"override（{ov.get('band_note', '手拍')}）"
     elif rp:
         lo, mid, hi = _p(rp, 25), _p(rp, 50), _p(rp, 75)
@@ -191,6 +218,14 @@ def main():
             eps, src = c["avg"], f"consensus {c['n']} 分析师，区间 {c['low']:.2f}~{c['high']:.2f}"
         else:
             continue
+        # PE 法对非正 EPS 不成立：eps=0 会在下面 px/r_mid 直接 ZeroDivisionError，
+        # eps<0 则 lo*eps > hi*eps，区间反向、pos 变 nan，还会打印一段"负价格区间"。
+        # 与 pe_band 的口径一致（它计算带子时本就剔除亏损年），也与引擎里
+        # 「负 EPS × 正倍数 = 负目标价，PE 腿 n.m.」是同一条原则。
+        if not isinstance(eps, (int, float)) or not math.isfinite(eps) or eps <= 0:
+            print(f"\n{lab}  EPS {eps} —— 非正或非有限，PE 法不适用，跳过该财年"
+                  f"（来源：{src}）。亏损标的请看引擎的 DCF/P-S 口径，参考表只做 PE×EPS")
+            continue
         r_lo, r_mid, r_hi = lo * eps, mid * eps, hi * eps
         pos = (px - r_lo) / (r_hi - r_lo) if r_hi > r_lo else float("nan")
         print(f"\n{lab}  EPS {eps:.2f}  [{src}]"
@@ -209,17 +244,27 @@ def main():
         print(f"\nEPS 修正轨迹(近90天): FY1 {_fmt(trend['0y'])}"
               + (f"   FY2 {_fmt(trend['+1y'])}" if "+1y" in trend else ""))
 
+    # fy1_lab/fy2_lab 必须落盘：财年滚动后 fy1_eps 指向的已经是**另一个**目标财年，
+    # 不存标签的话历史表把新旧两个财年并进同一列 FY1 EPS，滚动看起来像一次
+    # consensus 大幅修正（实际只是换了年）
     row = {"date": date.today().isoformat(), "price": round(px, 2),
-           "band": [lo, mid, hi], "band_src": band_src, **{
+           "band": [lo, mid, hi], "band_src": band_src,
+           "fy1_lab": fy1_lab, "fy2_lab": fy2_lab, **{
                f"{k}_{f}": v for k, r in rows_now.items() for f, v in r.items()}}
     rows = snapshot(T, row, keep=not a.no_snapshot)
     if len(rows) > 1:
         print(f"\n历史快照（{SNAP_DIR.name}/{T}.json，参考表布局，末行=本次）:")
-        print(f"{'日期':<12}{'FY1 EPS':>9}{'区间':>19}{'中位价':>9}{'现价':>9}")
-        for r in rows[-5:]:
-            if r.get("fy1_eps") is None:
-                continue
-            print(f"{r['date']:<12}{r['fy1_eps']:>9.2f}"
+        # 按 fy1 目标财年分段：跨财年滚动的行不并成一列，否则"换了年"会被读成
+        # "consensus 修正"。老快照没有 fy1_lab（本次之前不落盘），标记为"?"单列一段。
+        shown = [r for r in rows[-8:] if r.get("fy1_eps") is not None]
+        last_lab = object()
+        for r in shown:
+            lab = r.get("fy1_lab") or "?（旧快照未记录目标财年）"
+            if lab != last_lab:
+                print(f"  目标财年 {lab}")
+                print(f"  {'日期':<12}{'FY1 EPS':>9}{'区间':>19}{'中位价':>9}{'现价':>9}")
+                last_lab = lab
+            print(f"  {r['date']:<12}{r['fy1_eps']:>9.2f}"
                   f"{r['fy1_lo']:>9,.1f}~{r['fy1_hi']:<9,.1f}"
                   f"{r['fy1_mid']:>9,.1f}{r['price']:>9,.2f}")
     print("\n口径注: 区间=PE带×财年一致预期EPS（与参考表同公式）。EPS 的 non-GAAP=GAAP"
