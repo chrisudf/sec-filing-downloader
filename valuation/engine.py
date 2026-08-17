@@ -364,9 +364,15 @@ for name, s in cfg["scenarios"].items():
     # 综合退化为 DCF(+SOTP)；有 ps_band 时在红旗区给 P/S 参考价（不入综合）。
     # pe_target 仍照算并展示——退出综合 ≠ 隐藏。
     pe_nm = eps1 <= 0 or s["opm"] < 0.02
-    blend_methods = ((["pe"] if not pe_nm else [])
-                     + ["dcf"] + (["sotp"] if sotp_in_blend else []))
-    methods = ([] if pe_nm else [pe_target]) + [dcf_ps] + ([sotp_ps] if sotp_in_blend else [])
+    # SOTP 腿同理：EV/EBIT 对负 EBIT 不成立。此前只守 PE 腿，未盈利标的（RKLB 型
+    # 结构性营业亏损）的 sotp_eq = 负 EBIT×倍数 + 净现金 会照旧进综合——校验层要求
+    # 亏损情景写 m1=m2=0，那样 sotp_ps 退化成"每股净现金"，一个纯现金数字冒充估值腿
+    # 混进综合，同样不是估值。
+    sotp_nm = op1 <= 0
+    blend_methods = ((["pe"] if not pe_nm else []) + ["dcf"]
+                     + (["sotp"] if sotp_in_blend and not sotp_nm else []))
+    methods = ([] if pe_nm else [pe_target]) + [dcf_ps] \
+        + ([sotp_ps] if sotp_in_blend and not sotp_nm else [])
     _vals = {"pe": pe_target, "dcf": dcf_ps, "sotp": sotp_ps}
     _wsum = sum(BLEND_W[m] for m in blend_methods)
     blend = (sum(_vals[m] * BLEND_W[m] for m in blend_methods) / _wsum
@@ -419,8 +425,17 @@ for name, s in cfg["scenarios"].items():
         warnings.append(["yellow",
                          f"{name} PE 腿 n.m.（eps1 {eps1:.2f} / opm {s['opm']:.1%}——近零或"
                          "负利润下『盈利×倍数』无定价意义），综合退化为 "
-                         + ("DCF+SOTP" if sotp_in_blend else "DCF") + _ps_ref])
-    warnings += pe_band_check(name, s["pe"], facts.get("pe_band"), ddiag)
+                         + "+".join(m.upper() for m in blend_methods) + _ps_ref])
+    if sotp_in_blend and sotp_nm:
+        warnings.append(["yellow",
+                         f"{name} SOTP 腿 n.m.（{cfg['fwd_label']} 营业利润 {op1:,.0f}M <= 0——"
+                         "EV/EBIT 对负 EBIT 不适用），已剔出综合；综合仅取 "
+                         + "+".join(m.upper() for m in blend_methods)])
+    # 目标 PE 为 0（校验层对亏损情景的约定值）或 PE 腿已 n.m. 时不做历史带比对：
+    # 它比的是"目标倍数在自身历史分布里的位置"，对一个已声明不适用的倍数比对，
+    # 只会产出必然的「该票历史上从未出现过」黄旗
+    if not pe_nm:
+        warnings += pe_band_check(name, s["pe"], facts.get("pe_band"), ddiag)
 
     out["scenarios"][name] = dict(
         assumptions=s, rev1=round(rev1), op1=round(op1), ni1=round(ni1),
@@ -532,8 +547,14 @@ if out.get("trading_range"):
 if not sotp_in_blend:
     print(f"SOTP 降级为参考项（主分部利润占比 {cfg['seg1_share']:.0%} >= 85%），综合 = PE/DCF 均值")
 for n, v in out["scenarios"].items():
-    print(f"{n:5s}| EPS1 {v['eps1']:8.2f} | PE法 {v['pe_target']:9.1f} | DCF {v['dcf_ps']:9.1f} | "
-          f"SOTP {v['sotp_ps']:9.1f}{'*' if not sotp_in_blend else ' '}| "
+    # 被守卫剔出综合的腿打 x（* 仍表示 seg1_share 降级），避免 stdout 看起来像
+    # "三法都进了综合"——数字照显示，只是标出它没参与
+    _bm = v["blend_methods"]
+    print(f"{n:5s}| EPS1 {v['eps1']:8.2f} | "
+          f"PE法 {v['pe_target']:9.1f}{' ' if 'pe' in _bm else 'x'}| "
+          f"DCF {v['dcf_ps']:9.1f} | "
+          f"SOTP {v['sotp_ps']:9.1f}"
+          f"{'*' if not sotp_in_blend else (' ' if 'sotp' in _bm else 'x')}| "
           f"综合 {v['blend']:9.1f} | {v['upside']:+.1%}")
     for lv, msg in v["warnings"]:
         print(f"      {'⛔' if lv == 'red' else '⚠️'} {msg}")

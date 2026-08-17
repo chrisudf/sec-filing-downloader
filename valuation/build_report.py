@@ -642,7 +642,9 @@ metrics = [
     ("Forward PE（合理）", "=IF('情景假设'!$C$34<=0,\"n.m.\",B4/B13)", FM_X, ""),
     ("PEG（合理）", "=IF(ISNUMBER(B14),B14/('情景假设'!$C$4*100),\"n.m.\")",
      "0.00", "Forward PE / 营收增速"),
-    ("EV/EBIT (TTM)", "=(B5-B6)/'情景假设'!$B$20", FM_X, ""),
+    # TTM 营业利润为负时 EV/EBIT 是负倍数，会被当成"极便宜"读——与上面两格同一处置
+    ("EV/EBIT (TTM)", "=IF('情景假设'!$B$20>0,(B5-B6)/'情景假设'!$B$20,\"n.m.\")", FM_X,
+     "TTM 营业利润为负时不适用"),
     ("FCF 收益率 (TTM)", "='情景假设'!$B$25/B5", FM_PCT, ""),
     ("反向 DCF 隐含增速（base 口径条件）", d["reverse_dcf"], FM_PCT,
      "现价隐含的 DCF 起始增速（10年线性衰减）——条件于 base 的利润率路径与 WACC，"
@@ -699,8 +701,12 @@ for label, ac, key, dcf_f, sotp_f in scen_rows:
            or ["pe", "dcf"] + (["sotp"] if _sotp_in else []))
     _pairs = [(m, c_) for m, c_ in (("pe", "B"), ("dcf", "C"), ("sotp", "D")) if m in _bm]
     _cells = [f"{c_}{r}" for _, c_ in _pairs]
-    if "pe" not in _bm:
-        _nm_rows.append(label)
+    # 注释要如实说出哪条腿缺席：亏损情景 SOTP 腿也会被剔（op1<=0），只写"PE 腿"
+    # 会让读表的人对不上 E 列公式
+    _gone = [n_ for m, n_ in (("pe", "PE 法"), ("sotp", "SOTP")) if m not in _bm
+             and (m != "sotp" or _sotp_in)]
+    if _gone:
+        _nm_rows.append(f"{label} 的 {'/'.join(_gone)}")
     # 权重非默认时综合=显式加权公式（与引擎 BLEND_W 同构），默认等权保持 AVERAGE
     _bw = d.get("blend_weights") or {}
     if any(abs(_bw.get(m, 1) - 1) > 1e-9 for m, _ in _pairs):
@@ -728,7 +734,7 @@ if not _sotp_in:
     _note25 += f"；SOTP 不入综合（主分部利润占比 {d['meta']['seg1_share']:.0%} >= 85%，与 PE 法为同一笔盈利）"
 if _nm_rows:
     _note25 += ("；" + "、".join(_nm_rows)
-                + " 的 PE 腿 n.m. 不入综合（近零/负利润守卫，见红旗区 P/S 参考）")
+                + " n.m. 不入综合（近零/负利润守卫，综合口径逐档不同，见红旗区 P/S 参考）")
 put(ws, "A25", _note25, GREEN, border=False)
 _mth = "三法" if _sotp_in else "PE/DCF 两法"
 _spread = " / ".join(f"{sc} {d['scenarios'][sc].get('method_spread') or '—'}x"
