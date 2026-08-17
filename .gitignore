@@ -10,3 +10,5 @@ prev_configs/
 .claude/
 .DS_Store
 vintages/
+ref_snapshots/
+ref_table_overrides.json
