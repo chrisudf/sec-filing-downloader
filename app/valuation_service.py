@@ -155,8 +155,11 @@ def _validate_judgment(d: dict, mode: str = "standard",
         if len(s["margins"]) != 10:
             raise ValueError(f"{sc}.margins 必须恰好 10 个值")
         # 上界随当前实际 FCF 利润率放宽（特许权/授权类公司 TTM FCF 率本身可 >65%，
-        # 静态上界会连"维持现状"的路径都拒绝，两次 retry 撞同一堵墙后硬失败）
-        m_cap = max(0.65, min(0.9, 1.2 * fcf_margin)) if fcf_margin else 0.65
+        # 静态上界会连"维持现状"的路径都拒绝，两次 retry 撞同一堵墙后硬失败）。
+        # `> 0` 不可省：烧钱标的 TTM FCF 率为负（RKLB 实测 -48%），只判真值会算出
+        # m_cap = 1.2 × -0.48 = -0.58，与下界 -0.3 组成**空区间**——任何输出都过不了，
+        # 两次 retry 后必然硬失败，报错文案还写着一个看不出矛盾的"上界"
+        m_cap = max(0.65, min(0.9, 1.2 * fcf_margin)) if (fcf_margin and fcf_margin > 0) else 0.65
         # 上界含等号，与 prompt / TUNING.md 的 (-0.3, cap] 一致：模型给恰好等于上界
         # 的值（如 0.65）不该被误拒触发无谓 retry
         if not all(isinstance(m, (int, float)) and -0.3 < m <= m_cap for m in s["margins"]):
@@ -165,17 +168,41 @@ def _validate_judgment(d: dict, mode: str = "standard",
             raise ValueError(f"{sc}.wacc 越界")
         if s["wacc"] - s["tg"] < 0.045:
             raise ValueError(f"{sc}: wacc-tg 需 >= 0.045")
-        if not 0 < s["opm"] < 0.95 or not 0 <= s["tax"] < 0.5:
-            raise ValueError(f"{sc}: opm/tax 越界")
+        # opm 下界为 -1.0 而非 0（2026-08-11）：结构性未盈利标的（RKLB TTM 营业利润率
+        # -29%）在 NTM 窗口内不可能翻正，`0 < opm` 让判断层无论怎么答都被拒，两次
+        # retry 后硬失败——这不是漂移防线，是把整类标的挡在门外。亏损照实建模，
+        # 失效的估值腿由下面的 pe/m1/m2 = 0 显式声明（引擎据此把腿剔出综合）。
+        if not -1.0 < s["opm"] < 0.95 or not 0 <= s["tax"] < 0.5:
+            raise ValueError(f"{sc}: opm/tax 越界（opm 需在 (-1.0, 0.95)、tax 在 [0, 0.5)）")
+        # NTM 盈利符号：PE 法与 SOTP 在盈利为负时数学上失效（负 EPS × 正倍数 = 负目标价，
+        # 会静默混进综合）。rev0 缺失时退回按 opm 判断（引擎 op1 与 opm 同号）。
+        _rev1 = rev0 * (1 + s["g"]) if rev0 else None
+        _op1 = _rev1 * s["opm"] if _rev1 is not None else None
+        _pretax1 = _op1 + d["other_income"] if _op1 is not None else None
+        _loss_ni = _pretax1 <= 0 if _pretax1 is not None else s["opm"] <= 0
+        _loss_op = _op1 <= 0 if _op1 is not None else s["opm"] <= 0
         _imp = (s.get("permanent_impairment") is True
                 and str(s.get("impairment_note") or "").strip() != "")
-        if not (4 if _imp else pe_floor) <= s["pe"] <= 60:
+        if _loss_ni:
+            # 亏损情景下税率必须为 0：引擎的 ni1 = 税前 × (1-tax) 会把亏损按税率**缩小**，
+            # 等于给亏损打折——递延所得税资产不是当期现金流，不在本模型口径内
+            if s["tax"] != 0:
+                raise ValueError(f"{sc}: NTM 税前为负（营业利润率 {s['opm']:.1%}），"
+                                 "tax 必须为 0——(1-tax) 会把亏损按税率缩小")
+            if s["pe"] != 0:
+                raise ValueError(f"{sc}: NTM 盈利为负，目标 PE 必须写 0（PE 法不适用；"
+                                 "负 EPS × 正倍数 = 负目标价）。引擎会把该腿剔出综合")
+        elif not (4 if _imp else pe_floor) <= s["pe"] <= 60:
             raise ValueError(
                 f"{sc}.pe 需在 [{pe_floor:g}, 60]——低于下限的『目标 PE』属于崩盘/永久受损"
                 "定价，须设 permanent_impairment=true + impairment_note（下限放宽至 4）"
                 + ("" if pe_floor != 8.0 else
                    "；历史 NTM 带子窗 P50×1.15<8 的低倍数票下限会自动放宽至 max(4, 0.6×子窗P10)"))
-        if not 0 <= s["m1"] <= 60 or not 0 <= s["m2"] <= 60:
+        if _loss_op:
+            if s["m1"] != 0 or s["m2"] != 0:
+                raise ValueError(f"{sc}: NTM 营业利润为负，m1/m2 必须写 0"
+                                 "（EV/EBIT 对负 EBIT 不适用）。引擎会把 SOTP 腿剔出综合")
+        elif not 0 <= s["m1"] <= 60 or not 0 <= s["m2"] <= 60:
             raise ValueError(f"{sc}.m1/m2 需在 [0, 60]")
         for k in ("g", "g0"):
             if not -0.35 < s[k] < 0.9:
@@ -201,13 +228,16 @@ def _validate_judgment(d: dict, mode: str = "standard",
             # m2 仅在真双分部（次分部倍数非 0）时参与——它在 seg1_share<0.85 时
             # 承担近半 SOTP 权重，同样是独立采样漂移通道
             for key in (("pe", "m1", "m2") if sb.get("m2", 0) > 0 else ("pe", "m1")):
-                if (r_bear < 0.8 and sb[key] < 0.6 * ss[key] and not _exempt(sb)):
+                # 亏损情景的倍数按规定写 0（见上），此时 r<0.8 与「倍数 < 0.6×base」
+                # 恒同时成立——反双重计数会把"倍数腿已声明失效"误报成漂移
+                if (eps["bear"] > 0 and r_bear < 0.8
+                        and sb[key] < 0.6 * ss[key] and not _exempt(sb)):
                     raise ValueError(
                         f"bear 双重计数：情景盈利已较 base 收缩至 {r_bear:.0%}，{key} 又 "
                         f"< 0.6×base——谷底盈利×谷底倍数会把周期惩罚计两次。请上调 bear.{key}"
                         "（市场对可修复的谷底给看穿周期的倍数），或判断为永久受损时设 "
                         "permanent_impairment=true 并在 impairment_note 给原文出处")
-                if r_bull > 1.25 and su[key] > 1.4 * ss[key]:
+                if eps["bull"] > 0 and r_bull > 1.25 and su[key] > 1.4 * ss[key]:
                     raise ValueError(
                         f"bull 双重计数：情景盈利已较 base 扩张至 {r_bull:.0%}，{key} 又 "
                         f"> 1.4×base——景气顶点市场收敛倍数而非扩张。请下调 bull.{key}")
