@@ -1047,7 +1047,17 @@ async def _pipeline(job: dict, ticker: str, email: str) -> None:
                summary={k: dict(blend=v["blend"], upside=v["upside"])
                         for k, v in val["scenarios"].items()},
                trading_range=(dict(lo=_tr["px"].get("25"), mid=_tr["px"].get("50"),
-                                   hi=_tr["px"].get("75"), window=_tr["window"])
+                                   hi=_tr["px"].get("75"), window=_tr["window"],
+                                   # 盈利窗口 + 倍数窗口真实起止/滞后：只写"近3年PE带"
+                                   # 会被读成区间的时间跨度（实测确实被这么问了）
+                                   eps_window=_tr.get("eps_window"),
+                                   span=_tr.get("span"),
+                                   # 现价当前位置与倍数回归归因——区间中位的涨幅按构造
+                                   # 全部来自倍数回归，不写出来读者看不见
+                                   fwd_pe_now=_tr.get("fwd_pe_now"),
+                                   fwd_pe_now_pctile=_tr.get("fwd_pe_now_pctile"),
+                                   target_pe=_tr.get("target_pe"),
+                                   mult_reversion=_tr.get("mult_reversion_to_p50"))
                               if _tr and _tr.get("px") else None))
 
 
