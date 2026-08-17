@@ -118,6 +118,15 @@
   .status.err { color: var(--err); }
   .status.ok { color: var(--ok); }
   .status.busy { color: var(--muted); }
+  /* 状态区里的行内动作按钮（登录/重试）——不抢主按钮的视觉权重 */
+  .inline-act {
+    display: inline-block; margin: 8px 8px 0 0; padding: 6px 12px;
+    font-size: 12px; font-family: inherit; cursor: pointer;
+    color: var(--text); background: var(--card2);
+    border: 1px solid var(--border); border-radius: 8px;
+  }
+  .inline-act:hover:not(:disabled) { border-color: var(--muted); }
+  .inline-act:disabled { opacity: .5; cursor: default; }
   .foot { color: var(--muted); font-size: 12px; margin-top: 24px; text-align: center; }
   .foot a { color: var(--muted); }
 </style>
@@ -346,7 +355,9 @@ function setStatus(cls, msg) {
 }
 
 // ---- 估值报告 ----
-$("valBtn").addEventListener("click", async () => {
+$("valBtn").addEventListener("click", runValuation);
+
+async function runValuation() {
   const ticker = $("ticker").value.trim().toUpperCase();
   if (!ticker) return setValStatus("err", "请输入股票代码");
 
@@ -380,6 +391,8 @@ $("valBtn").addEventListener("click", async () => {
         if (msg.includes("任务已丢失") || ++pollErrors >= 3) throw new Error(msg);
         continue;
       }
+      // 登录失效是"点一下就能解决"的状态问题，不该只甩一段红字：给登录按钮
+      if (st.status === "failed" && st.error_kind === "auth") return showAuthPrompt(st.error);
       if (st.status === "failed") throw new Error(st.error || "任务失败");
       if (st.status === "done") {
         const parts = Object.entries(st.summary || {}).map(
@@ -410,12 +423,68 @@ $("valBtn").addEventListener("click", async () => {
   } finally {
     $("valBtn").disabled = false;
   }
-});
+}
 
+// textContent 而不是 innerHTML：msg 里可能带 CLI stderr 原文，不能当 HTML 解析
 function setValStatus(cls, msg) {
   const el = $("valStatus");
   el.className = "status " + cls;
   el.textContent = msg;
+  return el;
+}
+
+function statusButton(el, label, onClick) {
+  const b = document.createElement("button");
+  b.type = "button";
+  b.className = "inline-act";
+  b.textContent = label;
+  b.addEventListener("click", onClick);
+  el.appendChild(b);
+  return b;
+}
+
+// 判断层登录失效：弹出真终端让用户登录（claude -p 是无头模式，OAuth 登录必须
+// 在交互式终端里走浏览器回填，没法在后台子进程内完成），登录后原地重试。
+function showAuthPrompt(errMsg) {
+  const el = setValStatus("err", "判断层（Claude Code）未登录或登录已失效，需要重新登录。");
+  const detail = document.createElement("div");
+  detail.className = "hint";
+  detail.textContent = errMsg || "";
+  el.appendChild(detail);
+
+  const loginBtn = statusButton(el, "🔑 打开登录窗口", async () => {
+    loginBtn.disabled = true;
+    try {
+      const r = await fetch("/api/valuation/login", { method: "POST" });
+      const body = await r.json().catch(() => ({}));
+      if (!r.ok) throw new Error(body.detail || `HTTP ${r.status}`);
+      detail.textContent = "已弹出终端窗口，在其中完成登录（会自动开浏览器）。登录成功后这里会自动转绿。";
+      pollAuth(detail);
+    } catch (e) {
+      detail.textContent = "无法自动弹窗（" + ((e && e.message) || e)
+        + "）。请手动开一个终端运行： claude /login";
+      loginBtn.disabled = false;
+    }
+  });
+  statusButton(el, "↻ 重试", runValuation);
+}
+
+// 轮询登录状态，转绿后把「重试」提上来——不自动重跑：重跑要几分钟且会占住
+// _running 单任务槽，什么时候开始该由用户点
+async function pollAuth(detail) {
+  for (let i = 0; i < 100; i++) {
+    await new Promise(r => setTimeout(r, 3000));
+    try {
+      const r = await fetch("/api/valuation/auth");
+      if (!r.ok) continue;
+      const st = await r.json();
+      if (st.ok) {
+        detail.textContent = "✅ 登录已恢复（" + st.reason + "），点上面的「↻ 重试」继续。";
+        return;
+      }
+    } catch (e) { /* 轮询期间的抖动忽略，下一轮再试 */ }
+  }
+  detail.textContent = "登录状态仍未恢复。请确认终端里的登录流程已走完，或手动运行 claude /login。";
 }
 
 refreshRange();

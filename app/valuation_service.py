@@ -38,7 +38,20 @@ PY = sys.executable
 # 判断层单次调用上限。默认模型 opus 后（v2, 2026-07-22）在 ~45k 字符 prompt 上比
 # sonnet 慢，且 v2 一次运行最多 3 次调用（schema retry + 经济复审），放宽到 600s
 CLAUDE_TIMEOUT = 600
+
+# 判断层登录失效的识别（stderr 文本匹配）。Claude Code 的鉴权错误不走独立退出码，
+# 只能认文案——命中即归类为 auth，前端据此给「登录」按钮而不是一段红字。
+# 认漏的代价只是退回普通错误展示，所以宁可宽一点。
+_AUTH_PAT = re.compile(
+    r"OAuth|Failed to authenticate|authentication_error|Invalid API key|"
+    r"session expired|not logged in|please (?:run )?/?login|credentials",
+    re.I)
+# 凭证文件（Windows/Linux）。macOS 存 Keychain，此文件不存在属正常——探测一律
+# "拿不准就放行"，绝不因为读不到文件而拦住任务。
+_CRED_PATH = Path.home() / ".claude" / ".credentials.json"
+
 STEP_LABELS = {
+    "preflight": "⓪ 检查判断层登录状态…",
     "facts": "① XBRL 取数中…",
     "price": "② 获取现价…",
     "filings": "③ 下载最新 10-K / 10-Q…",
@@ -343,6 +356,57 @@ def _find_claude() -> str:
     raise RuntimeError(f"找不到 claude CLI：{hint}，然后设置环境变量 CLAUDE_CLI_PATH 指向它")
 
 
+class JudgmentAuthError(RuntimeError):
+    """判断层未登录/登录失效——与普通失败区分开，前端据此给「登录」按钮。"""
+
+
+def _auth_state() -> dict:
+    """尽力而为地判断本机 Claude Code 是否还登录着。
+
+    返回 {"ok": bool, "reason": str}。**只在能确凿判定"没登录"时返回 False**：
+    读不到文件、格式不认识、macOS 走 Keychain——一律 ok=True 放行，让真正的
+    调用去报错。探测的价值是"1 秒失败"而不是"替 CLI 做鉴权"，误拦比漏拦贵得多。
+    """
+    try:
+        if not _CRED_PATH.exists():
+            return {"ok": True, "reason": "无凭证文件（macOS 走 Keychain，或用 API key）"}
+        d = json.loads(_CRED_PATH.read_text(encoding="utf-8"))
+    except Exception as e:  # noqa: BLE001 —— 探测失败不许影响主流程
+        return {"ok": True, "reason": f"凭证探测跳过（{e!r:.80}）"}
+    oauth = d.get("claudeAiOauth")
+    if not isinstance(oauth, dict):
+        return {"ok": True, "reason": "凭证结构不认识，交给 CLI 判断"}
+    # 实测过的失效形态：token 被清空成 ""、expiresAt 归 0。此时 CLI 报
+    # "OAuth session expired and could not be refreshed"——没有 refresh token
+    # 可用，refresh 无从谈起，只能重新登录
+    if not oauth.get("accessToken") and not oauth.get("refreshToken"):
+        return {"ok": False, "reason": "凭证已被清空（accessToken/refreshToken 均为空）"}
+    exp = oauth.get("refreshTokenExpiresAt")
+    if isinstance(exp, (int, float)) and exp and exp / 1000 < time.time():
+        return {"ok": False, "reason": "refresh token 已过期"}
+    return {"ok": True, "reason": "凭证在位"}
+
+
+def _login_argv() -> list[str] | None:
+    """弹出一个交互式终端跑 `claude /login`。返回 None 表示本平台不支持自动弹窗。
+
+    命令是写死的（只嵌入 _find_claude() 的结果），不接受任何请求参数——这个端点
+    只在本机开发服务里存在，但仍然不给它拼接外部输入的机会。
+    """
+    exe = _find_claude()
+    if os.name == "nt":
+        # start 需要一个标题占位参数，否则带引号的路径会被当成标题
+        return ["cmd", "/c", "start", "Claude 登录", "cmd", "/k", exe, "/login"]
+    if sys.platform == "darwin":
+        return ["osascript", "-e",
+                f'tell application "Terminal" to do script "{exe} /login"',
+                "-e", 'tell application "Terminal" to activate']
+    for term in ("x-terminal-emulator", "gnome-terminal", "konsole", "xterm"):
+        if shutil.which(term):
+            return [term, "-e", f"{exe} /login"]
+    return None
+
+
 async def _claude(prompt: str) -> str:
     # VALUATION_JUDGMENT_CMD 可替换判断层命令（测试注入 / 将来切 Anthropic API）
     # VALUATION_MODEL 可换判断层模型：opus(默认) / sonnet / fable，或完整模型 ID。
@@ -364,7 +428,12 @@ async def _claude(prompt: str) -> str:
         proc.kill()
         raise RuntimeError(f"claude -p 超时（{CLAUDE_TIMEOUT}s）")
     if proc.returncode != 0:
-        raise RuntimeError("claude -p 失败: " + (err or out).decode("utf-8", "ignore")[-500:])
+        msg = (err or out).decode("utf-8", "ignore")[-500:]
+        # 登录失效单独成类：它是"去点一下登录"就能解决的状态问题，不该和
+        # "模型输出跑偏"混在同一段红字里，前端要据此给按钮
+        if _AUTH_PAT.search(msg):
+            raise JudgmentAuthError("判断层未登录或登录已失效: " + msg)
+        raise RuntimeError("claude -p 失败: " + msg)
     return out.decode("utf-8", "ignore")
 
 
@@ -504,6 +573,13 @@ def _compact_facts_financials(facts: dict) -> str:
 async def _pipeline(job: dict, ticker: str, email: str) -> None:
     wd = Path(job["dir"])
     today = date.today().isoformat()
+
+    # 判断层登录探测放在第一步：④ 之前的取数/下载要跑好几分钟，登录失效却要等到
+    # ⑤ 才暴露——用户白等一轮，SEC 也白请求一轮。探测只在能确凿判定未登录时拦。
+    job["step"] = "preflight"
+    _auth = _auth_state()
+    if not _auth["ok"]:
+        raise JudgmentAuthError(f"判断层未登录（{_auth['reason']}）")
 
     job["step"] = "facts"
     await _run([PY, str(VAL / "fetch_facts.py"), ticker, str(wd / "facts.json"), email], wd)
@@ -940,6 +1016,10 @@ async def _run_job(job_id: str, ticker: str, email: str) -> None:
     job = _jobs[job_id]
     try:
         await _pipeline(job, ticker, email)
+    except JudgmentAuthError as e:
+        # error_kind 让前端能给出「登录」按钮而不是只显示一段无从下手的红字
+        job.update(status="failed", error_kind="auth",
+                   error=f"[{STEP_LABELS.get(job.get('step'), job.get('step'))}] {e}")
     except Exception as e:  # noqa: BLE001 —— 任何一步失败都要报给前端
         job.update(status="failed", error=f"[{STEP_LABELS.get(job.get('step'), job.get('step'))}] {e}")
     finally:
@@ -966,6 +1046,41 @@ async def create_valuation(req: ValuationRequest):
     _bg_tasks.add(task)
     task.add_done_callback(_bg_tasks.discard)
     return {"job_id": job_id}
+
+
+@router.get("/api/valuation/auth")
+async def valuation_auth():
+    """判断层登录状态。前端在弹出登录窗口后轮询它，登录完成即可重试。"""
+    st = _auth_state()
+    try:
+        st["cli"] = _find_claude()
+    except RuntimeError as e:
+        st = {"ok": False, "reason": str(e), "cli": None}
+    st["can_popup"] = bool(st.get("cli")) and _login_argv() is not None
+    return st
+
+
+@router.post("/api/valuation/login")
+async def valuation_login():
+    """在本机弹出一个交互式终端跑 `claude /login`。
+
+    只能这样做：`claude -p` 是无头模式，登录本身是交互流程（要开浏览器做 OAuth
+    并回填），没法在无头子进程里完成。所以"弹窗登录"= 起一个真终端窗口交给用户，
+    登录完成后前端轮询 /api/valuation/auth 转绿即可重试。
+    命令写死，不接受任何请求参数。
+    """
+    argv = _login_argv()
+    if argv is None:
+        raise edgar.EdgarError(
+            501, "本平台无法自动弹出终端，请手动开一个终端运行： claude /login")
+    try:
+        # 不等它结束：这个终端窗口会一直开着直到用户登录完
+        await asyncio.create_subprocess_exec(
+            *argv, stdout=asyncio.subprocess.DEVNULL, stderr=asyncio.subprocess.DEVNULL)
+    except OSError as e:
+        raise edgar.EdgarError(500, f"启动登录终端失败：{e}") from e
+    return {"started": True,
+            "hint": "已弹出终端窗口，在其中完成登录后回到本页点「重试」"}
 
 
 @router.get("/api/valuation/{job_id}")
