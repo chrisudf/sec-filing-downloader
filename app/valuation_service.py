@@ -38,7 +38,20 @@ PY = sys.executable
 # 判断层单次调用上限。默认模型 opus 后（v2, 2026-07-22）在 ~45k 字符 prompt 上比
 # sonnet 慢，且 v2 一次运行最多 3 次调用（schema retry + 经济复审），放宽到 600s
 CLAUDE_TIMEOUT = 600
+
+# 判断层登录失效的识别（stderr 文本匹配）。Claude Code 的鉴权错误不走独立退出码，
+# 只能认文案——命中即归类为 auth，前端据此给「登录」按钮而不是一段红字。
+# 认漏的代价只是退回普通错误展示，所以宁可宽一点。
+_AUTH_PAT = re.compile(
+    r"OAuth|Failed to authenticate|authentication_error|Invalid API key|"
+    r"session expired|not logged in|please (?:run )?/?login|credentials",
+    re.I)
+# 凭证文件（Windows/Linux）。macOS 存 Keychain，此文件不存在属正常——探测一律
+# "拿不准就放行"，绝不因为读不到文件而拦住任务。
+_CRED_PATH = Path.home() / ".claude" / ".credentials.json"
+
 STEP_LABELS = {
+    "preflight": "⓪ 检查判断层登录状态…",
     "facts": "① XBRL 取数中…",
     "price": "② 获取现价…",
     "filings": "③ 下载最新 10-K / 10-Q…",
@@ -96,7 +109,8 @@ def _check_rev_override(d: dict) -> None:
 
 def _validate_judgment(d: dict, mode: str = "standard",
                        rev0: float | None = None,
-                       fcf_margin: float | None = None) -> None:
+                       fcf_margin: float | None = None,
+                       band: dict | None = None) -> None:
     """LLM 输出的硬校验：结构、边界、margins 长度。不合格直接拒绝重试。
 
     v2（semantics_version=2, 2026-07-22）新增：
@@ -107,7 +121,7 @@ def _validate_judgment(d: dict, mode: str = "standard",
       市场对可修复的周期谷底给看穿周期的倍数；判断为永久受损时可设
       permanent_impairment=true + impairment_note（原文出处）豁免
     - margins 谷底下限 0.4×当前 TTM FCF 利润率（同一豁免）
-    rev0/fcf_margin 由调用方从 facts 传入；为 None 时跳过对应规则。"""
+    rev0/fcf_margin/band 由调用方从 facts 传入；为 None 时跳过对应规则。"""
     if mode == "financials":
         _validate_judgment_financials(d)
         return
@@ -135,6 +149,21 @@ def _validate_judgment(d: dict, mode: str = "standard",
     if not isinstance(d["notes"], list) or not d["notes"]:
         raise ValueError("notes 必须是非空数组")
     _check_rev_override(d)
+    # pe 下限的 band 证据放行：锚纪律命令 base 默认锚子窗 P50，而历史 P50×1.15 < 8
+    # 的低倍数票（汽车/能源类，GM/F 历史 NTM P50 约 4.5~7）上，[8,60] 静态下限与锚
+    # 互相矛盾——唯一合法值 pe=8 必然吃黄旗或烧光 retry。带子本身就是"该票长期在
+    # 8x 以下交易"的证据：此时下限放宽到 max(4, 0.6×锚窗P10)——低于历史 P10 打六折
+    # 仍属崩盘定价，照旧走 permanent_impairment 通道。带子缺失时回退静态 8。
+    #
+    # thin_coverage 必须同门槛（PR #3 review）：0059 起「<250 天的分布没有锚的话语权」
+    # 在 band_meta 注入 / pe_band_check / 交易区间 / 中枢检查四处都停用了薄带子，
+    # 唯独这里漏了——一个 60 天的低倍数薄样本能把硬下限从 8 放宽到 4，而同一个
+    # 带子在 prompt 里被明说"本次无历史锚"。放行与"带子算证据"必须是同一个闸门。
+    pe_floor = 8.0
+    _bp = ({} if (band or {}).get("thin_coverage") else
+           ((band or {}).get("recent") or {}).get("pctiles") or (band or {}).get("pctiles") or {})
+    if "10" in _bp and "50" in _bp and _bp["50"] * 1.15 < 8:
+        pe_floor = max(4.0, round(0.6 * _bp["10"], 1))
     for sc in ("bear", "base", "bull"):
         if sc not in d["scenarios"]:
             raise ValueError(f"缺少情景 {sc}")
@@ -145,8 +174,11 @@ def _validate_judgment(d: dict, mode: str = "standard",
         if len(s["margins"]) != 10:
             raise ValueError(f"{sc}.margins 必须恰好 10 个值")
         # 上界随当前实际 FCF 利润率放宽（特许权/授权类公司 TTM FCF 率本身可 >65%，
-        # 静态上界会连"维持现状"的路径都拒绝，两次 retry 撞同一堵墙后硬失败）
-        m_cap = max(0.65, min(0.9, 1.2 * fcf_margin)) if fcf_margin else 0.65
+        # 静态上界会连"维持现状"的路径都拒绝，两次 retry 撞同一堵墙后硬失败）。
+        # `> 0` 不可省：烧钱标的 TTM FCF 率为负（RKLB 实测 -48%），只判真值会算出
+        # m_cap = 1.2 × -0.48 = -0.58，与下界 -0.3 组成**空区间**——任何输出都过不了，
+        # 两次 retry 后必然硬失败，报错文案还写着一个看不出矛盾的"上界"
+        m_cap = max(0.65, min(0.9, 1.2 * fcf_margin)) if (fcf_margin and fcf_margin > 0) else 0.65
         # 上界含等号，与 prompt / TUNING.md 的 (-0.3, cap] 一致：模型给恰好等于上界
         # 的值（如 0.65）不该被误拒触发无谓 retry
         if not all(isinstance(m, (int, float)) and -0.3 < m <= m_cap for m in s["margins"]):
@@ -155,14 +187,41 @@ def _validate_judgment(d: dict, mode: str = "standard",
             raise ValueError(f"{sc}.wacc 越界")
         if s["wacc"] - s["tg"] < 0.045:
             raise ValueError(f"{sc}: wacc-tg 需 >= 0.045")
-        if not 0 < s["opm"] < 0.95 or not 0 <= s["tax"] < 0.5:
-            raise ValueError(f"{sc}: opm/tax 越界")
+        # opm 下界为 -1.0 而非 0（2026-08-11）：结构性未盈利标的（RKLB TTM 营业利润率
+        # -29%）在 NTM 窗口内不可能翻正，`0 < opm` 让判断层无论怎么答都被拒，两次
+        # retry 后硬失败——这不是漂移防线，是把整类标的挡在门外。亏损照实建模，
+        # 失效的估值腿由下面的 pe/m1/m2 = 0 显式声明（引擎据此把腿剔出综合）。
+        if not -1.0 < s["opm"] < 0.95 or not 0 <= s["tax"] < 0.5:
+            raise ValueError(f"{sc}: opm/tax 越界（opm 需在 (-1.0, 0.95)、tax 在 [0, 0.5)）")
+        # NTM 盈利符号：PE 法与 SOTP 在盈利为负时数学上失效（负 EPS × 正倍数 = 负目标价，
+        # 会静默混进综合）。rev0 缺失时退回按 opm 判断（引擎 op1 与 opm 同号）。
+        _rev1 = rev0 * (1 + s["g"]) if rev0 else None
+        _op1 = _rev1 * s["opm"] if _rev1 is not None else None
+        _pretax1 = _op1 + d["other_income"] if _op1 is not None else None
+        _loss_ni = _pretax1 <= 0 if _pretax1 is not None else s["opm"] <= 0
+        _loss_op = _op1 <= 0 if _op1 is not None else s["opm"] <= 0
         _imp = (s.get("permanent_impairment") is True
                 and str(s.get("impairment_note") or "").strip() != "")
-        if not (4 if _imp else 8) <= s["pe"] <= 60:
-            raise ValueError(f"{sc}.pe 需在 [8, 60]——低于 8x 的『目标 PE』属于崩盘/永久受损"
-                             "定价，须设 permanent_impairment=true + impairment_note（下限放宽至 4）")
-        if not 0 <= s["m1"] <= 60 or not 0 <= s["m2"] <= 60:
+        if _loss_ni:
+            # 亏损情景下税率必须为 0：引擎的 ni1 = 税前 × (1-tax) 会把亏损按税率**缩小**，
+            # 等于给亏损打折——递延所得税资产不是当期现金流，不在本模型口径内
+            if s["tax"] != 0:
+                raise ValueError(f"{sc}: NTM 税前为负（营业利润率 {s['opm']:.1%}），"
+                                 "tax 必须为 0——(1-tax) 会把亏损按税率缩小")
+            if s["pe"] != 0:
+                raise ValueError(f"{sc}: NTM 盈利为负，目标 PE 必须写 0（PE 法不适用；"
+                                 "负 EPS × 正倍数 = 负目标价）。引擎会把该腿剔出综合")
+        elif not (4 if _imp else pe_floor) <= s["pe"] <= 60:
+            raise ValueError(
+                f"{sc}.pe 需在 [{pe_floor:g}, 60]——低于下限的『目标 PE』属于崩盘/永久受损"
+                "定价，须设 permanent_impairment=true + impairment_note（下限放宽至 4）"
+                + ("" if pe_floor != 8.0 else
+                   "；历史 NTM 带子窗 P50×1.15<8 的低倍数票下限会自动放宽至 max(4, 0.6×子窗P10)"))
+        if _loss_op:
+            if s["m1"] != 0 or s["m2"] != 0:
+                raise ValueError(f"{sc}: NTM 营业利润为负，m1/m2 必须写 0"
+                                 "（EV/EBIT 对负 EBIT 不适用）。引擎会把 SOTP 腿剔出综合")
+        elif not 0 <= s["m1"] <= 60 or not 0 <= s["m2"] <= 60:
             raise ValueError(f"{sc}.m1/m2 需在 [0, 60]")
         for k in ("g", "g0"):
             if not -0.35 < s[k] < 0.9:
@@ -188,13 +247,16 @@ def _validate_judgment(d: dict, mode: str = "standard",
             # m2 仅在真双分部（次分部倍数非 0）时参与——它在 seg1_share<0.85 时
             # 承担近半 SOTP 权重，同样是独立采样漂移通道
             for key in (("pe", "m1", "m2") if sb.get("m2", 0) > 0 else ("pe", "m1")):
-                if (r_bear < 0.8 and sb[key] < 0.6 * ss[key] and not _exempt(sb)):
+                # 亏损情景的倍数按规定写 0（见上），此时 r<0.8 与「倍数 < 0.6×base」
+                # 恒同时成立——反双重计数会把"倍数腿已声明失效"误报成漂移
+                if (eps["bear"] > 0 and r_bear < 0.8
+                        and sb[key] < 0.6 * ss[key] and not _exempt(sb)):
                     raise ValueError(
                         f"bear 双重计数：情景盈利已较 base 收缩至 {r_bear:.0%}，{key} 又 "
                         f"< 0.6×base——谷底盈利×谷底倍数会把周期惩罚计两次。请上调 bear.{key}"
                         "（市场对可修复的谷底给看穿周期的倍数），或判断为永久受损时设 "
                         "permanent_impairment=true 并在 impairment_note 给原文出处")
-                if r_bull > 1.25 and su[key] > 1.4 * ss[key]:
+                if eps["bull"] > 0 and r_bull > 1.25 and su[key] > 1.4 * ss[key]:
                     raise ValueError(
                         f"bull 双重计数：情景盈利已较 base 扩张至 {r_bull:.0%}，{key} 又 "
                         f"> 1.4×base——景气顶点市场收敛倍数而非扩张。请下调 bull.{key}")
@@ -300,6 +362,57 @@ def _find_claude() -> str:
     raise RuntimeError(f"找不到 claude CLI：{hint}，然后设置环境变量 CLAUDE_CLI_PATH 指向它")
 
 
+class JudgmentAuthError(RuntimeError):
+    """判断层未登录/登录失效——与普通失败区分开，前端据此给「登录」按钮。"""
+
+
+def _auth_state() -> dict:
+    """尽力而为地判断本机 Claude Code 是否还登录着。
+
+    返回 {"ok": bool, "reason": str}。**只在能确凿判定"没登录"时返回 False**：
+    读不到文件、格式不认识、macOS 走 Keychain——一律 ok=True 放行，让真正的
+    调用去报错。探测的价值是"1 秒失败"而不是"替 CLI 做鉴权"，误拦比漏拦贵得多。
+    """
+    try:
+        if not _CRED_PATH.exists():
+            return {"ok": True, "reason": "无凭证文件（macOS 走 Keychain，或用 API key）"}
+        d = json.loads(_CRED_PATH.read_text(encoding="utf-8"))
+    except Exception as e:  # noqa: BLE001 —— 探测失败不许影响主流程
+        return {"ok": True, "reason": f"凭证探测跳过（{e!r:.80}）"}
+    oauth = d.get("claudeAiOauth")
+    if not isinstance(oauth, dict):
+        return {"ok": True, "reason": "凭证结构不认识，交给 CLI 判断"}
+    # 实测过的失效形态：token 被清空成 ""、expiresAt 归 0。此时 CLI 报
+    # "OAuth session expired and could not be refreshed"——没有 refresh token
+    # 可用，refresh 无从谈起，只能重新登录
+    if not oauth.get("accessToken") and not oauth.get("refreshToken"):
+        return {"ok": False, "reason": "凭证已被清空（accessToken/refreshToken 均为空）"}
+    exp = oauth.get("refreshTokenExpiresAt")
+    if isinstance(exp, (int, float)) and exp and exp / 1000 < time.time():
+        return {"ok": False, "reason": "refresh token 已过期"}
+    return {"ok": True, "reason": "凭证在位"}
+
+
+def _login_argv() -> list[str] | None:
+    """弹出一个交互式终端跑 `claude /login`。返回 None 表示本平台不支持自动弹窗。
+
+    命令是写死的（只嵌入 _find_claude() 的结果），不接受任何请求参数——这个端点
+    只在本机开发服务里存在，但仍然不给它拼接外部输入的机会。
+    """
+    exe = _find_claude()
+    if os.name == "nt":
+        # start 需要一个标题占位参数，否则带引号的路径会被当成标题
+        return ["cmd", "/c", "start", "Claude 登录", "cmd", "/k", exe, "/login"]
+    if sys.platform == "darwin":
+        return ["osascript", "-e",
+                f'tell application "Terminal" to do script "{exe} /login"',
+                "-e", 'tell application "Terminal" to activate']
+    for term in ("x-terminal-emulator", "gnome-terminal", "konsole", "xterm"):
+        if shutil.which(term):
+            return [term, "-e", f"{exe} /login"]
+    return None
+
+
 async def _claude(prompt: str) -> str:
     # VALUATION_JUDGMENT_CMD 可替换判断层命令（测试注入 / 将来切 Anthropic API）
     # VALUATION_MODEL 可换判断层模型：opus(默认) / sonnet / fable，或完整模型 ID。
@@ -321,7 +434,12 @@ async def _claude(prompt: str) -> str:
         proc.kill()
         raise RuntimeError(f"claude -p 超时（{CLAUDE_TIMEOUT}s）")
     if proc.returncode != 0:
-        raise RuntimeError("claude -p 失败: " + (err or out).decode("utf-8", "ignore")[-500:])
+        msg = (err or out).decode("utf-8", "ignore")[-500:]
+        # 登录失效单独成类：它是"去点一下登录"就能解决的状态问题，不该和
+        # "模型输出跑偏"混在同一段红字里，前端要据此给按钮
+        if _AUTH_PAT.search(msg):
+            raise JudgmentAuthError("判断层未登录或登录已失效: " + msg)
+        raise RuntimeError("claude -p 失败: " + msg)
     return out.decode("utf-8", "ignore")
 
 
@@ -334,14 +452,27 @@ def _parse_json(text: str) -> dict:
 
 
 def _add_months(d: date, n: int) -> date:
-    """加 n 个月，落在不存在的日期时退到当月最后一天（3-31 + 1月 -> 4-30）。"""
+    """加 n 个月，落在不存在的日期时退到当月最后一天（3-31 + 1月 -> 4-30）。
+
+    **月末进月末**（end-of-month 约定，2026-08-17 修）：输入本身是所在月最后一天时，
+    结果取目标月最后一天。此前只做"日不存在才回退"，于是 9-30 + 3月 = 12-30 而不是
+    12-31——日历季末的公司做 PENDING_10Q 前滚一个季度后，TTM 末端差了一天，
+    fwd_window 的财年对齐判据就认不出"NTM 正好是下一个完整财年"（实测
+    Dec-FY 公司 Q3 前滚后被判 aligned=False，窗口写成 2026-12-31~2027-12-30）。
+    非月末输入（AAPL 这类 52/53 周财历的 6-27）不受影响，行为逐位不变。
+
+    只用 date/timedelta（不引 calendar）：tests/test_pure.py 按 AST 抽取本函数源码后
+    在只注入这两个名字的命名空间里 exec，多一个模块级依赖就会 NameError。
+    """
+    def _eom(yy: int, mm: int) -> date:      # 该年月的最后一天
+        return date(yy + (mm == 12), mm % 12 + 1, 1) - timedelta(days=1)
+
     y, m = divmod(d.year * 12 + (d.month - 1) + n, 12)
-    for day in range(d.day, 27, -1):     # 27 一定存在，最多回退 4 天
-        try:
-            return date(y, m + 1, day)
-        except ValueError:
-            continue
-    return date(y, m + 1, d.day)
+    m += 1
+    last_out = _eom(y, m).day
+    if d.day == _eom(d.year, d.month).day:
+        return date(y, m, last_out)
+    return date(y, m, min(d.day, last_out))
 
 
 def fwd_window(ttm_end: str, fy_end: str, rolled_quarters: int = 0) -> dict:
@@ -375,8 +506,29 @@ def fwd_window(ttm_end: str, fy_end: str, rolled_quarters: int = 0) -> dict:
     start, end = te + timedelta(days=1), _add_months(te, 12)
     out = {"start": start.isoformat(), "end": end.isoformat()}
 
-    # 财年末对齐判断：月-日相同即说明 TTM 窗口正好是一个完整财年，NTM 也就正好是下一个
-    if fy_end and fy_end[5:] == te.isoformat()[5:]:
+    # 财年末对齐判断：TTM 窗口正好是一个完整财年时，NTM 也就正好是下一个。
+    #
+    # 不能要求月-日**精确**相等（2026-08-17 修）：52/53 周财历的公司（AAPL 财年末
+    # = 9 月最后一个周六）每年的财年末日期本身就在漂移，2025 是 09-27、2026 是
+    # 09-26——精确比较会把"这份 TTM 就是完整 FY2026"判成不对齐，label 里写成横跨
+    # 两个财年，判断层于是拿到一个自相矛盾的前瞻期口径。容差取 ±4 天：52/53 周
+    # 财历相邻年度最多差 7 天但同向漂移通常 1-2 天，4 天足够覆盖且远小于一个季度，
+    # 不会把真正横跨的窗口（差一个季度以上）误判成对齐。
+    _aligned = False
+    if fy_end:
+        try:
+            _fy = date.fromisoformat(fy_end)
+            # 把财年末搬到 te 所在年份再比，避免跨年比较把 12-31 vs 01-01 算成差 364 天
+            for _y in (te.year, te.year - 1, te.year + 1):
+                try:
+                    if abs((te - _fy.replace(year=_y)).days) <= 4:
+                        _aligned = True
+                        break
+                except ValueError:
+                    continue    # 2-29 搬到平年
+        except ValueError:
+            _aligned = fy_end[5:] == te.isoformat()[5:]
+    if _aligned:
         out["aligned"] = True
         out["straddle"] = f"= FY{end.year} 完整财年"
     else:
@@ -461,6 +613,13 @@ def _compact_facts_financials(facts: dict) -> str:
 async def _pipeline(job: dict, ticker: str, email: str) -> None:
     wd = Path(job["dir"])
     today = date.today().isoformat()
+
+    # 判断层登录探测放在第一步：④ 之前的取数/下载要跑好几分钟，登录失效却要等到
+    # ⑤ 才暴露——用户白等一轮，SEC 也白请求一轮。探测只在能确凿判定未登录时拦。
+    job["step"] = "preflight"
+    _auth = _auth_state()
+    if not _auth["ok"]:
+        raise JudgmentAuthError(f"判断层未登录（{_auth['reason']}）")
 
     job["step"] = "facts"
     await _run([PY, str(VAL / "fetch_facts.py"), ticker, str(wd / "facts.json"), email], wd)
@@ -596,8 +755,9 @@ async def _pipeline(job: dict, ticker: str, email: str) -> None:
                 stale = None
                 if prev.get("ticker") != ticker:
                     stale = "标的不符"
-                elif prev.get("semantics_version", 1) != 2:
-                    stale = f"语义版本 v{prev.get('semantics_version', 1)} != v2"
+                elif prev.get("semantics_version", 1) != (3 if mode == "standard" else 2):
+                    stale = (f"语义版本 v{prev.get('semantics_version', 1)} != "
+                             f"v{3 if mode == 'standard' else 2}")
                 elif prev.get("manifest_latest") and latest_report \
                         and prev["manifest_latest"] != latest_report:
                     stale = f"出现新报告期 {latest_report}（上次基于 {prev['manifest_latest']}）"
@@ -639,7 +799,13 @@ async def _pipeline(job: dict, ticker: str, email: str) -> None:
     # 直接锚全窗会把泡沫倍数抬进锚。与连续性纪律同哲学：无证据不偏离。
     band_meta = ""
     _b = facts.get("pe_band") or {}
-    if mode == "standard" and _b.get("pctiles"):
+    if mode == "standard" and _b.get("thin_coverage"):
+        # 覆盖不足：不给锚（薄样本的 P50 没有话语权），但显式告诉判断层"没有锚"——
+        # 沉默会让它自由发挥还以为有历史背书
+        band_meta = (f"\n历史 NTM PE 带覆盖不足（仅 {_b.get('days')} 个交易日/"
+                     f"{_b.get('years')} 年，原始数据缺口）——**本次无历史锚**：目标 PE 按"
+                     "基本面第一性与可比经验判断，并在 rationale.pe 写明定价依据。")
+    elif mode == "standard" and _b.get("pctiles"):
         _rc = _b.get("recent") or {}
         _rp = _rc.get("pctiles") or {}
 
@@ -653,14 +819,55 @@ async def _pipeline(job: dict, ticker: str, email: str) -> None:
             f"\n  全窗近{_b['years']}年: {_pfmt(_b['pctiles'])}（{_b['days']}天）"
             + (f"\n  近{_rc['years']}年子窗: {_pfmt(_rp)}（{_rc['days']}天）" if _rp else "")
             + f"\n  ← base 情景目标 PE **默认锚{_anchor_win} P50**；bear/bull 参照"
-              " P25/P75 量级再叠加各自情景的盈利假设。偏离锚 ±15% 以上必须在"
-              " rationale.pe 给出财报证据（增长/利润率结构变化、资本回报变化等），"
-              "『保守起见』类无证据折价不接受——那会系统性压低所有标的。"
+              " P25/P75 量级再叠加各自情景的盈利假设（量级参照，不受下述 ±15% 纪律"
+              "约束）。**base** 偏离 P50 ±15% 以上必须在 rationale.pe 给出财报证据"
+              "（增长/利润率结构变化、资本回报变化等），『保守起见』类无证据折价"
+              "不接受——那会系统性压低所有标的。"
               "\n  若下方给出「上一次运行的假设（连续性基准）」，连续性优先——"
               "本锚只约束首次基线与失锚重建。")
+    # financials 的锚是 P/TBV 带（图3 的教科书结论：银行 E 带杠杆带周期，估值锚
+    # 是 P/B 系）——与 standard 的 PE 锚同一纪律结构，锚 s["ptbv"]
+    _tb = facts.get("ptbv_band") or {}
+    if mode == "financials" and _tb.get("thin_coverage"):
+        band_meta = (f"\n历史 P/TBV 带覆盖不足（仅 {_tb.get('days')} 个交易日）——本次无历史锚："
+                     "目标 P/TBV 按 ROTE/资本回报第一性判断，并在 rationale.ptbv 写明依据。")
+    elif mode == "financials" and _tb.get("pctiles"):
+        _rc2 = _tb.get("recent") or {}
+        _rp2 = _rc2.get("pctiles") or {}
+
+        def _pfmt2(pp):
+            return " / ".join(f"P{q} {pp[str(q)]:.2f}x" for q in (10, 25, 50, 75, 90)
+                              if str(q) in pp)
+        _aw2 = f"近{_rc2['years']}年" if _rp2 else f"近{_tb['years']}年"
+        band_meta = (
+            f"\n历史 P/TBV 带（trailing 口径，分母=当日已知每股有形账面价值，"
+            "与引擎 tbv_ps 同构）："
+            f"\n  全窗近{_tb['years']}年: {_pfmt2(_tb['pctiles'])}（{_tb['days']}天）"
+            + (f"\n  近{_rc2['years']}年子窗: {_pfmt2(_rp2)}（{_rc2['days']}天）" if _rp2 else "")
+            + f"\n  ← base 情景目标 P/TBV **默认锚{_aw2} P50**；bear/bull 参照 P25/P75"
+              " 量级再叠加各自情景的 ROTE/信贷假设。**base** 偏离 P50 ±15% 以上必须在"
+              " rationale.ptbv 给出财报证据（ROTE 结构变化、信贷周期位置、资本行动等）。"
+              "\n  若下方给出「上一次运行的假设（连续性基准）」，连续性优先。")
+    # Rule of 40（fetch_facts 计算）：营收增速+利润率，「高倍数值不值得给」的对照
+    # 标尺——分数高支撑倍数带上沿，分数低而倍数高 = 增速在烧钱换。给判断层做
+    # pe/g 组合合理性的参照，不是硬规则（校验层不执法）。
+    ro40_meta = ""
+    _r40 = facts.get("rule_of_40") or {}
+    if mode == "standard" and (_r40.get("score_op") is not None
+                               or _r40.get("score_fcf") is not None):
+        ro40_meta = (
+            "\nRule of 40（TTM）：营收增速 " + f"{_r40.get('rev_g_ttm', 0):+.1%}"
+            + (f" + 营业利润率 {_r40.get('opm_ttm', 0):.1%} = {_r40['score_op']:.0f} 分"
+               if _r40.get("score_op") is not None else "（营业利润无数据，OP 口径缺）")
+            + (f"；FCF 口径 {_r40['score_fcf']:.0f} 分" if _r40.get("score_fcf") is not None else "")
+            + (f"（剔 SBC 后 {_r40['score_fcf_ex_sbc']:.0f} 分，SBC 占营收 "
+               f"{_r40['sbc_margin_ttm']:.1%}）" if _r40.get("score_fcf_ex_sbc") is not None else "")
+            + (f"\n  ⚠ 口径注意：{_r40['caliber_note']}" if _r40.get("caliber_note") else "")
+            + "\n  ← 软件/平台类 >40 算优秀。用作 pe/g 组合合理性的对照：分数低于 40"
+              " 而你给的目标倍数落在历史带上沿时，rationale.pe 里要说清为什么。")
     prompt = (f"{base_prompt}\n\n# 服务器注入的元数据（不要输出这些字段）\n"
               f"ticker={ticker} name={info['name']} date={today} price={price:.2f} "
-              f"mcap={mcap/1e6:,.0f}M$ shares={shares}M股{fwd_meta}{band_meta}{caliber}\n\n"
+              f"mcap={mcap/1e6:,.0f}M$ shares={shares}M股{fwd_meta}{band_meta}{ro40_meta}{caliber}\n\n"
               f"# FACTS（SEC XBRL）\n{_compact_facts(facts)}\n\n"
               f"# MANIFEST（本次分析的财报文件）\n{manifest}\n\n"
               f"# SECTIONS（财报关键章节摘录 JSON）\n{sections}{prev_section}\n")
@@ -686,7 +893,7 @@ async def _pipeline(job: dict, ticker: str, email: str) -> None:
             judgment = _parse_json(raw)
             _validate_judgment(judgment, mode,
                                rev0=float(judgment.get("ttm_revenue_override") or rev0_m),
-                               fcf_margin=fcfm)
+                               fcf_margin=fcfm, band=facts.get("pe_band"))
             # 陈旧 XBRL（外国发行人 6-K 无季度框架）下，没有原文重锚的 TTM 会让
             # 全部情景锚在多年前的营收基准上——硬性要求判断层给 override。
             # PENDING_10Q（业绩 8-K 已出、10-Q 未交）同理：不重锚等于用上季度
@@ -709,8 +916,11 @@ async def _pipeline(job: dict, ticker: str, email: str) -> None:
     if judgment is None:
         raise RuntimeError(f"判断层输出两次校验失败：{last_err}")
 
-    # semantics_version=2（2026-07-22）：v2 一致性规则/诊断红旗/SOTP 降级口径，
-    # 仅描述 standard 模式（financials 沿用 v1 情景语义，恒为 1）。
+    # semantics_version=3（2026-08-14）：v2 的一致性规则/诊断红旗/SOTP 降级之上，
+    # 纳入判断层 PE 锚（66ad9c4 起注入历史 NTM 带、base 默认锚子窗 P50）——锚改变
+    # base PE 的产生方式与目标价水平，锚前样本与锚后样本混在趋势视图里聚合会把
+    # 语义变化读成基本面修正，必须靠版本号隔开。仅描述 standard 模式
+    # （financials 沿用 v1 情景语义，恒为 1）。
     # manifest_latest 直接进 cfg：bundle 里的 config_假设留档.json 与自动锚同源，
     # 显式 VALUATION_PREV_CONFIG 指向 bundle config 时报告期失效触发器才有指纹可查
     def _build_cfg(j: dict) -> dict:
@@ -724,8 +934,12 @@ async def _pipeline(job: dict, ticker: str, email: str) -> None:
                  price=round(price, 2), mcap=round(mcap / 1e6), shares=shares,
                  mode=mode, adr_multiple=adr_multiple,
                  currency=facts.get("currency", "USD"),
-                 semantics_version=2 if mode == "standard" else 1,
-                 manifest_latest=latest_report)
+                 semantics_version=3 if mode == "standard" else 2,
+                 manifest_latest=latest_report,
+                 # PENDING_10Q 标记进 cfg：engine 据此把 vintage 归档键前滚到 8-K
+                 # 覆盖的季度（fwd_window 已 +3 个月），否则这次运行会归进旧
+                 # report_end 的格子，趋势视图把"最新业绩下的估值"错当旧季度样本
+                 pending_10q=bool(pending_8k))
         # fwd_label 是可由 report_end 纯日期推导的事实，与 price/shares 同类：
         # 在此**覆盖**判断层的输出，让"选错财年"这个失败模式从构造上不存在。
         # 判断层若仍输出了该字段，静默被盖掉即可——prompt 已明确要求不要输出。
@@ -770,7 +984,7 @@ async def _pipeline(job: dict, ticker: str, email: str) -> None:
             revised = _parse_json(await _claude(retry_p))
             _validate_judgment(revised, mode,
                                rev0=float(revised.get("ttm_revenue_override") or rev0_m),
-                               fcf_margin=fcfm)
+                               fcf_margin=fcfm, band=facts.get("pe_band"))
             # 陈旧 XBRL / PENDING_10Q 的强制 override 在复审通道同样成立——revised
             # 整体替换 judgment，若复审输出丢掉 override，全部情景会锚回旧营收基准
             if ((stale_days > 550 or pending_8k)
@@ -842,6 +1056,10 @@ async def _run_job(job_id: str, ticker: str, email: str) -> None:
     job = _jobs[job_id]
     try:
         await _pipeline(job, ticker, email)
+    except JudgmentAuthError as e:
+        # error_kind 让前端能给出「登录」按钮而不是只显示一段无从下手的红字
+        job.update(status="failed", error_kind="auth",
+                   error=f"[{STEP_LABELS.get(job.get('step'), job.get('step'))}] {e}")
     except Exception as e:  # noqa: BLE001 —— 任何一步失败都要报给前端
         job.update(status="failed", error=f"[{STEP_LABELS.get(job.get('step'), job.get('step'))}] {e}")
     finally:
@@ -868,6 +1086,41 @@ async def create_valuation(req: ValuationRequest):
     _bg_tasks.add(task)
     task.add_done_callback(_bg_tasks.discard)
     return {"job_id": job_id}
+
+
+@router.get("/api/valuation/auth")
+async def valuation_auth():
+    """判断层登录状态。前端在弹出登录窗口后轮询它，登录完成即可重试。"""
+    st = _auth_state()
+    try:
+        st["cli"] = _find_claude()
+    except RuntimeError as e:
+        st = {"ok": False, "reason": str(e), "cli": None}
+    st["can_popup"] = bool(st.get("cli")) and _login_argv() is not None
+    return st
+
+
+@router.post("/api/valuation/login")
+async def valuation_login():
+    """在本机弹出一个交互式终端跑 `claude /login`。
+
+    只能这样做：`claude -p` 是无头模式，登录本身是交互流程（要开浏览器做 OAuth
+    并回填），没法在无头子进程里完成。所以"弹窗登录"= 起一个真终端窗口交给用户，
+    登录完成后前端轮询 /api/valuation/auth 转绿即可重试。
+    命令写死，不接受任何请求参数。
+    """
+    argv = _login_argv()
+    if argv is None:
+        raise edgar.EdgarError(
+            501, "本平台无法自动弹出终端，请手动开一个终端运行： claude /login")
+    try:
+        # 不等它结束：这个终端窗口会一直开着直到用户登录完
+        await asyncio.create_subprocess_exec(
+            *argv, stdout=asyncio.subprocess.DEVNULL, stderr=asyncio.subprocess.DEVNULL)
+    except OSError as e:
+        raise edgar.EdgarError(500, f"启动登录终端失败：{e}") from e
+    return {"started": True,
+            "hint": "已弹出终端窗口，在其中完成登录后回到本页点「重试」"}
 
 
 @router.get("/api/valuation/{job_id}")

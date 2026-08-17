@@ -76,26 +76,40 @@
       假设全部为可调黄色格、公式联动）+ `verify_report.py` 独立复算验证
 - [x] 用户级 Claude Code skill `/valuation TICKER` 串起全流程（LLM 只做判断层：定假设+注出处）
 - [x] 已产出样例：META / NVDA / MU（reports/，不入库）
-- [x] **历史 PE 分位带** `valuation/pe_band.py`（2026-08-05 实装）：XBRL 净利÷稀释股数
-      × yfinance 日收盘 → 逐日 PE → 分位数/σ 带 + `--match lo,hi` 逆向匹配。
-      两种口径不可混用：`forward`（分母=该财年最终实现 EPS，刻意用后见之明，
-      对标"财年交易区间"类预测）与 `trailing`（分母=当日已公告滚动四季 EPS），
-      两者中位数之比≈期间 EPS 增速（实测 MSFT 1.17x / META 1.21x / AMZN 1.34x）。
-      三个静默坑已处理：可知日必须取 filed **最早**（取最新会让旧季度标成两年后才可知，
-      整条序列退化成"远古 EPS 除当期价格"，MSFT 中位 PE 被算成 43 而非 34）；
-      Q4 股数用 `4×FY−Σ前三季` 补（均值式成立，和式不成立）；年度期间需按 `fp=="FY"`
-      过滤（AMZN 每季申报 twelve-months-ended，只按天数过滤会把财年切成四段）。
-      已接入：`fetch_facts.py` 写入 `facts.pe_band`，`engine.py:pe_band_check` 输出
-      `diagnostics.pe_vs_history` 并在越界时报 yellow。`VALUATION_NO_PE_BAND=1` 可关。
-- [ ] `pe_band_check` 接 financials 模式：该模式 scenario dict 无 `warnings` 通道
-      （engine.py:135-144），要连带改 build_report 的红旗区渲染
+- [x] **历史 PE 分位带** `valuation/pe_band.py`（2026-08-05 实装，其后多轮加固）：
+      XBRL 净利÷稀释股数 × yfinance 日收盘 → 逐日 PE → 分位数/σ 带 + `--match` 逆向匹配。
+      三种口径不可混用：`ntm`（分母=该日已知最新 TTM 期末之后 12 个月实现的 EPS，
+      与 engine 前瞻期严格同源——**生产在用的口径**，锚/交易区间/中枢检查都走它）、
+      `forward`（分母=该财年最终实现 EPS，刻意后见之明，对标"财年交易区间"类预测）、
+      `trailing`（分母=当日已公告滚动四季 EPS）；forward/trailing 中位数之比≈期间
+      EPS 增速（实测 MSFT 1.17x / META 1.21x / AMZN 1.34x）。
+      四个静默坑已处理：可知日必须取 filed **最早**（取最新会让旧季度标成两年后才可知，
+      MSFT 中位 PE 被算成 43 而非 34）；Q4 股数用 `4×FY−Σ前三季` 补（均值式成立，
+      和式不成立）；年度期间需按 `fp=="FY"` 过滤（AMZN 每季申报 twelve-months-ended）；
+      分母趋零日按「EPS < 窗口中位 25%」剔除（AMZN 2022 型 300x 假读数）。
+      另有：一次性畸变窗口双侧剔除（ANOM_K=1.25，AMZN Anthropic 重估校准）、
+      近 3 年子窗分位（避 2021 regime，锚/交易区间用它）、拆股口径**逐条 filed 判定**
+      归一（2026-08-14：重述是逐条的，整段跳变探测在 NVDA 10:1 上漏掉未重述旧期，
+      band min 5.1→修复后 17.9；反拆股象限旧判据恒真会把重述好的序列再乘 0.1）。
+      已接入：`fetch_facts.py` 写入 `facts.pe_band`；`engine.py:pe_band_check`
+      输出 `diagnostics.pe_vs_history`（base 中枢=子窗 [P10,P90]∪P50±15%）；
+      判断层 base PE 锚子窗 P50（valuation_service 注入）；交易区间行（摘要 27 行起）。
+      `VALUATION_NO_PE_BAND=1` 可关。
+- [x] `pe_band_check` 接 financials 模式（2026-08-14 实装）：financials 情景开通
+      warnings/diagnostics 通道，P/TBV 带检查复用同一套逻辑（label 参数化），
+      build_report 金融股摘要增红旗区
 - [ ] **观察项：全窗 min/max 那条「从未出现过的倍数」检查是否已过松**（2026-08-10 记，
       先不改，攒观察）。一次性畸变剔除那版把 `ntm` 从 `ttm_eps>0` 的嵌套里解了出来
       （分母是未来窗口的 EPS，与当前已知 TTM 正负无关，负 TTM 期恰是周期底）——
-      口径上是对的，副作用是低 EPS 日回流：AMZN 全窗 max 从 58x 涨到 114x，
-      于是 `band["min"] <= pe <= band["max"]` 这条黄旗的上界被单点带高，
-      实际上只对荒谬值还有约束力。**锚与交易区间不受影响**（都走近 3 年子窗），
-      base 中枢检查也已改成子窗 [P10,P90] ∪ P50±15%，所以当前无实际损害。
+      口径上是对的。AMZN 全窗 max 58x→114x 的回流有两个机制叠加：主因是
+      畸变窗剔除拉低了 near-zero 地板的中位基准（floor=0.25×窗口中位 EPS，
+      剔除畸变窗后中位下移、地板跟着下移，原被地板挡住的低 EPS 日回流），
+      解嵌套是次因——于是 `band["min"] <= pe <= band["max"]` 这条黄旗的上界被
+      单点带高，实际上只对荒谬值还有约束力。**锚与交易区间不受影响**（都走
+      近 3 年子窗），base 中枢检查也已改成子窗 [P10,P90] ∪ P50±15%；但注意
+      全窗分位并非无人消费——prompt 的全窗参照行、Excel 的 full_window_p50
+      对照、子窗样本不足时的回退路径都读它，低 EPS 日回流同样移动全窗
+      P10-P90，损害有限但不为零。
       要观察的是：bear/bull 是否出现过"离谱但因为全窗 max 被撑大而没打旗"的案例。
       若确认，候选改法是这条也改用子窗 min/max，或对全窗 min/max 先做分位裁剪
       （如 P1/P99）——但那会削弱"从未出现过"这句话的字面含义，需要一并想清楚措辞。

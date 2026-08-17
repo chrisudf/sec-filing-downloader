@@ -85,21 +85,46 @@ def main():
         used = [s for s in r["samples"] if a.include_flagged or s.get("gate_clean")]
         dropped = len(r["samples"]) - len(used)
 
-        # 前瞻口径必须一致才能聚合：同一份财报下，判断层可能把"下一财年"理解成
-        # 本财年(FY2026E)或下一整年(FY2027E)——12 月财年的公司在 Q2 报告期尤其
-        # 容易分歧（AMZN 2026-06-30 实测 3 次里 1 次 FY2026E、2 次 FY2027E）。
-        # 两者差整整一年增长，混在一格取中位数得到的是无意义的数。
-        # 处理：按 fwd_label 分组，只聚合最大的一组，其余显式报告。
+        # 口径一致才能聚合，两个维度都要看：
+        # ① fwd_label——历史样本（fwd_label 服务端派生之前的运行）可能把"下一财年"
+        #   理解成不同年份（AMZN 2026-06-30 实测 3 次裂成 FY2026E/FY2027E，差一整年
+        #   增长）；派生化之后新样本组内恒一致，分裂只会来自旧样本。
+        # ② semantics_version——语义版本改变判断层输出的产生方式（v3 起 base PE 锚
+        #   历史带子窗 P50），锚前/锚后样本混在一格取中位数会把语义变化读成基本面
+        #   修正。vintages 每个样本都存了版本号，这里必须消费它（存而不用是十七期
+        #   review 的 P1-4）。
+        # 处理：按 (fwd_label, semantics_version) 复合键分组，只聚合最大组，其余显式报告。
         mixed = None
         if used:
             groups = {}
             for s in used:
-                groups.setdefault(s.get("fwd_label") or "?", []).append(s)
+                # 旧金融股样本无 semantics_version（engine 当时不输出）→ 视为 v1；
+                # standard 样本自 vintages 引入起恒有值，不受影响
+                _k = (f"{s.get('fwd_label') or '?'}"
+                      f"｜v{s.get('semantics_version') or 1}")
+                # blend 权重非默认也是口径（等权与缺省视为同一组，兼容旧样本）
+                _bw = {k: v for k, v in (s.get("blend_weights") or {}).items()
+                       if isinstance(v, (int, float)) and abs(v - 1) > 1e-9}
+                if _bw:
+                    _k += "｜w=" + ":".join(f"{k}{v:g}" for k, v in sorted(_bw.items()))
+                # 参与综合的**腿集合**同样是口径，而上面的权重归一化恰好把它抹平了
+                # （PR #3 review）：等权三腿与等权两腿都产出空 _bw。两处来源——
+                #   1) 该情景的 blend_methods：近零/负利润守卫逐情景剔 PE/SOTP 腿，
+                #      DCF 独腿的 blend 与 PE/DCF 均值的 blend 不是一个东西
+                #   2) sotp_in_blend：seg1_share 跨 0.85 门槛导致 SOTP 进/出综合
+                # 两者都缺（本次改动之前归档的老样本）时不进 key——无法追溯的数据
+                # 不该拆组，否则新旧样本会因"字段缺失"这一非口径原因分裂。
+                _bm = (s.get("scenarios") or {}).get(SC, {}).get("blend_methods")
+                if _bm:
+                    _k += "｜m=" + "/".join(sorted(_bm))
+                elif s.get("sotp_in_blend") is not None:
+                    _k += "｜sotp=" + ("in" if s["sotp_in_blend"] else "ref")
+                groups.setdefault(_k, []).append(s)
             if len(groups) > 1:
                 mixed = {k: len(v) for k, v in groups.items()}
                 ranked = sorted(groups, key=lambda k: len(groups[k]), reverse=True)
-                # 无严格多数（如 1:1）时拒绝聚合：任意挑一边等于把口径分歧藏起来，
-                # 而这个分歧恰恰是要修的东西（判断层 prompt 没把"下一财年"钉死）。
+                # 无严格多数（如 1:1）时拒绝聚合：任意挑一边等于把口径分歧藏起来。
+                # 有严格多数时取最大组聚合，其余样本显式报告为未计入。
                 used = (groups[ranked[0]]
                         if len(groups[ranked[0]]) > len(groups[ranked[1]]) else [])
         if not used:
@@ -110,6 +135,7 @@ def main():
         rows.append({
             "report_end": r["report_end"], "n": n, "dropped": dropped, "mixed": mixed,
             "fwd_label": used[0].get("fwd_label"),
+            "semantics": used[0].get("semantics_version") or 1,
             "blend": blend, "blend_sd": sd,
             "eps1": agg(used, SC, "eps1")[0], "pe": agg(used, SC, "pe")[0],
             "pe_pctile": agg(used, SC, "pe_pctile")[0],
@@ -133,9 +159,10 @@ def main():
         if not r["n"]:
             if r.get("mixed"):
                 detail = "，".join(f"{k} {v}次" for k, v in r["mixed"].items())
-                print(f"{r['report_end']:<12}{0:>3}   ⛔ 前瞻口径分裂且无多数（{detail}）"
-                      f"——差一整年增长，拒绝聚合。请先在判断层 prompt 里钉死"
-                      f"「下一财年」的定义再重跑"
+                print(f"{r['report_end']:<12}{0:>3}   ⛔ 口径分裂且无多数（{detail}）"
+                      f"——拒绝聚合。fwd_label 已由服务器派生（2026-08-06 起），"
+                      f"分裂通常来自派生前的旧样本或语义版本混杂：同一 report_end "
+                      f"里补跑 ≥2 次当前版本即可形成多数"
                       + (f"（另有 {r['dropped']} 次带 red 红旗已排除）" if r["dropped"] else ""))
             else:
                 print(f"{r['report_end']:<12}{0:>3}   （{r['dropped']} 次运行全部带 red 红旗，已排除）")
@@ -151,8 +178,8 @@ def main():
             print(f"{'':<12}   （另有 {r['dropped']} 次带 red 红旗已排除）")
         if r.get("mixed"):
             detail = "，".join(f"{k} {v}次" for k, v in r["mixed"].items())
-            print(f"{'':<12}   ⛔ 前瞻口径不一致（{detail}）——差一整年增长，不可混合聚合。"
-                  f"已只取最大组「{r['fwd_label']}」，其余样本未计入")
+            print(f"{'':<12}   ⛔ 口径不一致（{detail}）——前瞻窗口或语义版本不同的"
+                  f"样本不可混合聚合。已只取最大组「{r['fwd_label']}」，其余样本未计入")
 
     live = [r for r in rows if r["n"]]
     if len(live) >= 2:
@@ -170,6 +197,11 @@ def main():
                 tag = f"|Δ|/SE = {ratio:.2f} → {verdict}"
             else:
                 tag = "样本不足（需每期 ≥2 次运行）→ 无法判定"
+            # 复合键只隔离同格混聚；跨报告期的语义切换（v2→v3 锚上线）表现为
+            # 前后两行版本不同——变化里混着语义变化，显著性判定必须打折说明
+            if p.get("semantics") != q.get("semantics"):
+                tag += (f"  ⚠ 语义 v{p.get('semantics')}→v{q.get('semantics')}，"
+                        "变化含口径成分，先归因语义再谈基本面")
             print(f"  {p['report_end']} → {q['report_end']}  "
                   f"{p['blend']:,.1f} → {q['blend']:,.1f} ({d:+.1%})  |  {tag}")
 

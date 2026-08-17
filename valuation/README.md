@@ -16,7 +16,7 @@ python valuation\engine.py config.json facts.json valuation.json [manifest.csv]
 # 4. 生成六表 Excel（默认 reports/{T}_valuation_{date}.xlsx）
 python valuation\build_report.py valuation.json
 
-# 5. 独立验证（formulas 包重算 16 个关键单元格 vs 引擎）
+# 5. 独立验证（formulas 包重算 16~17 个关键单元格 vs 引擎，交易区间块在时多一项）
 python valuation\verify_report.py valuation.json reports\NVDA_valuation_2026-07-17.xlsx
 ```
 
@@ -28,16 +28,19 @@ python valuation\verify_report.py valuation.json reports\NVDA_valuation_2026-07-
 {
   "ticker": "NVDA", "name": "NVIDIA (英伟达)", "date": "2026-07-17",
   "price": 207.40, "mcap": 5023435,        // $M，yfinance
-  "shares": 24391, "fwd_shares": 24300,    // 百万股：最新稀释 / 下一财年估计
+  "shares": 24391, "fwd_shares": 24300,    // 百万股：最新稀释 / 前瞻期(NTM)估计
   "net_cash": 44000, "net_cash_note": "现金+短期证券-债务，出处…",
   "adj_ni": 137831, "adj_note": "TTM 调整口径说明（还原/剔除了哪些一次性项）",
   "other_income": 2400,                    // 年化其他收益 $M
-  "fwd_label": "FY2027E（至2027-01）",
+  "fwd_label": "NTM 2026-08~2027-07（横跨 FY2027 后段 + FY2028 前段）",
+                                           // 服务器从 report_end 派生并覆盖——判断层不要输出；
+                                           // 前瞻期恒为 NTM 而非财年（见 valuation_service.fwd_window）
+                                           // 手写 config 时照此格式给一个说明性标签即可
   "seg1": "主分部名", "seg2": "次分部名", "seg1_share": 0.95,
-  "semantics_version": 2,                  // v2（2026-07-22）：一致性规则/诊断/SOTP 降级口径
+  "semantics_version": 3,                  // v3（2026-08-14）：v2 之上 base PE 锚历史 NTM 带子窗 P50
   "scenarios": {
     "bear|base|bull": {
-      "g": 0.32,          // 下一财年营收增速 vs TTM
+      "g": 0.32,          // 前瞻期(NTM)营收增速 vs TTM
       "opm": 0.64, "tax": 0.16, "pe": 30,
       "m1": 24, "m2": 15, // 分部 EV/EBIT 倍数
       "wacc": 0.095, "tg": 0.03,
@@ -70,6 +73,30 @@ bear \$37-\$87，根因是判断层对连续参数的独立采样叠加"情景�
   隐含 P/adj_ni 界外 [6,60]、方法离散 >2x、base 偏离现价 >±35% 为 yellow（报告红旗区展示）
 - 引擎输出增加顶层 `semantics_version` 与 meta.sotp_in_blend；v1/v2 config 的
   倍数假设不可直接对比（v1 的 pe 语义相同但无联动约束）
+
+## v3 语义（semantics_version=3，2026-08-14）
+
+- **判断层 PE 锚**（valuation_service 注入）：base 目标 PE 默认锚历史已实现 NTM PE 带
+  近 3 年子窗 P50，偏离 ±15% 须在 rationale.pe 给财报证据；bear/bull 参照 P25/P75 量级。
+  engine.pe_band_check 的 base 中枢检查 = 子窗 [P10,P90] ∪ P50±15% 并集，与纪律同口径
+- **pe 下限带证据自适应**：锚窗 P50×1.15<8 的低倍数票，校验下限自动放宽至
+  max(4, 0.6×锚窗P10)（带子即证据）；无带子回退静态 8
+- 锚改变 base PE 的产生方式与目标价水平：锚前(≤v2)/锚后(v3) 样本在 trend/compare 里
+  按版本隔离，连续性锚跨版本自动失效重建
+- **近零利润守卫**：情景 eps1<=0 或 opm<2% 时 PE 腿 n.m. 退出综合（blend_methods 记录），
+  综合退化为 DCF(+SOTP)，红旗区给 P/S 参考价（facts.ps_band，不入综合）；
+  `op1<=0` 时 SOTP 腿同样剔出（EV/EBIT 对负 EBIT 不成立）
+- **未盈利标的**（2026-08-11）：opm 允许为负（下限 -1.0）；NTM 盈利为负的情景须给
+  `tax=0`、`pe=0`、`m1=m2=0`（倍数法对负分子不成立），校验层强制、prompt 已写明。
+  此前 `0 < opm` 与从负 FCF 率算出的空 margins 区间让这类标的必然两次 retry 后硬失败。
+  引擎按上面的守卫剔腿，综合退化为 DCF；亏损情景跳过历史 PE 带比对（对已声明不适用
+  的倍数比对只会产出必然的黄旗）。详见 `TUNING.md` 的「未盈利标的」
+- **blend 权重政策**：`VALUATION_BLEND_W_PE/_DCF/_SOTP/_PTBV`（默认等权，行为不变）；
+  权重随 valuation.json 进 Excel 公式与 compare/trend——改权重=改口径
+- **Rule of 40 注入**：营收 TTM 增速 + 营业利润率/FCF 口径（剔 SBC 变体）进 prompt
+  元数据与摘要——高倍数值不值得给的对照标尺，不执法
+- **financials v2（2026-08-14）**：base P/TBV 默认锚历史带（时点流通股分母）锚窗 P50
+  ±15% 证据纪律；financials 情景开通 warnings 通道（P/TBV 带检查）
 
 ## 判断层检查清单（写 config 前必做）
 
