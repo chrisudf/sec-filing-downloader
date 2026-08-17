@@ -3,6 +3,7 @@
 import ast
 import json
 import os
+import sys
 from pathlib import Path
 
 # 被测 worktree：SFD_WT 环境变量覆盖；默认取本文件所在 repo 根
@@ -72,3 +73,5 @@ except Exception as e:
 
 print()
 print("FAILS:", fails if fails else "none")
+# 非零退出：此前挂了也 exit 0，自动化无法检出回归
+sys.exit(1 if fails else 0)

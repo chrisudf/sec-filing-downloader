@@ -49,7 +49,7 @@
   "scenarios": {
     "bear": {"g": <前瞻期(NTM,见元数据)总净收入增速vs TTM,小数>, "nm": <净利率=净利/总净收入,小数>,
              "pe": <目标PE,对前瞻期EPS>,
-             "ptbv": <目标P/TBV倍数。元数据给出「历史 P/TBV 带」时:base 默认锚锚窗 P50、
+             "ptbv": <目标P/TBV倍数。元数据给出「历史 P/TBV 带」时:base 默认锚窗 P50、
                       bear/bull 参照 P25/P75 量级,base 偏离 P50±15% 须在 rationale.ptbv 给财报证据>,
              "wacc": <股权资本成本,0.05-0.25>, "tg": <永续增速,须比wacc小至少0.045>},
     "base": {...同结构...}, "bull": {...同结构...}

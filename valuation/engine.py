@@ -12,6 +12,7 @@ justified P/TBV = (ROTE−g)/(WACC−g) 交叉参考）；DCF/SOTP 对金融股�
 import csv
 import io
 import json
+import math
 import os
 import sys
 from datetime import date, timedelta
@@ -31,9 +32,15 @@ MODE = cfg.get("mode", facts.get("mode", "standard"))
 # 权重随 valuation.json（blend_weights）进 Excel 综合公式与 compare/trend——
 # 改权重 = 改口径，跨运行对比必须可见，不允许只活在环境变量里。
 def _env_w(name):
+    # nan/inf 必须挡在这里：float("nan") 不抛异常，max(nan, 0.0) 也照样返回 nan，
+    # 于是 _wsum 变 nan、blend 变 nan，一路写进 valuation.json 并让 Excel 收到
+    # 一个 `nan` 公式。非有限权重没有任何合法语义，直接退回 1.0（等权）。
     try:
         w = float(os.environ.get(name, 1) or 1)
     except ValueError:
+        w = 1.0
+    if not math.isfinite(w):
+        print(f"⚠️  {name} 为非有限值（{os.environ.get(name)!r}），已退回等权 1.0")
         w = 1.0
     return max(w, 0.0)
 
@@ -217,7 +224,20 @@ if MODE == "financials":
     eq_end, eq_val = list(eq.items())[-1]
     tbv = round((eq_val - (list(gw.values())[-1] if gw else 0)
                  - (list(it.values())[-1] if it else 0)) / 1e6)
-    tbv_ps = tbv / cfg["shares"]
+    # 每股 TBV 的分母用**时点流通股**，与 ptbv_band 的历史序列同源（PR #3 review）：
+    # TBV 是时点存量，配加权平均稀释股数是流量均值配存量——增发季（SOFI 型）加权数
+    # ≈期末股数的一半，当前每股 TBV 被高估近一倍，拿它去比一条按时点股数算出来的
+    # 历史带，等于两个口径相减，锚给出的目标价系统性偏错。
+    # 注意只换这一个分母：adj_eps 必须继续用加权稀释股数（GAAP EPS 口径），
+    # 把 cfg["shares"] 全局换掉会把 EPS 一起算错。
+    _sho = facts.get("shares_outstanding_instant") or {}
+    if _sho:
+        tbv_shares = round(list(_sho.values())[-1] / 1e6, 1)
+        tbv_shares_basis = "instant"
+    else:
+        tbv_shares = cfg["shares"]
+        tbv_shares_basis = "weighted_avg_fallback"
+    tbv_ps = tbv / tbv_shares
 
     out = dict(
         ticker=cfg["ticker"], name=cfg["name"], date=cfg["date"], mode="financials",
@@ -229,6 +249,9 @@ if MODE == "financials":
         meta=dict(price=cfg["price"], mcap=cfg["mcap"], shares=cfg["shares"],
                   fwd_shares=cfg["fwd_shares"], fwd_label=cfg["fwd_label"],
                   tbv=tbv, tbv_ps=round(tbv_ps, 2), tbv_asof=eq_end,
+                  # 分母与口径都要可见：报告/verify 要用同一个数，读者也要能看出
+                  # 这次是时点股数还是退回了加权稀释
+                  tbv_shares=tbv_shares, tbv_shares_basis=tbv_shares_basis,
                   adr_multiple=cfg.get("adr_multiple", 1.0),
                   currency=cfg.get("currency", "USD"), vintage=VINTAGE,
                   # XBRL 结构化数据的期末——与 vintage.report_end（定期报告期末）

@@ -154,8 +154,14 @@ def _validate_judgment(d: dict, mode: str = "standard",
     # 互相矛盾——唯一合法值 pe=8 必然吃黄旗或烧光 retry。带子本身就是"该票长期在
     # 8x 以下交易"的证据：此时下限放宽到 max(4, 0.6×锚窗P10)——低于历史 P10 打六折
     # 仍属崩盘定价，照旧走 permanent_impairment 通道。带子缺失时回退静态 8。
+    #
+    # thin_coverage 必须同门槛（PR #3 review）：0059 起「<250 天的分布没有锚的话语权」
+    # 在 band_meta 注入 / pe_band_check / 交易区间 / 中枢检查四处都停用了薄带子，
+    # 唯独这里漏了——一个 60 天的低倍数薄样本能把硬下限从 8 放宽到 4，而同一个
+    # 带子在 prompt 里被明说"本次无历史锚"。放行与"带子算证据"必须是同一个闸门。
     pe_floor = 8.0
-    _bp = ((band or {}).get("recent") or {}).get("pctiles") or (band or {}).get("pctiles") or {}
+    _bp = ({} if (band or {}).get("thin_coverage") else
+           ((band or {}).get("recent") or {}).get("pctiles") or (band or {}).get("pctiles") or {})
     if "10" in _bp and "50" in _bp and _bp["50"] * 1.15 < 8:
         pe_floor = max(4.0, round(0.6 * _bp["10"], 1))
     for sc in ("bear", "base", "bull"):
@@ -446,14 +452,27 @@ def _parse_json(text: str) -> dict:
 
 
 def _add_months(d: date, n: int) -> date:
-    """加 n 个月，落在不存在的日期时退到当月最后一天（3-31 + 1月 -> 4-30）。"""
+    """加 n 个月，落在不存在的日期时退到当月最后一天（3-31 + 1月 -> 4-30）。
+
+    **月末进月末**（end-of-month 约定，2026-08-17 修）：输入本身是所在月最后一天时，
+    结果取目标月最后一天。此前只做"日不存在才回退"，于是 9-30 + 3月 = 12-30 而不是
+    12-31——日历季末的公司做 PENDING_10Q 前滚一个季度后，TTM 末端差了一天，
+    fwd_window 的财年对齐判据就认不出"NTM 正好是下一个完整财年"（实测
+    Dec-FY 公司 Q3 前滚后被判 aligned=False，窗口写成 2026-12-31~2027-12-30）。
+    非月末输入（AAPL 这类 52/53 周财历的 6-27）不受影响，行为逐位不变。
+
+    只用 date/timedelta（不引 calendar）：tests/test_pure.py 按 AST 抽取本函数源码后
+    在只注入这两个名字的命名空间里 exec，多一个模块级依赖就会 NameError。
+    """
+    def _eom(yy: int, mm: int) -> date:      # 该年月的最后一天
+        return date(yy + (mm == 12), mm % 12 + 1, 1) - timedelta(days=1)
+
     y, m = divmod(d.year * 12 + (d.month - 1) + n, 12)
-    for day in range(d.day, 27, -1):     # 27 一定存在，最多回退 4 天
-        try:
-            return date(y, m + 1, day)
-        except ValueError:
-            continue
-    return date(y, m + 1, d.day)
+    m += 1
+    last_out = _eom(y, m).day
+    if d.day == _eom(d.year, d.month).day:
+        return date(y, m, last_out)
+    return date(y, m, min(d.day, last_out))
 
 
 def fwd_window(ttm_end: str, fy_end: str, rolled_quarters: int = 0) -> dict:
@@ -487,8 +506,29 @@ def fwd_window(ttm_end: str, fy_end: str, rolled_quarters: int = 0) -> dict:
     start, end = te + timedelta(days=1), _add_months(te, 12)
     out = {"start": start.isoformat(), "end": end.isoformat()}
 
-    # 财年末对齐判断：月-日相同即说明 TTM 窗口正好是一个完整财年，NTM 也就正好是下一个
-    if fy_end and fy_end[5:] == te.isoformat()[5:]:
+    # 财年末对齐判断：TTM 窗口正好是一个完整财年时，NTM 也就正好是下一个。
+    #
+    # 不能要求月-日**精确**相等（2026-08-17 修）：52/53 周财历的公司（AAPL 财年末
+    # = 9 月最后一个周六）每年的财年末日期本身就在漂移，2025 是 09-27、2026 是
+    # 09-26——精确比较会把"这份 TTM 就是完整 FY2026"判成不对齐，label 里写成横跨
+    # 两个财年，判断层于是拿到一个自相矛盾的前瞻期口径。容差取 ±4 天：52/53 周
+    # 财历相邻年度最多差 7 天但同向漂移通常 1-2 天，4 天足够覆盖且远小于一个季度，
+    # 不会把真正横跨的窗口（差一个季度以上）误判成对齐。
+    _aligned = False
+    if fy_end:
+        try:
+            _fy = date.fromisoformat(fy_end)
+            # 把财年末搬到 te 所在年份再比，避免跨年比较把 12-31 vs 01-01 算成差 364 天
+            for _y in (te.year, te.year - 1, te.year + 1):
+                try:
+                    if abs((te - _fy.replace(year=_y)).days) <= 4:
+                        _aligned = True
+                        break
+                except ValueError:
+                    continue    # 2-29 搬到平年
+        except ValueError:
+            _aligned = fy_end[5:] == te.isoformat()[5:]
+    if _aligned:
         out["aligned"] = True
         out["straddle"] = f"= FY{end.year} 完整财年"
     else:

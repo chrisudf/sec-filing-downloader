@@ -130,11 +130,22 @@ if MODE == "financials":
         put(ws, f"E{r}", note, GREEN, wrap=True)
         r += 1
     put(ws, "A20", "TTM 调整后 EPS", BOLD)
-    put(ws, "B20", "=B17/B19", BLACK, fmt=FM_EPS)
+    put(ws, "B20", "=B17/B19", BLACK, fmt=FM_EPS)      # EPS 用加权稀释（GAAP 口径）
     put(ws, "A21", "每股 TBV", BOLD)
-    put(ws, "B21", "=B18/B19", BLACK, fmt=FM_PX)
+    # 分母指向 B23（时点流通股）而不是 B19（加权稀释）：与引擎 tbv_ps、ptbv_band 的
+    # 历史序列三者同源，否则 verify_report 的「每股TBV」交叉核对会 FAIL。
+    # 新增行放 23 而不是插进上面的事实块——插入会把 20/21/22 全部顶移，
+    # 而下游 calc_rows 与 verify_report 都按绝对行号引用 $B$21。
+    put(ws, "B21", "=B18/B23", BLACK, fmt=FM_PX)
     put(ws, "A22", "TTM ROTE（调整后）", BOLD)
     put(ws, "B22", "=B17/B18", BLACK, fmt=FM_PCT)
+    put(ws, "A23", "时点流通股 (M)", BOLD)
+    put(ws, "B23", M.get("tbv_shares") or M["shares"], BLUE, fmt="#,##0")
+    put(ws, "E23", "每股 TBV 的分母（"
+        + ("us-gaap 时点流通股" if M.get("tbv_shares_basis") == "instant"
+           else "⚠ 无时点流通股 XBRL，退回加权稀释——增发季每股 TBV 会被高估")
+        + "）。TBV 是时点存量，配加权平均稀释股数等于流量均值配存量；"
+          "历史 P/TBV 带同样按时点股数计算，两者必须同源", GREEN, wrap=True)
 
     put(ws, "A24", "情景计算（公式）", H2, border=False)
     calc_rows = [

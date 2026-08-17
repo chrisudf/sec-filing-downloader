@@ -71,9 +71,14 @@ TAGS_FINANCIALS = {
     "intangibles": ["IntangibleAssetsNetExcludingGoodwill", "FiniteLivedIntangibleAssetsNet"],
     "cash": ["CashAndCashEquivalentsAtCarryingValue"],
     "shares_diluted": ["WeightedAverageNumberOfDilutedSharesOutstanding"],
+    # 时点流通股 = 每股 TBV 的正确分母。TBV 是时点存量，除以当季**加权平均**稀释
+    # 股数等于拿流量均值配存量——增发季（SOFI 型一次性摊薄）加权数≈期末股数的
+    # 一半，每股 TBV 会被高估近一倍。P/TBV 历史带自 0058 起已改用时点股数
+    # （pe_band.ptbv_band），引擎当前点必须同源，否则"当前倍数 vs 历史锚"是两个口径。
+    "shares_outstanding": ["CommonStockSharesOutstanding"],
     "sbc": ["ShareBasedCompensation", "AllocatedShareBasedCompensationExpense"],
 }
-INSTANT_FINANCIALS = {"equity", "goodwill", "intangibles", "cash"}
+INSTANT_FINANCIALS = {"equity", "goodwill", "intangibles", "cash", "shares_outstanding"}
 
 # IFRS 外国发行人（20-F）：概念名映射到与 standard 相同的输出键，下游无感知
 TAGS_IFRS = {

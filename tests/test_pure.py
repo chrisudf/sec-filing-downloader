@@ -351,7 +351,9 @@ tmp = Path(tempfile.mkdtemp(prefix="vint-", dir=str(Path(__file__).parent)))
 
 # lowercase ticker round-trip
 p = vintages.record(mkval(), gate_clean=True, root=tmp)
-check("record path uppercased", str(p).endswith("vintages/AAPL/2026-06-27.json"), True)
+# 按路径分量比较，不用字符串后缀：Windows 上 str(Path) 是反斜杠，
+# 写死 "vintages/AAPL/..." 会在非 POSIX 平台假失败（这是哨兵自己的 bug）
+check("record path uppercased", p.parts[-3:], ("vintages", "AAPL", "2026-06-27.json"))
 recs = vintages.load("aapl", root=tmp)
 check("load lowercase ticker finds it", len(recs), 1)
 check("load sample count", len(recs[0]["samples"]), 1)
@@ -499,3 +501,5 @@ print()
 print(f"{len(PASSES)} passed, {len(FAILS)} FAILED")
 for name, a, e in FAILS:
     print(f"  FAILED: {name}: {a} vs {e}")
+# 非零退出：此前无论挂多少条都 exit 0，CI/自动化完全看不见回归
+sys.exit(1 if FAILS else 0)

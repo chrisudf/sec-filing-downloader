@@ -40,6 +40,32 @@ if _bw_o != _bw_n:
     print(f"⚠️  blend 权重不同（{_bw_o or '等权'} → {_bw_n or '等权'}）：综合目标价口径已变，"
           "③ 里综合的水平差异先归因权重，不要读作假设修正\n")
 
+
+# 参与综合的**腿集合**也是口径，而且 _wnorm 恰好把它抹掉了（PR #3 review）：
+# 等权三腿 {pe:1,dcf:1,sotp:1} 与等权两腿 {pe:1,dcf:1} 归一化后都是 {}，于是
+# seg1_share 跨过 0.85 门槛导致 SOTP 进/出综合时，上面那条权重警告一声不响。
+# 腿集合优先取 blend_weights 的键（0056 起只记录"本次可能参与综合"的腿），
+# 老文件无该键时退回 meta.sotp_in_blend 推断，再不行标记为未知（不报假警）。
+def _legs(v):
+    w = v.get("blend_weights")
+    if isinstance(w, dict) and w:
+        return frozenset(w)
+    si = (v.get("meta") or {}).get("sotp_in_blend")
+    if si is None:
+        return None
+    return frozenset(("pe", "dcf") + (("sotp",) if si else ()))
+
+
+_lg_o, _lg_n = _legs(old), _legs(new)
+if _lg_o and _lg_n and _lg_o != _lg_n:
+    _fmt = lambda s: "/".join(sorted(x.upper() for x in s))    # noqa: E731
+    _si_o = (old.get("meta") or {}).get("sotp_in_blend")
+    _si_n = (new.get("meta") or {}).get("sotp_in_blend")
+    _why = ("（主分部利润占比跨过 85% 门槛，SOTP 降级/恢复）"
+            if _si_o is not None and _si_n is not None and _si_o != _si_n else "")
+    print(f"⚠️  参与综合的方法不同（{_fmt(_lg_o)} → {_fmt(_lg_n)}）{_why}：综合是不同"
+          "条数的均值，③ 里的水平差异先归因口径，不要读作假设修正\n")
+
 # 前瞻窗口对比：NTM 窗口随报告期滚动，跨季对比时不同是正常的（下面会如实打印）；
 # 但**同一报告期**内两次运行窗口不同 = 口径分裂，g/eps1/pe 全部不可直接对比——
 # 这正是趋势视图按 (fwd_label, semantics) 分组拒绝混聚的同一件事，两期对比也得拦

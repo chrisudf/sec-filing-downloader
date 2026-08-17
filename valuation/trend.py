@@ -107,6 +107,18 @@ def main():
                        if isinstance(v, (int, float)) and abs(v - 1) > 1e-9}
                 if _bw:
                     _k += "｜w=" + ":".join(f"{k}{v:g}" for k, v in sorted(_bw.items()))
+                # 参与综合的**腿集合**同样是口径，而上面的权重归一化恰好把它抹平了
+                # （PR #3 review）：等权三腿与等权两腿都产出空 _bw。两处来源——
+                #   1) 该情景的 blend_methods：近零/负利润守卫逐情景剔 PE/SOTP 腿，
+                #      DCF 独腿的 blend 与 PE/DCF 均值的 blend 不是一个东西
+                #   2) sotp_in_blend：seg1_share 跨 0.85 门槛导致 SOTP 进/出综合
+                # 两者都缺（本次改动之前归档的老样本）时不进 key——无法追溯的数据
+                # 不该拆组，否则新旧样本会因"字段缺失"这一非口径原因分裂。
+                _bm = (s.get("scenarios") or {}).get(SC, {}).get("blend_methods")
+                if _bm:
+                    _k += "｜m=" + "/".join(sorted(_bm))
+                elif s.get("sotp_in_blend") is not None:
+                    _k += "｜sotp=" + ("in" if s["sotp_in_blend"] else "ref")
                 groups.setdefault(_k, []).append(s)
             if len(groups) > 1:
                 mixed = {k: len(v) for k, v in groups.items()}
