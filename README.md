@@ -3,7 +3,8 @@
 输入美股股票代码，自动从 **SEC EDGAR 官方数据库** 查找并批量下载财报文件（10-K / 10-Q / 20-F / 6-K），
 按 `代码_表单_报告期` 统一重命名后打包成 zip，作为后续 DCF / PE 估值分析的数据底座。
 
-> 第一阶段目标：**搜索 → 下载 → 重命名**。财务数据提取与估值模型见 [TODO.md](TODO.md)。
+> 第一阶段目标：**搜索 → 下载 → 重命名**。财务数据提取与估值模型见 [TODO.md](TODO.md)，
+> 口径类事故的复盘见 [LESSONS.md](LESSONS.md)。
 
 ## ✨ 功能
 
@@ -89,7 +90,8 @@ sec-filing-downloader/
 ├── reports/                   # 手动生成的报告（gitignore）
 ├── requirements.txt
 ├── README.md
-└── TODO.md                    # 路线图
+├── TODO.md                    # 路线图
+└── LESSONS.md                 # 事故与教训（口径类问题必读）
 ```
 
 ## 🚀 快速开始

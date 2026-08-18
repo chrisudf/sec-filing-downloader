@@ -497,6 +497,36 @@ with tempfile.TemporaryDirectory() as _td:
     check("pending sample flagged", _rec["samples"][0].get("pending_10q"), True)
 
 # =====================================================================
+# =====================================================================
+# 10. 口径披露哨兵（2026-08-17 "带子滞后一年"复盘）
+# ---------------------------------------------------------------------
+# 事故形态：ntm 口径的带子结构性缺最近约 12 个月（分母是"该日之后 12 个月**实际
+# 实现**的 EPS"，那个未来还没发生）。这是设计使然、代码里也写了，但**四个消费面
+# 一个都没把它说出来**，于是 days=1055/"近5年" 看起来像"截至今天"，判断层照旧锚
+# 一条止于 10 个月前的分布。教训见 LESSONS.md。
+#
+# 这一组是**源码级**断言而非行为断言：它防的正是"重构时把披露顺手删掉"这一类
+# 静默回归——披露没了不会有任何用例变红，只会让报告重新开始说谎。
+# =====================================================================
+_DISCLOSE = (
+    (("app", "valuation_service.py"), "判断层 prompt 注入 band_meta"),
+    (("valuation", "engine.py"), "engine stdout / trading_range JSON"),
+    (("valuation", "build_report.py"), "Excel 摘要交易区间块"),
+    (("static", "index.html"), "前端一行摘要"),
+)
+for _rel, _name in _DISCLOSE:
+    _src = WT.joinpath(*_rel).read_text(encoding="utf-8")
+    check(f"滞后披露(lag_days)仍在: {_name}", "lag_days" in _src, True)
+
+# 数据层必须产出这三样，否则上面四个面无从披露
+_pb_text = (WT / "valuation" / "pe_band.py").read_text(encoding="utf-8")
+for _k in ("span", "drift", "trailing_nolag"):
+    check(f"pe_band 仍输出 {_k}", f'"{_k}"' in _pb_text, True)
+# trailing_nolag 必须在 `key in s` 过滤**之前**取全序列——过滤之后同样带滞后，
+# 那正是既有 other_basis_median 的坑
+check("trailing_nolag 取自过滤前的全序列",
+      _pb_text.index("_unfiltered = series") < _pb_text.index("trailing_nolag = None"), True)
+
 print()
 print(f"{len(PASSES)} passed, {len(FAILS)} FAILED")
 for name, a, e in FAILS:
