@@ -497,6 +497,68 @@ with tempfile.TemporaryDirectory() as _td:
     check("pending sample flagged", _rec["samples"][0].get("pending_10q"), True)
 
 # =====================================================================
+# =====================================================================
+# 10. 口径披露哨兵（2026-08-17 "带子滞后一年"复盘）
+# ---------------------------------------------------------------------
+# 事故形态：ntm 口径的带子结构性缺最近约 12 个月（分母是"该日之后 12 个月**实际
+# 实现**的 EPS"，那个未来还没发生）。这是设计使然、代码里也写了，但**四个消费面
+# 一个都没把它说出来**，于是 days=1055/"近5年" 看起来像"截至今天"，判断层照旧锚
+# 一条止于 10 个月前的分布。教训见 LESSONS.md。
+#
+# 这一组是**源码级**断言而非行为断言：它防的正是"重构时把披露顺手删掉"这一类
+# 静默回归——披露没了不会有任何用例变红，只会让报告重新开始说谎。
+# =====================================================================
+_DISCLOSE = (
+    (("app", "valuation_service.py"), "判断层 prompt 注入 band_meta"),
+    (("valuation", "engine.py"), "engine stdout / trading_range JSON"),
+    (("valuation", "build_report.py"), "Excel 摘要交易区间块"),
+    (("static", "index.html"), "前端一行摘要"),
+)
+for _rel, _name in _DISCLOSE:
+    _src = WT.joinpath(*_rel).read_text(encoding="utf-8")
+    check(f"滞后披露(lag_days)仍在: {_name}", "lag_days" in _src, True)
+
+# 数据层必须产出这三样，否则上面四个面无从披露
+_pb_text = (WT / "valuation" / "pe_band.py").read_text(encoding="utf-8")
+for _k in ("span", "drift", "trailing_nolag"):
+    check(f"pe_band 仍输出 {_k}", f'"{_k}"' in _pb_text, True)
+# trailing_nolag 的**行为**测试（PR #5 review：原来只断言两个字符串的先后顺序，
+# 把 _tr 改回从过滤后的 series 取仍然会通过——恰恰漏掉它自称要抓的那个回归）。
+# 现在 build_trailing_nolag 是独立纯函数，可以直接喂合成数据：
+# 造一段"最后一个 NTM 观测之后还有 30 天 trailing-only 行"的输入，
+# 断言 gap_since_main_band 抓到了那 30 天。
+build_trailing_nolag = ns_pb["build_trailing_nolag"]
+
+_rows = []
+for i in range(300):                      # 主带覆盖段：trailing 与 ntm 都有值
+    d = f"2025-{1 + i // 28:02d}-{1 + i % 28:02d}"
+    _rows.append({"date": f"2024-{1 + i % 12:02d}-{1 + i % 28:02d}", "pe_trailing": 30.0,
+                  "pe_ntm": 25.0})
+_rows = sorted(_rows, key=lambda r: r["date"])
+_MAIN_LAST = _rows[-1]["date"]
+# 盲区：只有 trailing 有值（ntm 缺——未来 EPS 还没实现），倍数明显更低
+_gap_rows = [{"date": f"2026-{1 + i // 28:02d}-{1 + i % 28:02d}", "pe_trailing": 18.0}
+             for i in range(30)]
+_all = _rows + _gap_rows
+
+_tn = build_trailing_nolag(_all, _MAIN_LAST, "pe")
+check("build_trailing_nolag 返回非空", _tn is not None, True)
+check("窗口末端取到盲区最后一天", _tn["span"]["end"], _gap_rows[-1]["date"])
+check("current 是盲区最新值（非主带末点）", _tn["current"], 18.0)
+check("gap_since_main_band 抓到盲区", (_tn["gap_since_main_band"] or {}).get("days"), 30)
+check("盲区 P50 是低倍数那段", (_tn["gap_since_main_band"] or {}).get("p50"), 18.0)
+
+# 关键回归：喂**过滤后**的序列（只剩有 ntm 的行）时，盲区必须消失——
+# 这正是"改回从 series 取"会造成的后果，行为上可判别
+_filtered = [r for r in _all if "pe_ntm" in r]
+_tn_bad = build_trailing_nolag(_filtered, _MAIN_LAST, "pe")
+check("喂过滤后序列则盲区为空（证明该测试能判别这个回归）",
+      (_tn_bad or {}).get("gap_since_main_band"), None)
+check("喂过滤后序列时 current 退回主带末点", (_tn_bad or {}).get("current"), 30.0)
+
+# 样本不足时不出（宁缺勿错）
+check("样本 < 60 行时返回 None", build_trailing_nolag(_all[:59], _MAIN_LAST, "pe"), None)
+
 print()
 print(f"{len(PASSES)} passed, {len(FAILS)} FAILED")
 for name, a, e in FAILS:

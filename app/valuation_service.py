@@ -825,6 +825,38 @@ async def _pipeline(job: dict, ticker: str, email: str) -> None:
               "不接受——那会系统性压低所有标的。"
               "\n  若下方给出「上一次运行的假设（连续性基准）」，连续性优先——"
               "本锚只约束首次基线与失锚重建。")
+        # 滞后必须告知判断层（2026-08-17）：ntm 口径要求"该日之后满 4 个季度已披露"，
+        # 最近约一年结构性无值。此前只把天数注进去，锚看起来像"截至今天的近3年"，
+        # 于是判断层在市场已经重新定价的标的上照旧锚旧中枢却毫不知情（MSFT 实测：
+        # 锚 P50 30.1x，而市场最近 10 个月付的 NTM 可比倍数只有 ~22x）。
+        # 这里只给事实（滞后天数 + 无滞后 trailing 对照），不放松 ±15% 纪律——
+        # "市场已重定价"是一类**合法证据**，但仍要在 rationale.pe 里写出来。
+        _sp = _b.get("span") or {}
+        if _sp.get("lag_days"):
+            band_meta += (
+                f"\n  ⚠ 本带止于 {_sp['end']}（滞后 {_sp['lag_days']} 天）："
+                "ntm 口径的分母是「该日之后 12 个月**实际实现**的 EPS」，那个未来对最近"
+                "约一年的交易日还没发生，因此**最近约一年的倍数不在本分布内**。")
+            _tn = _b.get("trailing_nolag") or {}
+            _tnp = {str(k): v for k, v in (_tn.get("pctiles") or {}).items()}
+            if _tnp.get("50"):
+                band_meta += (
+                    f"\n    无滞后对照（trailing 口径，价÷过去12个月，{_tn['span']['start']}~"
+                    f"{_tn['span']['end']}）：P50 {_tnp['50']:.1f}x，最新 {_tn['current']:.1f}x。"
+                    "**不可与上面的 NTM 分位直接相减**——trailing 分母是过去 12 个月的"
+                    "已实现 GAAP EPS，NTM 分位的分母是未来 12 个月的 EPS。"
+                    "换算需要除以 **EPS 增速因子**（你给出的该情景 NTM EPS ÷ 当前 GAAP "
+                    "TTM EPS），**不是营收增速 g**——利润率、税率、其他收益、股数变化"
+                    "都会让 EPS 增速与营收增速显著分叉（利润率扩张叠加回购的票尤其）。"
+                    "当前 GAAP TTM EPS 见 FACTS 的 TTM 净利 ÷ 稀释股数。")
+                _gap = _tn.get("gap_since_main_band")
+                if _gap:
+                    band_meta += (f"\n    本带盲区那一段（{_gap['span']['start']}~"
+                                  f"{_gap['span']['end']}）trailing P50 {_gap['p50']:.1f}x。")
+            band_meta += ("\n    → 若折算后显示市场近一年的定价已明显偏离本带中枢，"
+                          "那是**锚可能已过时**的证据：此时偏离 P50 属于有证据的偏离，"
+                          "请在 rationale.pe 写明「近一年 regime 变化」并给出财报/定价依据。"
+                          "反之若两者量级一致，锚照常适用。")
     # financials 的锚是 P/TBV 带（图3 的教科书结论：银行 E 带杠杆带周期，估值锚
     # 是 P/B 系）——与 standard 的 PE 锚同一纪律结构，锚 s["ptbv"]
     _tb = facts.get("ptbv_band") or {}
@@ -1047,7 +1079,18 @@ async def _pipeline(job: dict, ticker: str, email: str) -> None:
                summary={k: dict(blend=v["blend"], upside=v["upside"])
                         for k, v in val["scenarios"].items()},
                trading_range=(dict(lo=_tr["px"].get("25"), mid=_tr["px"].get("50"),
-                                   hi=_tr["px"].get("75"), window=_tr["window"])
+                                   hi=_tr["px"].get("75"), window=_tr["window"],
+                                   # 盈利窗口 + 倍数窗口真实起止/滞后：只写"近3年PE带"
+                                   # 会被读成区间的时间跨度（实测确实被这么问了）
+                                   eps_window=_tr.get("eps_window"),
+                                   span=_tr.get("span"),
+                                   # 现价当前位置与倍数回归归因——区间中位的涨幅按构造
+                                   # 全部来自倍数回归，不写出来读者看不见
+                                   fwd_pe_now=_tr.get("fwd_pe_now"),
+                                   # 带外只给关系不给截断分位（PR #5 review）
+                                   fwd_pe_now_position=_tr.get("fwd_pe_now_position"),
+                                   target_pe=_tr.get("target_pe"),
+                                   mult_reversion=_tr.get("mult_reversion_to_p50"))
                               if _tr and _tr.get("px") else None))
 
 

@@ -402,9 +402,30 @@ async function runValuation() {
         // （engine.py 闸门），缺档不可达；防的是未来服务端改成逐档可缺时渲染出
         // "$undefined~$undefined"——宁可整块不出
         const tr = st.trading_range;
-        const trTxt = tr && tr.lo != null && tr.hi != null && tr.mid != null
-          ? `；交易区间（${tr.window}PE带×baseEPS）$${tr.lo}~$${tr.hi}，中位 $${tr.mid}`
-          : "";
+        // 标清三件事：①价格对应哪 12 个月的盈利（不是"近3年"——那是倍数历史的长度）
+        // ②倍数窗口的真实起止与滞后 ③中位涨幅全部来自倍数回归
+        let trTxt = "";
+        if (tr && tr.lo != null && tr.hi != null && tr.mid != null) {
+          const win = tr.eps_window ? `盈利窗口 ${tr.eps_window}` : "base EPS";
+          trTxt = `；交易区间（${win}；倍数取自${tr.window}已实现 NTM PE`;
+          if (tr.span && tr.span.start) {
+            trTxt += ` ${tr.span.start}~${tr.span.end}`;
+            if (tr.span.lag_days) trTxt += `，止于 ${tr.span.lag_days} 天前`;
+          }
+          trTxt += `）$${tr.lo}~$${tr.hi}，中位 $${tr.mid}`;
+          if (tr.fwd_pe_now != null) {
+            trTxt += `；现价隐含 ${tr.fwd_pe_now}x`;
+            // 带外只给关系：低于 P10 的值会被 _pctile_rank 截断成"第10百分位"，
+            // 直接显示会与"跌出下沿"的说法自相矛盾
+            if (tr.fwd_pe_now_position) trTxt += `（${tr.fwd_pe_now_position}）`;
+            if (tr.target_pe != null) trTxt += ` vs 目标 ${tr.target_pe}x`;
+            if (tr.mult_reversion != null) {
+              // "纯倍数差距"而非"与盈利预测无关"：恒等式只在给定同一 base EPS 时成立，
+              // 改 EPS 会同比例移动中位价
+              trTxt += `，中位涨幅 ${(tr.mult_reversion * 100).toFixed(0)}% 是纯倍数差距（同一 base EPS 下）`;
+            }
+          }
+        }
         const resultRes = await fetch(`/api/valuation/${job_id}/result`);
         if (!resultRes.ok) throw new Error(`下载报告失败（HTTP ${resultRes.status}）`);
         const blob = await resultRes.blob();

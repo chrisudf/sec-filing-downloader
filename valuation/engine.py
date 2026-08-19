@@ -505,14 +505,82 @@ if _band.get("thin_coverage") and _use:
 if (not _base_pe_nm and not _band.get("thin_coverage")
         and all(q in _use for q in ("10", "25", "50", "75", "90"))):
     _tr_pe = {q: round(float(_use[q]), 2) for q in ("10", "25", "50", "75", "90")}
+    _sub = bool(_rc.get("pctiles"))
+    # 现价隐含的前瞻倍数 = 价 ÷ base NTM EPS。它与本带子**同一个分母概念**
+    # （都是"价 ÷ 未来 12 个月盈利"），因此可以直接比分位，不像 trailing 那样差着
+    # 一个增长率。这个数引擎本来就算了（scenarios.base.fwd_pe），此前从未与带子
+    # 连起来——于是"市场当前付多少倍"和"目标假设多少倍"各说各话，读者看不到
+    # 目标价里有多少是倍数回归。唯一的口径差：带子分母是已实现 EPS，这里是估计值。
+    # 建模 NTM EPS ÷ GAAP TTM EPS —— trailing→NTM 的换算因子（理由见下方 dict 注释）
+    _gaap_ttm_eps = (ttm_m["net_income"] / cfg["shares"]) if cfg.get("shares") else None
+    _ntm_eps_growth = (round(_e1 / _gaap_ttm_eps - 1, 4)
+                       if _gaap_ttm_eps and _gaap_ttm_eps > 0 and _e1 else None)
+    _now_pe = out["scenarios"]["base"]["fwd_pe"]
+    _tgt_pe = cfg["scenarios"]["base"]["pe"]
+    # 带外关系必须与百分位分开表达（PR #5 review）：_pctile_rank 对低于 P10 的值
+    # 一律返回 10、高于 P90 一律返回 90（子窗只有 P10~P90 五档）。于是 20.0x 与
+    # 25.7x 都会被报成"第 10 百分位"，与同时打出的"跌出下沿 P10"黄旗自相矛盾。
+    # 规则：只有落在 [P10, P90] 内才给数值分位，带外只给关系。
+    if not _now_pe:
+        _now_rank, _now_rel = None, None
+    elif _now_pe < _tr_pe["10"]:
+        _now_rank, _now_rel = None, "below_p10"
+    elif _now_pe > _tr_pe["90"]:
+        _now_rank, _now_rel = None, "above_p90"
+    else:
+        _now_rank, _now_rel = round(_pctile_rank(_use, _now_pe), 1), "in_band"
+    # 带内位置的可读文案，四个消费面共用一句，避免各写各的
+    _now_pos = ({"below_p10": f"低于带子下沿 P10（{_tr_pe['10']:.1f}x）",
+                 "above_p90": f"高于带子上沿 P90（{_tr_pe['90']:.1f}x）"}.get(_now_rel)
+                or (f"带内第 {_now_rank:.0f} 百分位" if _now_rank is not None else None))
     out["trading_range"] = dict(
         basis=_band.get("basis"),
-        window=(f"近{_rc['years']}年" if _rc.get("pctiles") else f"近{_band.get('years')}年"),
-        days=(_rc.get("days") if _rc.get("pctiles") else _band.get("days")),
+        window=(f"近{_rc['years']}年" if _sub else f"近{_band.get('years')}年"),
+        days=(_rc.get("days") if _sub else _band.get("days")),
+        # 窗口真实起止 + 滞后：ntm 口径结构性缺最近约一年，"近3年"不是区间跨度也
+        # 不是"到今天为止的3年"——不报出来会被两头误读
+        span=((_rc.get("span") if _sub else None) or _band.get("span")),
+        eps_window=cfg["fwd_label"],
         eps1_base=_e1, pe=_tr_pe,
         px={q: round(v * _e1, 1) for q, v in _tr_pe.items()},
         full_window_p50=(round(float(_band["pctiles"]["50"]), 2)
-                         if _band.get("pctiles") else None))
+                         if _band.get("pctiles") else None),
+        fwd_pe_now=_now_pe, fwd_pe_now_pctile=_now_rank,
+        fwd_pe_now_vs_band=_now_rel, fwd_pe_now_position=_now_pos,
+        # px50/价 − 1 = (P50×eps1)/(fwd_pe_now×eps1) − 1 = P50/fwd_pe_now − 1 是恒等式。
+        # 但它**不**意味着"与盈利预测无关"（PR #5 review）：fwd_pe_now 本身 = 价÷eps1，
+        # eps1 变了中位价与本比值会同步变。它成立的前提是**给定同一个 base EPS**——
+        # 此时现价与中位价用的是同一个分母，两者的差距只能是倍数差距，不能由盈利
+        # 预测解释。措辞按此口径统一（Excel/stdout/前端/文档同源）。
+        mult_reversion_to_p50=(round(_tr_pe["50"] / _now_pe - 1, 4) if _now_pe else None),
+        mult_reversion_to_target=(round(_tgt_pe / _now_pe - 1, 4) if _now_pe else None),
+        target_pe=_tgt_pe,
+        drift=_band.get("drift"), trailing_nolag=_band.get("trailing_nolag"),
+        # trailing → NTM 的换算因子必须是 **EPS 增速**，不是营收增速（PR #5 review）：
+        #   trailing_PE = 价÷TTM_EPS，NTM_PE = 价÷NTM_EPS
+        #   ⇒ NTM_PE = trailing_PE ÷ (NTM_EPS / TTM_EPS)
+        # 此前用 cfg.scenarios.base.g，而 g 在 prompt 里被明确定义为**营收**增速
+        # （"g 的定义 = 该窗口营收 ÷ TTM营收 − 1"）。利润率、税率、其他收益、股数
+        # 变化都会让 EPS 增速与营收增速显著分叉（利润率扩张 + 回购的票尤其）。
+        # 分母取 **GAAP** TTM EPS：带子的分子是价、分母是 NetIncomeLoss 口径的
+        # 已实现 EPS，换算因子必须与它同源；用调整后 EPS 会引入第二重口径错配。
+        # 拿不到正的 GAAP TTM EPS 时置 None，消费侧据此**不显示**换算值。
+        trailing_ntm_eps_growth=_ntm_eps_growth)
+
+    # 现价隐含倍数跌出/冲破带子时留痕：这是"目标 PE 的分位"之外的另一半信息——
+    # 目标锚在 P50 不代表便宜，市场当前付的倍数在哪同样是事实。跌出 P10 尤其要说：
+    # 此时目标价的涨幅几乎全部押在"倍数回到中枢"，而带子恰好看不见最近一年
+    # 究竟发生了什么（滞后 span.lag_days 天）。
+    _trw = out["trading_range"]
+    if _now_pe and (_now_pe < _tr_pe["10"] or _now_pe > _tr_pe["90"]):
+        _side = "跌出下沿 P10" if _now_pe < _tr_pe["10"] else "冲破上沿 P90"
+        _sp = _trw.get("span") or {}
+        out["scenarios"]["base"]["warnings"].append(["yellow",
+            f"现价隐含前瞻倍数 {_now_pe:.1f}x {_side}（带子 P10~P90 = "
+            f"{_tr_pe['10']:.1f}~{_tr_pe['90']:.1f}x）——目标 PE {_tgt_pe:g}x 相对现价隐含"
+            f"{_trw['mult_reversion_to_target']:+.0%} 的纯倍数变动；"
+            f"而带子止于 {_sp.get('end', '?')}（滞后 {_sp.get('lag_days', '?')} 天），"
+            "最近一年的倍数不在分布内，请用下方 trailing 对照自行判断 regime 是否已变"])
 
 # Rule of 40 透传（fetch_facts 计算，standard 模式）：营收增速+利润率的标尺，
 # 与 pe_band 同属"倍数值不值得给"的判断参照，进报告与 prompt 元数据
@@ -564,9 +632,53 @@ print(f"TTM: rev {ttm_m['revenue']:,} op {ttm_m['op_income']:,} adjNI {cfg['adj_
 print(f"反向DCF隐含起始增速: {out['reverse_dcf']:.1%}（base 利润率/WACC 条件下）")
 if out.get("trading_range"):
     _tr = out["trading_range"]
-    print(f"交易区间（{_tr['window']}已实现 NTM PE 分位 × base EPS {_tr['eps1_base']}）: "
-          f"P25~P75 {_tr['px']['25']}~{_tr['px']['75']}  中位 {_tr['px']['50']}"
+    _sp = _tr.get("span") or {}
+    # 标签写全三件事：①价格对应的是哪 12 个月的盈利 ②倍数取自哪段真实日期、多少天、
+    # 滞后多久 ③中位相对现价的涨幅全部来自倍数回归。此前只写"近3年PE带×baseEPS"，
+    # "近3年"会被读成区间的时间跨度，而滞后一年这件事完全不可见。
+    print(f"价值交易区间 —— 盈利窗口 {_tr.get('eps_window') or '?'}（base EPS {_tr['eps1_base']}）")
+    # span 缺失（本次改动之前生成的 facts.json）时整段不出，不打印 "?~?"
+    print(f"  倍数取自 {_tr['window']}已实现 NTM PE"
+          + (f": {_sp['start']}~{_sp['end']}" if _sp.get("start") else "")
+          + f" 共 {_tr['days']} 个交易日"
+          + (f"（止于 {_sp['lag_days']} 天前——ntm 口径需要该日之后满 4 个季度已披露，"
+             "最近约一年结构性无值）" if _sp.get("lag_days") else ""))
+    print(f"  P25~P75 {_tr['px']['25']}~{_tr['px']['75']}  中位 {_tr['px']['50']}"
           f"  宽区间 P10~P90 {_tr['px']['10']}~{_tr['px']['90']}")
+    if _tr.get("fwd_pe_now"):
+        print(f"  现价隐含前瞻倍数 {_tr['fwd_pe_now']:.1f}x"
+              + (f"（{_tr['fwd_pe_now_position']}）" if _tr.get("fwd_pe_now_position") else "")
+              + f" vs 目标 {_tr['target_pe']:g}x"
+              f"  →  中位涨幅 {_tr['mult_reversion_to_p50']:+.1%} 是**纯倍数差距**"
+              "（给定同一个 base EPS 时，现价与中位价用同一分母，两者之差只能是倍数之差；"
+              "改 base EPS 会同比例移动中位价，故此非『与盈利预测无关』）")
+    _df = _tr.get("drift")
+    if _df:
+        print(f"  窗口内漂移: 早段 {_df['early']['span']['start']}~{_df['early']['span']['end']} "
+              f"P50 {_df['early']['p50']:.1f}x  →  近段 "
+              f"{_df['late']['span']['start']}~{_df['late']['span']['end']} "
+              f"P50 {_df['late']['p50']:.1f}x  ({_df['delta_pct']:+.1%})")
+    _tn = _tr.get("trailing_nolag")
+    if _tn:
+        # 换算因子 = 建模 NTM EPS ÷ GAAP TTM EPS − 1（**EPS** 增速，不是营收增速）；
+        # 拿不到就不显示换算值，宁可只给原始 trailing 数
+        _g = _tr.get("trailing_ntm_eps_growth")
+        # pctiles 的键经 facts.json 往返后是字符串（pe_band 里建的是 int）——两种都收，
+        # 这正是 test_engine_band 记下的那个潜在坑，别在这里踩第二次
+        _tnp = {str(k): v for k, v in (_tn.get("pctiles") or {}).items()}
+        _tn50 = _tnp.get("50")
+        _eq = _tn50 / (1 + _g) if (_g is not None and _tn50) else None
+        print(f"  ⚠ 无滞后对照（trailing 口径，价÷过去12个月，**不可与上面直接相减**）: "
+              f"{_tn['span']['start']}~{_tn['span']['end']}"
+              + (f" P50 {_tn50:.1f}x，" if _tn50 else " ")
+              + f"最新 {_tn['current']:.1f}x"
+              + (f"；按 NTM EPS 增速 {_g:+.0%}（建模 NTM EPS ÷ GAAP TTM EPS）折成 "
+                 f"NTM 可比口径约 {_eq:.1f}x" if _eq else "；无 GAAP TTM EPS，不做换算"))
+        _gap = _tn.get("gap_since_main_band")
+        if _gap:
+            print(f"     主带盲区那段 {_gap['span']['start']}~{_gap['span']['end']}"
+                  f"（{_gap['days']} 天）trailing P50 {_gap['p50']:.1f}x"
+                  + (f" ≈ NTM 可比 {_gap['p50'] / (1 + _g):.1f}x" if _g is not None else ""))
 if not sotp_in_blend:
     print(f"SOTP 降级为参考项（主分部利润占比 {cfg['seg1_share']:.0%} >= 85%），综合 = PE/DCF 均值")
 for n, v in out["scenarios"].items():

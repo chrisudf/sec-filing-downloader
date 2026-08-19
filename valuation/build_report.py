@@ -762,7 +762,11 @@ put(ws, "A26", f"方法离散度（同情景{_mth} max/min）：{_spread}——�
 _row = 27
 _tr = d.get("trading_range")
 if _tr:
-    put(ws, f"A{_row}", f"价值交易区间（{_tr['window']}已实现 NTM PE 分位 × base 前瞻 EPS）",
+    # 标题带上盈利窗口：读者问"这个区间是多久的"，答案是盈利窗口那 12 个月，
+    # 而不是"近3年"（那是倍数历史的长度）——两者此前挤在一个括号里必然被误读
+    put(ws, f"A{_row}", "价值交易区间 —— 盈利窗口 "
+        + (_tr.get("eps_window") or d["meta"].get("fwd_label") or "?")
+        + f"（{_tr['window']}已实现 NTM PE 分位 × base 前瞻 EPS）",
         H2, border=False)
     _row += 1
     _qs = [q for q in ("10", "25", "50", "75", "90") if q in _tr["pe"]]
@@ -784,14 +788,81 @@ if _tr:
         col = get_column_letter(2 + j)
         put(ws, f"{col}{_row}", f"={col}{_row-1}/$B$4-1", BLACK, fmt=FM_PCT)
     _row += 1
+    _sp = _tr.get("span") or {}
     put(ws, f"A{_row}", f"注：分位取自 {_tr['days']} 个交易日的逐日已实现 NTM PE"
-                        f"（basis={_tr['basis']}，一次性畸变窗口已双侧剔除"
+                        + (f"，真实覆盖 {_sp['start']}~{_sp['end']}" if _sp.get("start") else "")
+                        + (f"（止于 {_sp['lag_days']} 天前：ntm 口径要求该日之后满 4 个季度"
+                           "已披露，最近约一年结构性无值——最近的倍数变化不在本分布内）"
+                           if _sp.get("lag_days") else "")
+                        + f"（basis={_tr['basis']}，一次性畸变窗口已双侧剔除"
                         + (f"；5年全窗中位 {_tr['full_window_p50']}x 供对照"
                            if _tr.get("full_window_p50") else "")
                         + "）。P25~P75 为核心区间——「按历史倍数该在哪交易」，"
                           "与上方情景估值（基本面公允价）分歧本身即是信号。",
         GREEN, border=False)
-    _row += 2
+    _row += 1
+
+    # ---- 现价当前位置 + 倍数回归归因（活公式：改现价/base EPS 即联动）----
+    # 这是本块此前缺的另一半：目标 PE 锚在 P50 不代表便宜，市场当前付多少倍同样是
+    # 事实。而且区间中位相对现价的涨幅按构造恒等于倍数回归幅度（EPS 消掉了）。
+    if _tr.get("fwd_pe_now"):
+        _c50 = get_column_letter(2 + _qs.index("50")) if "50" in _qs else "D"
+        put(ws, f"A{_row}", "现价隐含前瞻倍数 (×)", BOLD)
+        put(ws, f"B{_row}", "=$B$4/'情景假设'!$C$34", BLACK, fmt=FM_X)
+        # 带外只给关系不给分位：_pctile_rank 把低于 P10 的一律截断成 10，
+        # 直接显示会与"跌出下沿"的黄旗自相矛盾（PR #5 review）
+        put(ws, f"C{_row}", _tr.get("fwd_pe_now_position") or "", GREEN)
+        put(ws, f"E{_row}", f"目标 PE {_tr['target_pe']:g}x", GREEN)
+        put(ws, f"H{_row}", "价 ÷ base 前瞻 EPS。与本带同一分母概念（都是价÷未来12个月），"
+                            "可直接比分位——不同于下方 trailing 对照", GREEN, wrap=True)
+        _row += 1
+        put(ws, f"A{_row}", "中位涨幅（纯倍数差距）", BOLD)
+        put(ws, f"B{_row}", f"={_c50}30/$B$4-1", BLACK, fmt=FM_PCT)
+        put(ws, f"H{_row}", "中位价/现价 − 1 = P50/现价隐含倍数 − 1 是恒等式："
+                            "**给定同一个 base EPS 时**，现价与中位价用的是同一个分母，"
+                            "两者之差只能是倍数之差，不能由盈利预测解释。"
+                            "但这不等于「与盈利预测无关」——改 base EPS 会同比例移动"
+                            "中位价（现价隐含倍数也随之变），本行数值会跟着变",
+            GREEN, wrap=True)
+        _row += 1
+
+    # ---- 窗口内漂移：带子跨 3-5 年，regime 有没有在移动 ----
+    _df = _tr.get("drift")
+    if _df:
+        put(ws, f"A{_row}", "窗口内漂移 (P50)", BOLD)
+        put(ws, f"B{_row}", f"早段 {_df['early']['span']['start']}~{_df['early']['span']['end']}"
+                            f"（{_df['early']['days']}天）", GREEN)
+        put(ws, f"E{_row}", f"{_df['early']['p50']:.1f}x → {_df['late']['p50']:.1f}x"
+                            f"（{_df['delta_pct']:+.1%}）", BLUE)
+        put(ws, f"H{_row}", f"近段 {_df['late']['span']['start']}~{_df['late']['span']['end']}"
+                            f"（{_df['late']['days']}天）。同一条带子内部的倍数中枢在移动时，"
+                            "单一 P50 会把两个 regime 平均成一个看不出分歧的数", GREEN, wrap=True)
+        _row += 1
+
+    # ---- 无滞后 trailing 对照：补上主带看不见的最近一年 ----
+    _tn = _tr.get("trailing_nolag")
+    if _tn:
+        _tnp = {str(k): v for k, v in (_tn.get("pctiles") or {}).items()}
+        _g = _tr.get("trailing_ntm_eps_growth")
+        _gap = _tn.get("gap_since_main_band")
+        put(ws, f"A{_row}", "⚠ 无滞后对照（trailing 口径）", BOLD)
+        put(ws, f"B{_row}", f"{_tn['span']['start']}~{_tn['span']['end']}", GREEN)
+        put(ws, f"E{_row}", (f"P50 {_tnp['50']:.1f}x，最新 {_tn['current']:.1f}x"
+                             if _tnp.get("50") else f"最新 {_tn['current']:.1f}x"), BLUE)
+        put(ws, f"H{_row}", "trailing = 价 ÷ **过去** 12 个月 EPS，与上方 NTM 口径"
+                            "（价 ÷ 未来 12 个月）差约一个增长率，**不可直接相减**"
+                            + (f"。换算因子是 **EPS 增速**（建模 NTM EPS ÷ GAAP TTM EPS = "
+                               f"{_g:+.0%}），不是营收增速——两者在利润率扩张/回购的票上"
+                               f"会显著分叉。折成 NTM 可比口径约 "
+                               f"{_tnp['50'] / (1 + _g):.1f}x"
+                               if _g is not None and _tnp.get("50") else "")
+                            + (f"；主带盲区那段（{_gap['span']['start']}~{_gap['span']['end']}，"
+                               f"{_gap['days']}天）trailing P50 {_gap['p50']:.1f}x"
+                               + (f" ≈ NTM 可比 {_gap['p50'] / (1 + _g):.1f}x"
+                                  if _g is not None else "")
+                               if _gap else ""), GREEN, wrap=True)
+        _row += 1
+    _row += 1
 
 # v2 诊断红旗区：engine diagnostics 的 red/yellow 警告逐条落进摘要——
 # 警告和 headline 数字必须出现在同一张表上，不能只活在引擎 stdout 里
