@@ -352,6 +352,41 @@ def load_inputs(ticker, email, years=5):
             "hist": hist, "splits": splits, "years": years}
 
 
+def build_trailing_nolag(unfiltered_rows, main_band_last_date, prefix="pe",
+                         min_rows=60, window=252, min_gap=20):
+    """无滞后 trailing 对照块——**必须**喂过滤前的全序列。
+
+    主带（ntm 口径）结构性缺最近约一年：分母是"该日之后 12 个月实际实现的 EPS"，
+    那个未来对最近的交易日还没发生。compute_band 里 `series = [s for s in series
+    if key in s]` 会把这些天整段删掉，而它们在 trailing 口径下**是有值的**。
+    所以这里接收的必须是过滤**之前**的 `_unfiltered`——传过滤后的 series 进来，
+    产出的"无滞后对照"会和主带一样滞后，等于什么都没补上（既有的
+    other_basis_median 正是这个坑）。
+
+    抽成独立函数是为了能被哨兵用合成数据直接验：构造"最后一个 NTM 观测之后还有
+    若干 trailing-only 行"的输入，断言 gap_since_main_band 抓到了那一段。
+    """
+    rows = [r for r in unfiltered_rows if r.get(f"{prefix}_trailing")]
+    if len(rows) < min_rows:
+        return None
+    win = rows[-window:]
+    vals = sorted(r[f"{prefix}_trailing"] for r in win)
+    gap = [r for r in rows if r["date"] > main_band_last_date]
+    return {
+        "basis": "trailing", "note": "分母=过去12个月，与主带不同口径，不可直接相减",
+        "span": {"start": win[0]["date"], "end": rows[-1]["date"]},
+        "days": len(vals),
+        "pctiles": {p: pctile(vals, p) for p in (25, 50, 75)},
+        "current": rows[-1][f"{prefix}_trailing"],
+        "current_date": rows[-1]["date"],
+        # 主带盲区那一段单独给：这正是"最近一年倍数去哪了"的答案
+        "gap_since_main_band": (
+            {"span": {"start": gap[0]["date"], "end": gap[-1]["date"]},
+             "days": len(gap),
+             "p50": pctile(sorted(r[f"{prefix}_trailing"] for r in gap), 50)}
+            if len(gap) >= min_gap else None)}
+
+
 def compute_band(ticker, email, years=5, basis="forward", include_series=False,
                  metric="eps", inputs=None):
     """算出历史 PE/P.S 分布，返回纯数据 dict（不打印）。
@@ -585,25 +620,10 @@ def compute_band(ticker, email, years=5, basis="forward", include_series=False,
     # 高出约一个增长率——MSFT 实测同一天 trailing 39.7 / ntm 30.2 = 1.316，恰好等于
     # FY2026/FY2025 EPS 之比 1.316，是算术不是巧合。因此这里只出**纯数据**：换算成
     # 可比口径需要一个前瞻增速，那是判断层的输入，由 engine 用 base g 完成并标注。
-    trailing_nolag = None
-    _tr = [s for s in _unfiltered if s.get(f"{P}_trailing")]
-    if basis != "trailing" and len(_tr) >= 60:
-        _lag_start = series[-1]["date"]          # 主带最后一个观测日
-        _gap = [s for s in _tr if s["date"] > _lag_start]
-        _tv = sorted(s[f"{P}_trailing"] for s in _tr[-252:])
-        trailing_nolag = {
-            "basis": "trailing", "note": "分母=过去12个月，与主带不同口径，不可直接相减",
-            "span": {"start": _tr[-252:][0]["date"], "end": _tr[-1]["date"]},
-            "days": len(_tv),
-            "pctiles": {p: pctile(_tv, p) for p in (25, 50, 75)},
-            "current": _tr[-1][f"{P}_trailing"],
-            "current_date": _tr[-1]["date"],
-            # 主带盲区那一段单独给：这正是"最近一年倍数去哪了"的答案
-            "gap_since_main_band": (
-                {"span": {"start": _gap[0]["date"], "end": _gap[-1]["date"]},
-                 "days": len(_gap),
-                 "p50": pctile(sorted(s[f"{P}_trailing"] for s in _gap), 50)}
-                if len(_gap) >= 20 else None)}
+    # 必须喂 _unfiltered（过滤前）——传 series 进去等于产出一条和主带同样滞后的
+    # "无滞后对照"，那正是 other_basis_median 的坑。函数 docstring 里也钉了这条。
+    trailing_nolag = (build_trailing_nolag(_unfiltered, series[-1]["date"], P)
+                      if basis != "trailing" else None)
 
     # 近 3 年子窗分位：5 年全窗把 2021 零利率 regime 的倍数原样计入（AMZN 全窗
     # P50≈31x 比手工参考带的中位还高），直接拿全窗 P50 当锚会把泡沫期抬进锚里。

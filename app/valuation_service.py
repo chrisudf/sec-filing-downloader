@@ -843,8 +843,12 @@ async def _pipeline(job: dict, ticker: str, email: str) -> None:
                 band_meta += (
                     f"\n    无滞后对照（trailing 口径，价÷过去12个月，{_tn['span']['start']}~"
                     f"{_tn['span']['end']}）：P50 {_tnp['50']:.1f}x，最新 {_tn['current']:.1f}x。"
-                    "**不可与上面的 NTM 分位直接相减**——trailing 分母是过去12个月，"
-                    "成长股系统性高出约一个增长率（除以 (1+g) 才是 NTM 可比口径）。")
+                    "**不可与上面的 NTM 分位直接相减**——trailing 分母是过去 12 个月的"
+                    "已实现 GAAP EPS，NTM 分位的分母是未来 12 个月的 EPS。"
+                    "换算需要除以 **EPS 增速因子**（你给出的该情景 NTM EPS ÷ 当前 GAAP "
+                    "TTM EPS），**不是营收增速 g**——利润率、税率、其他收益、股数变化"
+                    "都会让 EPS 增速与营收增速显著分叉（利润率扩张叠加回购的票尤其）。"
+                    "当前 GAAP TTM EPS 见 FACTS 的 TTM 净利 ÷ 稀释股数。")
                 _gap = _tn.get("gap_since_main_band")
                 if _gap:
                     band_meta += (f"\n    本带盲区那一段（{_gap['span']['start']}~"
@@ -1083,7 +1087,8 @@ async def _pipeline(job: dict, ticker: str, email: str) -> None:
                                    # 现价当前位置与倍数回归归因——区间中位的涨幅按构造
                                    # 全部来自倍数回归，不写出来读者看不见
                                    fwd_pe_now=_tr.get("fwd_pe_now"),
-                                   fwd_pe_now_pctile=_tr.get("fwd_pe_now_pctile"),
+                                   # 带外只给关系不给截断分位（PR #5 review）
+                                   fwd_pe_now_position=_tr.get("fwd_pe_now_position"),
                                    target_pe=_tr.get("target_pe"),
                                    mult_reversion=_tr.get("mult_reversion_to_p50"))
                               if _tr and _tr.get("px") else None))

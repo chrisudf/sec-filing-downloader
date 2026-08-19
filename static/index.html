@@ -415,10 +415,14 @@ async function runValuation() {
           trTxt += `）$${tr.lo}~$${tr.hi}，中位 $${tr.mid}`;
           if (tr.fwd_pe_now != null) {
             trTxt += `；现价隐含 ${tr.fwd_pe_now}x`;
-            if (tr.fwd_pe_now_pctile != null) trTxt += `（第 ${tr.fwd_pe_now_pctile} 百分位）`;
+            // 带外只给关系：低于 P10 的值会被 _pctile_rank 截断成"第10百分位"，
+            // 直接显示会与"跌出下沿"的说法自相矛盾
+            if (tr.fwd_pe_now_position) trTxt += `（${tr.fwd_pe_now_position}）`;
             if (tr.target_pe != null) trTxt += ` vs 目标 ${tr.target_pe}x`;
             if (tr.mult_reversion != null) {
-              trTxt += `，中位涨幅 ${(tr.mult_reversion * 100).toFixed(0)}% 全部来自倍数回归`;
+              // "纯倍数差距"而非"与盈利预测无关"：恒等式只在给定同一 base EPS 时成立，
+              // 改 EPS 会同比例移动中位价
+              trTxt += `，中位涨幅 ${(tr.mult_reversion * 100).toFixed(0)}% 是纯倍数差距（同一 base EPS 下）`;
             }
           }
         }

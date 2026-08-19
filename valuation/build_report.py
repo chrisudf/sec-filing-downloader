@@ -809,16 +809,21 @@ if _tr:
         _c50 = get_column_letter(2 + _qs.index("50")) if "50" in _qs else "D"
         put(ws, f"A{_row}", "现价隐含前瞻倍数 (×)", BOLD)
         put(ws, f"B{_row}", "=$B$4/'情景假设'!$C$34", BLACK, fmt=FM_X)
-        put(ws, f"C{_row}", f"带内第 {_tr['fwd_pe_now_pctile']:.0f} 百分位", GREEN)
+        # 带外只给关系不给分位：_pctile_rank 把低于 P10 的一律截断成 10，
+        # 直接显示会与"跌出下沿"的黄旗自相矛盾（PR #5 review）
+        put(ws, f"C{_row}", _tr.get("fwd_pe_now_position") or "", GREEN)
         put(ws, f"E{_row}", f"目标 PE {_tr['target_pe']:g}x", GREEN)
         put(ws, f"H{_row}", "价 ÷ base 前瞻 EPS。与本带同一分母概念（都是价÷未来12个月），"
                             "可直接比分位——不同于下方 trailing 对照", GREEN, wrap=True)
         _row += 1
-        put(ws, f"A{_row}", "中位涨幅中来自倍数回归的部分", BOLD)
+        put(ws, f"A{_row}", "中位涨幅（纯倍数差距）", BOLD)
         put(ws, f"B{_row}", f"={_c50}30/$B$4-1", BLACK, fmt=FM_PCT)
-        put(ws, f"H{_row}", "按构造为全部：中位价/现价 − 1 = P50/现价隐含倍数 − 1，"
-                            "base EPS 在分子分母里消掉。这块的涨幅完全依赖"
-                            "「倍数回到历史中枢」这一个假设，与盈利预测无关", GREEN, wrap=True)
+        put(ws, f"H{_row}", "中位价/现价 − 1 = P50/现价隐含倍数 − 1 是恒等式："
+                            "**给定同一个 base EPS 时**，现价与中位价用的是同一个分母，"
+                            "两者之差只能是倍数之差，不能由盈利预测解释。"
+                            "但这不等于「与盈利预测无关」——改 base EPS 会同比例移动"
+                            "中位价（现价隐含倍数也随之变），本行数值会跟着变",
+            GREEN, wrap=True)
         _row += 1
 
     # ---- 窗口内漂移：带子跨 3-5 年，regime 有没有在移动 ----
@@ -838,7 +843,7 @@ if _tr:
     _tn = _tr.get("trailing_nolag")
     if _tn:
         _tnp = {str(k): v for k, v in (_tn.get("pctiles") or {}).items()}
-        _g = _tr.get("trailing_ntm_equiv_g") or 0
+        _g = _tr.get("trailing_ntm_eps_growth")
         _gap = _tn.get("gap_since_main_band")
         put(ws, f"A{_row}", "⚠ 无滞后对照（trailing 口径）", BOLD)
         put(ws, f"B{_row}", f"{_tn['span']['start']}~{_tn['span']['end']}", GREEN)
@@ -846,11 +851,15 @@ if _tr:
                              if _tnp.get("50") else f"最新 {_tn['current']:.1f}x"), BLUE)
         put(ws, f"H{_row}", "trailing = 价 ÷ **过去** 12 个月 EPS，与上方 NTM 口径"
                             "（价 ÷ 未来 12 个月）差约一个增长率，**不可直接相减**"
-                            + (f"。按 base g {_g:.0%} 折成 NTM 可比口径约 "
-                               f"{_tnp['50'] / (1 + _g):.1f}x" if _g and _tnp.get("50") else "")
+                            + (f"。换算因子是 **EPS 增速**（建模 NTM EPS ÷ GAAP TTM EPS = "
+                               f"{_g:+.0%}），不是营收增速——两者在利润率扩张/回购的票上"
+                               f"会显著分叉。折成 NTM 可比口径约 "
+                               f"{_tnp['50'] / (1 + _g):.1f}x"
+                               if _g is not None and _tnp.get("50") else "")
                             + (f"；主带盲区那段（{_gap['span']['start']}~{_gap['span']['end']}，"
                                f"{_gap['days']}天）trailing P50 {_gap['p50']:.1f}x"
-                               + (f" ≈ NTM 可比 {_gap['p50'] / (1 + _g):.1f}x" if _g else "")
+                               + (f" ≈ NTM 可比 {_gap['p50'] / (1 + _g):.1f}x"
+                                  if _g is not None else "")
                                if _gap else ""), GREEN, wrap=True)
         _row += 1
     _row += 1
