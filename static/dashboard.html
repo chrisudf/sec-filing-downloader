@@ -133,6 +133,13 @@
     </div>
     <div class="chart-card">
       <div class="chart-head">
+        <div><h2>各细分业务营收</h2><div class="sub">堆叠=各分部，虚线=合并总营收对照；数据逐份解析自 10-K/10-Q 的 XBRL（首次加载约 10-60 秒）</div></div>
+        <div class="seg" id="segAxis" style="display:none"></div>
+      </div>
+      <div class="chart" id="cSegments"><div class="empty" id="segStatus">分部数据加载中…</div></div>
+    </div>
+    <div class="chart-card">
+      <div class="chart-head">
         <div><h2>利润瀑布</h2><div class="sub">营收到净利润的拆解，蓝=小计 / 橙=扣减；「其他」为对账残差项</div></div>
         <select id="wfPeriod"></select>
       </div>
@@ -162,7 +169,9 @@ const C = { s1: css("--s1"), s2: css("--s2"), s3: css("--s3"), s4: css("--s4"),
             text: css("--text"), muted: css("--muted"), border: css("--border"),
             card2: css("--card2") };
 
-const state = { freq: "quarterly", data: null, charts: {}, seq: 0 };
+const state = { freq: "quarterly", data: null, charts: {}, seq: 0, segSeq: 0 };
+const esc = (s) => String(s).replace(/[&<>"']/g,
+  (c) => ({ "&": "&amp;", "<": "&lt;", ">": "&gt;", '"': "&quot;", "'": "&#39;" }[c]));
 
 // ---- 控件与 URL 同步 ----
 const qs = new URLSearchParams(location.search);
@@ -371,6 +380,89 @@ function renderWaterfall(d, i) {
   mount("cWaterfall", opt);
 }
 
+// ---- 图 2b：各细分业务营收（独立异步加载，冷取数要逐份解析申报文件）----
+const SEG_COLORS = [C.s1, C.s2, C.s3, C.s4, C.s5, C.s6, C.s7];
+const OTHER_COLOR = "#7a7b88";
+
+function renderSegments(axis) {
+  const el = $("cSegments");
+  if (state.charts.cSegments) { state.charts.cSegments.dispose(); delete state.charts.cSegments; }
+  el.innerHTML = "";
+  const labels = axis.periods.map(p => p.label);
+  const opt = baseOpt();
+  opt.tooltip.formatter = (ps) => {
+    let html = `<b>${esc(ps[0].axisValue)}</b>`;
+    const i = ps[0].dataIndex;
+    for (const p of [...ps].reverse()) {
+      if (p.value == null) continue;
+      const mark = p.seriesName === "总营收"
+        ? (axis.derived[i] ? "（Q4=年度-前三季推导）" : "") : "";
+      // 成员名源自申报文件（第三方数据），拼 HTML 前必须转义
+      html += `<br>${p.marker} ${esc(p.seriesName)}: ${fmtUSD(p.value)}${mark}`;
+    }
+    if (axis.reconciled[i] === false) html += `<br>⚠ 该期分部与合并总额未对账`;
+    return html;
+  };
+  opt.xAxis = catAxis(labels);
+  opt.yAxis = usdAxis();
+  opt.series = axis.members.map((m, i) => ({
+    name: m.label, type: "bar", stack: "seg", data: axis.series[i],
+    itemStyle: { color: SEG_COLORS[i % SEG_COLORS.length] },
+    barMaxWidth: 30, emphasis: { focus: "series" },
+  }));
+  if (axis.other) {
+    opt.series.push({ name: "其他", type: "bar", stack: "seg", data: axis.other,
+      itemStyle: { color: OTHER_COLOR }, barMaxWidth: 30 });
+  }
+  opt.series.push({ name: "总营收", type: "line", data: axis.total,
+    lineStyle: { width: 2, type: "dashed", color: C.text },
+    itemStyle: { color: C.text }, symbol: "circle", symbolSize: 5,
+    connectNulls: false });
+  mount("cSegments", opt);
+}
+
+function renderSegAxisToggle(axes, active) {
+  const seg = $("segAxis");
+  seg.innerHTML = "";
+  seg.style.display = axes.length > 1 ? "flex" : "none";
+  for (const a of axes) {
+    const b = document.createElement("button");
+    b.textContent = a.label;
+    b.classList.toggle("on", a.key === active);
+    b.onclick = () => { renderSegAxisToggle(axes, a.key); renderSegments(axes.find(x => x.key === a.key)); };
+    seg.appendChild(b);
+  }
+}
+
+function segEmpty(msg) {
+  if (state.charts.cSegments) { state.charts.cSegments.dispose(); delete state.charts.cSegments; }
+  $("segAxis").style.display = "none";
+  $("cSegments").innerHTML = `<div class="empty">${""}</div>`;
+  $("cSegments").firstChild.textContent = msg;
+}
+
+async function loadSegments(ticker, freq, years) {
+  // 分部卡片用独立序号：主请求失败的新一轮不该作废仍然有效的在途分部
+  // 响应，否则卡片会永久停在「加载中…」
+  const seq = ++state.segSeq;
+  segEmpty("分部数据加载中…（冷启动要逐份解析 10-K/10-Q，约 10-60 秒）");
+  try {
+    const res = await fetch(`/api/segments/${encodeURIComponent(ticker)}?freq=${freq}&years=${years}`);
+    if (seq !== state.segSeq) return;
+    if (!res.ok) {
+      const body = await res.json().catch(() => ({}));
+      throw new Error(body.detail || `请求失败（HTTP ${res.status}）`);
+    }
+    const d = await res.json();
+    if (seq !== state.segSeq) return;
+    // 默认轴：业务线 > 经营分部 > 地区，取第一个可用的
+    renderSegAxisToggle(d.axes, d.axes[0].key);
+    renderSegments(d.axes[0]);
+  } catch (e) {
+    if (seq === state.segSeq) segEmpty(e.message);
+  }
+}
+
 // ---- 图 3：现金与债务 ----
 function renderBalance(d, labels) {
   const b = d.balance;
@@ -445,6 +537,7 @@ async function load() {
     renderIncome(d, labels);
     renderBalance(d, labels);
     renderCashflow(d, labels);
+    loadSegments(d.ticker, freq, years);  // 独立异步，不阻塞主图状态
     // 瀑布图期数下拉：默认最新一期
     const sel = $("wfPeriod");
     sel.innerHTML = "";
