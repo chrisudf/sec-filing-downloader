@@ -71,6 +71,11 @@ INSTANT = {"cash", "st_securities", "lt_securities", "lt_debt", "current_debt",
            "commercial_paper", "debt_securities_st", "debt_securities_lt",
            "lt_debt_noncurrent", "lt_debt_total", "lt_debt_current",
            "debt_current", "st_borrowings"}
+# 只补缺不覆盖的回退标签：主标签已有的期一律不动（估值管道基线稳定），
+# 只填缺失期。AVGO 2019 年起季度净利润只标 ProfitLoss（含少数股东权益）
+FILL_TAGS = {
+    "net_income": ["ProfitLoss", "NetIncomeLossAvailableToCommonStockholdersBasic"],
+}
 # 现金流表科目：10-Q 只披露财年累计数，离散季度序列要靠 YTD 差分
 YTD_FLOW = {"cfo", "capex"}
 
@@ -192,6 +197,11 @@ def build_facts(ticker: str, email: str, cik: int | None = None) -> dict:
         quarterly = pick(facts, TAGS[name], "quarterly")
         if name in YTD_FLOW:
             for k, v in quarterly_from_ytd(facts, TAGS[name]).items():
+                quarterly.setdefault(k, v)
+        for fill_tag in FILL_TAGS.get(name, ()):
+            for k, v in pick(facts, [fill_tag], "annual").items():
+                annual.setdefault(k, v)
+            for k, v in pick(facts, [fill_tag], "quarterly").items():
                 quarterly.setdefault(k, v)
         for a_end, a_val in annual.items():
             ae = date.fromisoformat(a_end)
