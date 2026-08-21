@@ -85,7 +85,7 @@
   .chart-card .sub { color: var(--muted); font-size: 12px; margin-top: 4px; }
   .chart-head { display: flex; align-items: center; justify-content: space-between; gap: 12px; flex-wrap: wrap; }
   .chart { width: 100%; height: 420px; }
-  .chart.tall { height: 500px; }
+  .chart.tall { height: 580px; }
   .empty {
     display: flex; align-items: center; justify-content: center;
     height: 300px; color: var(--muted); font-size: 14px;
@@ -258,9 +258,10 @@ function renderIncome(d, labels) {
     }
     return html;
   };
+  // 利润率面板给足高度：太矮时 0-100% 的刻度会把 20-50% 的正常波段挤成一团
   opt.grid = [
-    { left: 56, right: 20, top: 24, height: "48%" },
-    { left: 56, right: 20, top: "66%", height: "20%" },
+    { left: 56, right: 20, top: 24, height: "42%" },
+    { left: 56, right: 20, top: "58%", height: "28%" },
   ];
   opt.xAxis = [
     Object.assign(catAxis(labels), { gridIndex: 0, axisLabel: { show: false } }),
@@ -279,6 +280,7 @@ function renderIncome(d, labels) {
     lineStyle: { width: 2, color }, itemStyle: { color },
     symbol: "circle", symbolSize: 5, connectNulls: false,
   });
+  // 整列为空的系列不画也不进图例（银行没有营业成本/毛利率，硬挂着会误导）
   opt.series = [
     bar("营收", inc.revenue, C.s1),
     bar("营业成本", inc.cogs, C.s2),
@@ -287,7 +289,7 @@ function renderIncome(d, labels) {
     line("毛利率", m.gross, C.s5),
     line("营业利润率", m.operating, C.s6),
     line("净利润率", m.net, C.s7),
-  ];
+  ].filter(s => s.data.some(v => v != null));
   mount("cIncome", opt);
 }
 

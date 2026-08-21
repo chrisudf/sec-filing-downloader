@@ -171,6 +171,11 @@ def _reshape(facts: dict, info: dict, freq: str, years: int) -> dict:
     # GrossProfit 很多公司不标，回退用 营收-营业成本
     gross = [g if g is not None else (r - c if r is not None and c is not None else None)
              for g, r, c in zip(gross, revenue, cogs)]
+    # 银行报表没有毛利概念：SOFI 恰好有条成本标签，硬算会得出 82% 的
+    # 假毛利率（申报里不存在 gross profit 这一行），整列压掉
+    if facts.get("bank_format"):
+        cogs = [None] * len(ends)
+        gross = [None] * len(ends)
     # SG&A 合并披露优先；拆开披露的公司用 销售营销+管理 合成
     sga = [s if s is not None else (sm + ga if sm is not None and ga is not None else None)
            for s, sm, ga in zip(dur("sga"), dur("sm"), dur("ga"))]

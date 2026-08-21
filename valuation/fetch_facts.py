@@ -207,7 +207,10 @@ def build_facts(ticker: str, email: str, cik: int | None = None) -> dict:
         raise FactsError(f"{ticker} 没有 us-gaap 口径数据（可能是 IFRS 外国发行人），暂不支持")
     facts = all_facts["us-gaap"]
 
-    out = {"ticker": ticker, "cik": cik}
+    out = {"ticker": ticker, "cik": cik,
+           # 银行报表格式（损益表第一行是 Total net revenue）：
+           # 没有毛利概念，图表端据此不硬算毛利率
+           "bank_format": "RevenuesNetOfInterestExpense" in facts}
     for name in TAGS:
         if name in INSTANT:
             out[name + "_instant"] = pick(facts, TAGS[name], "instant")
