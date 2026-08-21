@@ -140,7 +140,7 @@
     </div>
     <div class="chart-card">
       <div class="chart-head">
-        <div><h2>利润瀑布</h2><div class="sub">营收到净利润的拆解，蓝=小计 / 橙=扣减；「其他」为对账残差项</div></div>
+        <div><h2>利润瀑布</h2><div class="sub">营收到净利润的拆解，蓝=小计 / 橙=扣减 / 绿=增加；「其他」为对账残差项</div></div>
         <select id="wfPeriod"></select>
       </div>
       <div class="chart" id="cWaterfall"></div>
@@ -268,7 +268,9 @@ function renderIncome(d, labels) {
   ];
   opt.yAxis = [
     Object.assign(usdAxis(), { gridIndex: 0 }),
-    { type: "value", gridIndex: 1,
+    // scale:true 让利润率轴贴合数据范围：GOOG 净利率被投资收益推到 94% 时，
+    // 0-100% 固定刻度会把正常的 20-40% 区间压成一条线
+    { type: "value", gridIndex: 1, scale: true,
       splitLine: { lineStyle: { color: C.border, opacity: .6 } },
       axisLabel: { color: C.muted, fontSize: 11, formatter: (v) => (v * 100).toFixed(0) + "%" } },
   ];
@@ -367,7 +369,9 @@ function renderWaterfall(d, i) {
     { type: "bar", stack: "wf", stackStrategy: "all",
       data: vis.map((v, idx) => ({
         value: v.value,
-        itemStyle: { color: v.total ? C.s1 : C.s2, borderRadius: 3 },
+        // 蓝=小计，橙=扣减，绿=增加（GOOG 的 +98B 投资收益画成橙色会误读）
+        itemStyle: { color: v.total ? C.s1 : (items[idx].val >= 0 ? C.s3 : C.s2),
+                     borderRadius: 3 },
         label: {
           show: true, position: v.total ? "top" : (items[idx].val >= 0 && !v.total ? "top" : "bottom"),
           color: C.muted, fontSize: 11,
