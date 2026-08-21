@@ -114,6 +114,20 @@
   button.download:hover { filter: brightness(1.08); }
   button.download:disabled { opacity: .5; cursor: wait; }
   button.download.val { background: #2e7d5b; margin-top: 8px; }
+  a.dash-btn {
+    display: block;
+    margin-top: 12px;
+    padding: 13px;
+    background: var(--card2);
+    border: 1px solid var(--accent);
+    border-radius: 10px;
+    color: var(--accent);
+    text-align: center;
+    text-decoration: none;
+    font-size: 15px;
+    font-weight: 700;
+  }
+  a.dash-btn:hover { background: var(--accent); color: #fff; }
   .status { margin-top: 14px; font-size: 13px; min-height: 18px; }
   .status.err { color: var(--err); }
   .status.ok { color: var(--ok); }
@@ -144,10 +158,8 @@
       <span class="icon">🗓️</span>
       <div><span class="k">最新财报</span><span id="coLatest">—</span></div>
     </div>
-    <div class="info-box" id="dashRow">
-      <span class="icon">📈</span>
-      <div><span class="k">财务图表</span><a id="dashLink" target="_blank" rel="noopener">损益 · 现金流 · 债务 图表面板 ↗</a></div>
-    </div>
+    <a id="dashLink" class="dash-btn" target="_blank" rel="noopener"
+       style="display:none">📈 打开财务图表面板（损益 · 分部营收 · 现金流 · 债务）↗</a>
   </div>
 
   <label class="section">下载类型（可多选）</label>
@@ -282,7 +294,7 @@ async function lookup() {
     }
     $("coLatest").textContent = parts.length ? parts.join("； ") : "未找到";
     $("dashLink").href = `/dashboard.html?ticker=${encodeURIComponent(info.ticker)}`;
-    $("dashRow").style.display = "flex";
+    $("dashLink").style.display = "block";
     $("companyInfo").style.display = "block";
   } catch (e) {
     showCompanyError("查询失败：" + e.message);
@@ -292,7 +304,7 @@ function showCompanyError(msg) {
   state.company = null;
   $("coName").textContent = msg;
   $("coLatest").textContent = "—";
-  $("dashRow").style.display = "none";
+  $("dashLink").style.display = "none";
   $("companyInfo").style.display = "block";
 }
 
