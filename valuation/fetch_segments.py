@@ -63,7 +63,9 @@ TARGET_AXES = {
 REQUEST_GAP = 0.12          # SEC 限速 10 req/s，全局（跨线程）生效
 MAX_FILINGS = 48            # 防误选超大范围
 MAX_INSTANCE_BYTES = 30_000_000
-PARSE_VER = 5               # 解析逻辑变更时递增，旧缓存自动失效
+PARSE_VER = 6               # 解析逻辑变更时递增，旧缓存自动失效
+# 集中度披露：带 1 的才是现行 us-gaap concept（无后缀版已弃用、返回零条）
+CONC_TAGS = {"ConcentrationRiskPercentage1", "ConcentrationRiskPercentage"}
 CACHE_DIR = Path(__file__).resolve().parent.parent / "jobs" / "segments_cache"
 
 _rate_lock = threading.Lock()
@@ -152,9 +154,9 @@ def _parse_instance(xml_bytes: bytes) -> dict:
             days = (date.fromisoformat(end) - date.fromisoformat(start)).days
         except (ValueError, TypeError):
             continue
-        if not (80 <= days <= 100 or 340 <= days <= 380):
-            continue
-        contexts[ctx.get("id")] = {"start": start, "end": end,
+        # 全部期间上下文都留着：营收事实在用的时候按季度/年度跨度过滤，
+        # 集中度事实（10-Q 里常见半年/9个月跨度）不受限
+        contexts[ctx.get("id")] = {"start": start, "end": end, "days": days,
                                    "dims": dims, "typed": typed}
 
     facts = {ln: {} for ln in REVENUE_LOCALNAMES}
@@ -170,12 +172,15 @@ def _parse_instance(xml_bytes: bytes) -> dict:
         except ValueError:
             continue
 
+    def span_ok(c: dict) -> bool:
+        return 80 <= c["days"] <= 100 or 340 <= c["days"] <= 380
+
     def axis_facts(ln: str, axis: str):
         """concept 在某轴上通过维度白名单的事实：{(start,end,member): (val, bare)}"""
         out = {}
         for cref, val in facts[ln].items():
             c = contexts[cref]
-            if c["typed"] or axis not in c["dims"]:
+            if c["typed"] or axis not in c["dims"] or not span_ok(c):
                 continue
             extra = {d: m for d, m in c["dims"].items() if d != axis}
             if extra and extra != {"ConsolidationItemsAxis": "OperatingSegmentsMember"}:
@@ -197,7 +202,7 @@ def _parse_instance(xml_bytes: bytes) -> dict:
         sums: dict = {}
         for cref, val in facts[ln].items():
             c = contexts[cref]
-            if c["typed"] or axis not in c["dims"]:
+            if c["typed"] or axis not in c["dims"] or not span_ok(c):
                 continue
             extra = {d: m for d, m in c["dims"].items()
                      if d not in (axis, "StatementBusinessSegmentsAxis")}
@@ -216,7 +221,7 @@ def _parse_instance(xml_bytes: bytes) -> dict:
     for ln in TOPLINE_PRIORITY:
         for cref, val in facts[ln].items():
             c = contexts[cref]
-            if c["typed"] or c["dims"]:
+            if c["typed"] or c["dims"] or not span_ok(c):
                 continue
             ref_totals.setdefault((c["start"], c["end"]), val)
 
@@ -252,7 +257,26 @@ def _parse_instance(xml_bytes: bytes) -> dict:
 
     for key, slot in periods.items():
         slot["total"] = ref_totals.get(key)
-    return {"periods": periods}
+
+    # 集中度披露：ConcentrationRiskPercentage1 + 全部维度原样带出，
+    # 分类（类型/基准/交易对手）留给服务端——基准轴必须保留，
+    # 「占应收款 46%」标成「占营收 46%」是对标站踩过的错
+    concentration = []
+    for el in root.iter():
+        if _local(el.tag) not in CONC_TAGS:
+            continue
+        cref = el.get("contextRef")
+        c = contexts.get(cref)
+        if c is None or c["typed"] or not el.text or not el.text.strip():
+            continue
+        try:
+            val = float(el.text.strip())
+        except ValueError:
+            continue
+        concentration.append({"start": c["start"], "end": c["end"],
+                              "days": c["days"], "value": val,
+                              "dims": dict(c["dims"])})
+    return {"periods": periods, "concentration": concentration}
 
 
 def _parse_filing_cached(client: httpx.Client, cik: int, acc: str) -> dict:
@@ -268,13 +292,15 @@ def _parse_filing_cached(client: httpx.Client, cik: int, acc: str) -> dict:
     url = _find_instance(client, cik, acc)
     r = _get(client, url)
     if len(r.content) > MAX_INSTANCE_BYTES:
-        parsed = {"periods": {}}
+        parsed = {"periods": {}, "concentration": []}
     else:
         try:
             parsed = _parse_instance(r.content)
         except ET.ParseError:
-            parsed = {"periods": {}}  # 畸形 instance：跳过该申报，不毒化请求
-    out = {"periods": {f"{s}|{e}": v for (s, e), v in parsed["periods"].items()}}
+            # 畸形 instance：跳过该申报，不毒化请求
+            parsed = {"periods": {}, "concentration": []}
+    out = {"periods": {f"{s}|{e}": v for (s, e), v in parsed["periods"].items()},
+           "concentration": parsed.get("concentration", [])}
     fd, tmp = tempfile.mkstemp(dir=CACHE_DIR, suffix=".tmp")
     with os.fdopen(fd, "w", encoding="utf-8") as f:
         f.write(json.dumps(out, ensure_ascii=False))
@@ -357,8 +383,29 @@ def build_segments(ticker: str, email: str, cik: int | None = None,
         # 先收集每期的全部申报版本（比较期会被多份申报覆盖）
         versions: dict = {}
         totals: dict = {}
+        # 集中度按（期间+类型+基准）整组取 filed 最新的申报：序数命名
+        # 跨申报不稳定（FY24 的 10-K 叫 CustomerOne、下年比较期叫
+        # CustomerB，同一家客户），逐事实合并会把同一期的新旧命名都留下；
+        # 分组必须带上类型+基准——10-Q 会用上年年度跨度的上下文标应收款
+        # 集中度，按期整组会把 10-K 的营收集中度整组误杀
+        def conc_group(entry: dict):
+            bench = type_m = ""
+            for axis, m in entry["dims"].items():
+                if "Benchmark" in axis:
+                    bench = m
+                elif "ConcentrationRiskByType" in axis:
+                    type_m = m
+            return (entry["start"], entry["end"], type_m, bench)
+
+        conc_cells: dict = {}  # group -> (filed, [entries])
         for row in picked:
             parsed = _parse_filing_cached(client, cik, row["acc"])
+            for entry in parsed.get("concentration", []):
+                k = conc_group(entry)
+                if k not in conc_cells or row["filed"] > conc_cells[k][0]:
+                    conc_cells[k] = (row["filed"], [entry])
+                elif row["filed"] == conc_cells[k][0]:
+                    conc_cells[k][1].append(entry)
             for pkey, slot in parsed["periods"].items():
                 s, e = pkey.split("|")
                 if slot.get("total") is not None:
@@ -455,7 +502,18 @@ def build_segments(ticker: str, email: str, cik: int | None = None,
     for data in axes.values():
         data["annual"] = dict(sorted(data["annual"].items()))
         data["quarterly"] = dict(sorted(data["quarterly"].items()))
-    return {"ticker": ticker, "cik": cik, "axes": axes}
+    # 同一份申报内 inline-XBRL 可能重复吐同一事实，按维度+期间去重
+    seen: set = set()
+    concentration = []
+    for _, (_filed, entries) in sorted(conc_cells.items()):
+        for e in entries:
+            k = (tuple(sorted(e["dims"].items())), e["start"], e["end"])
+            if k not in seen:
+                seen.add(k)
+                concentration.append(e)
+    concentration.sort(key=lambda e: (e["end"], -e["value"]))
+    return {"ticker": ticker, "cik": cik, "axes": axes,
+            "concentration": concentration}
 
 
 def main() -> None:

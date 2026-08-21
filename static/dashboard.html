@@ -92,6 +92,17 @@
   }
   #welcome { text-align: center; color: var(--muted); padding: 80px 20px; font-size: 14px; line-height: 2; }
   #welcome .big { font-size: 40px; }
+  .conc-banner { border-radius: 10px; padding: 12px 16px; font-size: 14px; margin: 14px 0 4px; }
+  .conc-banner.high { background: rgba(243, 124, 124, .12); color: var(--err); border: 1px solid rgba(243, 124, 124, .4); }
+  .conc-banner.medium { background: rgba(201, 133, 0, .12); color: #e0a63f; border: 1px solid rgba(201, 133, 0, .4); }
+  .conc-banner.low { background: var(--card2); color: var(--muted); border: 1px solid var(--border); }
+  table.conc { width: 100%; border-collapse: collapse; margin: 12px 0 16px; font-size: 13px; }
+  table.conc th, table.conc td { text-align: left; padding: 9px 12px; border-bottom: 1px solid var(--border); }
+  table.conc th { color: var(--muted); font-weight: 600; font-size: 12px; }
+  table.conc td.pct { font-variant-numeric: tabular-nums; font-weight: 700; }
+  table.conc .tag { display: inline-block; background: var(--card2); border: 1px solid var(--border);
+                    border-radius: 6px; padding: 1px 8px; font-size: 12px; color: var(--muted); }
+  .conc-empty { color: var(--muted); font-size: 13px; padding: 18px 4px 14px; }
 </style>
 </head>
 <body>
@@ -137,6 +148,14 @@
         <div class="seg" id="segAxis" style="display:none"></div>
       </div>
       <div class="chart" id="cSegments"><div class="empty" id="segStatus">分部数据加载中…</div></div>
+    </div>
+    <div class="chart-card">
+      <div class="chart-head">
+        <div><h2>客户与供应商集中度</h2><div class="sub">来自 10-K/10-Q 的 XBRL 集中度披露；占比含义以「基准」列为准——占应收款 ≠ 占营收</div></div>
+      </div>
+      <div id="concBanner" class="conc-banner" style="display:none"></div>
+      <div class="chart" id="cConcTrend" style="display:none;height:280px"></div>
+      <div id="concTable"></div>
     </div>
     <div class="chart-card">
       <div class="chart-head">
@@ -452,6 +471,7 @@ async function loadSegments(ticker, freq, years) {
   // 响应，否则卡片会永久停在「加载中…」
   const seq = ++state.segSeq;
   segEmpty("分部数据加载中…（冷启动要逐份解析 10-K/10-Q，约 10-60 秒）");
+  concReset("集中度数据加载中…");  // 别让上一只股票的风险横幅挂在加载窗口里
   try {
     const res = await fetch(`/api/segments/${encodeURIComponent(ticker)}?freq=${freq}&years=${years}`);
     if (seq !== state.segSeq) return;
@@ -461,12 +481,123 @@ async function loadSegments(ticker, freq, years) {
     }
     const d = await res.json();
     if (seq !== state.segSeq) return;
-    // 默认轴：业务线 > 经营分部 > 地区，取第一个可用的
-    renderSegAxisToggle(d.axes, d.axes[0].key);
-    renderSegments(d.axes[0]);
+    if (d.axes.length) {
+      // 默认轴：业务线 > 经营分部 > 地区，取第一个可用的
+      renderSegAxisToggle(d.axes, d.axes[0].key);
+      renderSegments(d.axes[0]);
+    } else {
+      segEmpty("该公司没有可用的分部营收数据");
+    }
+    renderConcentration(d.concentration);
   } catch (e) {
-    if (seq === state.segSeq) segEmpty(e.message);
+    if (seq === state.segSeq) {
+      segEmpty(e.message);
+      renderConcentration(null);
+    }
   }
+}
+
+// ---- 图 2c：客户与供应商集中度 ----
+function concReset(msg) {
+  if (state.charts.cConcTrend) { state.charts.cConcTrend.dispose(); delete state.charts.cConcTrend; }
+  $("concBanner").style.display = "none";
+  $("cConcTrend").style.display = "none";
+  const tableEl = $("concTable");
+  tableEl.textContent = "";
+  if (msg) {
+    const d = document.createElement("div");
+    d.className = "conc-empty";
+    d.textContent = msg;
+    tableEl.appendChild(d);
+  }
+}
+
+function renderConcentration(c) {
+  const banner = $("concBanner"), trendEl = $("cConcTrend"), tableEl = $("concTable");
+  concReset(null);
+  if (!c || !c.latest || !c.latest.length) {
+    concReset("该公司未在 XBRL 中披露集中度风险数据（通常意味着没有单一客户占营收 ≥10%）。");
+    return;
+  }
+  // 风险横幅：只看「占营收」基准的客户集中度，别的基准不冒充营收风险；
+  // 群体口径（前N大合计/某地区客户）用「合计」措辞，不冒充单一客户
+  banner.style.display = "block";
+  const agg = c.risk.aggregate ? "（合计口径）" : "";
+  banner.className = "conc-banner " +
+    (c.risk.level === "stale" ? "low" : c.risk.level);
+  banner.textContent = c.risk.level === "stale"
+    ? `最近一次集中度披露在 ${c.risk.last_end}，此后的申报未再披露（通常意味着不再有 ≥10% 的集中）；下表为历史披露。`
+    : c.risk.level === "high"
+      ? `高度集中风险：${c.risk.top_party}${agg} 占营收 ${c.risk.top_pct}%，失去该客户将构成重大事件。`
+      : c.risk.level === "medium"
+        ? `中度集中：${c.risk.top_party}${agg} 占营收 ${c.risk.top_pct}%。`
+        : "未披露占营收 ≥10% 的单一客户；下表为应收款/供应商等其他基准的集中度披露。";
+  // 趋势：营收基准的单一客户合计（年度），≥2 期才画；披露空窗年份
+  // 补 null 点断线呈现，不把跨年空档压成相邻点
+  if (c.trend.length >= 2) {
+    const tr = [];
+    for (let i = 0; i < c.trend.length; i++) {
+      if (i > 0) {
+        const prevY = +c.trend[i - 1].end.slice(0, 4);
+        const curY = +c.trend[i].end.slice(0, 4);
+        for (let y = prevY + 1; y < curY; y++)
+          tr.push({ label: String(y), sum: null, count: null });
+      }
+      tr.push(c.trend[i]);
+    }
+    trendEl.style.display = "block";
+    const opt = baseOpt();
+    opt.legend = { show: false };
+    opt.grid = { left: 56, right: 20, top: 28, bottom: 28 };
+    opt.tooltip.formatter = (ps) => {
+      const p = ps[0]; const t = tr[p.dataIndex];
+      if (t.sum == null) return `<b>${esc(t.label)}</b><br>该年度未披露单一客户集中度`;
+      return `<b>${esc(t.label)}</b><br>${p.marker} 重大单一客户合计占营收: ${t.sum}%（${t.count} 家）`;
+    };
+    opt.xAxis = catAxis(tr.map(t => t.label));
+    opt.yAxis = { type: "value",
+      splitLine: { lineStyle: { color: C.border, opacity: .6 } },
+      axisLabel: { color: C.muted, fontSize: 11, formatter: (v) => v + "%" } };
+    opt.series = [{
+      type: "line", data: tr.map(t => t.sum), connectNulls: false,
+      lineStyle: { width: 2, color: C.s1 }, itemStyle: { color: C.s1 },
+      symbol: "circle", symbolSize: 6,
+      areaStyle: { color: C.s1, opacity: .12 },
+      label: { show: true, position: "top", color: C.muted, fontSize: 11,
+               formatter: (p) => tr[p.dataIndex].count != null ? `${tr[p.dataIndex].count} 家` : "" },
+    }];
+    mount("cConcTrend", opt);
+  }
+  // 明细表（textContent 构建，成员名来自申报文件）
+  const tbl = document.createElement("table");
+  tbl.className = "conc";
+  const head = tbl.createTHead().insertRow();
+  for (const h of ["交易对手", "类型", "基准（占什么）", "占比", "期间"]) {
+    const th = document.createElement("th");
+    th.textContent = h;
+    head.appendChild(th);
+  }
+  const body = tbl.createTBody();
+  for (const r of c.latest) {
+    const tr = body.insertRow();
+    tr.insertCell().textContent = r.party + (r.aggregate ? "（合计）" : "");
+    const tdType = tr.insertCell();
+    const tag = document.createElement("span");
+    tag.className = "tag";
+    tag.textContent = r.type;
+    tdType.appendChild(tag);
+    tr.insertCell().textContent = r.benchmark;
+    const tdPct = tr.insertCell();
+    tdPct.className = "pct";
+    tdPct.textContent = r.pct + "%";
+    // 风险配色只给客户集中度：地域占营收 50% 是常态分布，不是风险信号
+    const risky = r.type === "客户" && r.benchmark === "营收";
+    tdPct.style.color = risky && r.pct >= 30 ? css("--err")
+      : risky && r.pct >= 10 ? "#e0a63f" : "";
+    const span = r.annual ? "年度" : r.days <= 100 ? "单季" : "YTD";
+    tr.insertCell().textContent = `截至 ${r.end}（${span}）`;
+  }
+  tableEl.appendChild(tbl);
 }
 
 // ---- 图 3：现金与债务 ----
