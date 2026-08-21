@@ -136,7 +136,9 @@ def _total_debt(inst) -> list:
             out.append(lt + extra)
         else:
             out.append(None)
-    return out
+    # 最后的兜底：SOFI 2023 起资产负债表 Debt 行只标长短期合并口径
+    combined = inst("debt_combined")
+    return [t if t is not None else c for t, c in zip(out, combined)]
 
 
 def _reshape(facts: dict, info: dict, freq: str, years: int) -> dict:
@@ -173,9 +175,12 @@ def _reshape(facts: dict, info: dict, freq: str, years: int) -> dict:
     sga = [s if s is not None else (sm + ga if sm is not None and ga is not None else None)
            for s, sm, ga in zip(dur("sga"), dur("sm"), dur("ga"))]
     op_income = dur("op_income")
-    # 运营费用：披露值优先，缺了用 毛利-营业利润 倒推
-    opex = [o if o is not None else (g - oi if g is not None and oi is not None else None)
-            for o, g, oi in zip(dur("opex"), gross, op_income)]
+    # 运营费用：披露值优先，缺了用 毛利-营业利润 倒推；银行格式两者皆无，
+    # 退到非利息支出合计（SOFI 等的费用主体）
+    nie = dur("noninterest_expense")
+    opex = [o if o is not None
+            else (g - oi if g is not None and oi is not None else n)
+            for o, g, oi, n in zip(dur("opex"), gross, op_income, nie)]
     net_income = dur("net_income")
 
     ocf = dur("cfo")
@@ -183,12 +188,21 @@ def _reshape(facts: dict, info: dict, freq: str, years: int) -> dict:
     fcf = _sub(ocf, capex)
 
     cash = inst("cash")
-    # 证券类：基线口径优先，NVDA 2026 起的 DebtSecurities* 新标签按期回填
+    # 证券类：基线口径优先。NVDA 2026 起把该行拆成 债券+股票 两个新标签，
+    # 回填时两腿都要（只跟债券腿会把 +18B 的组合增长画成缩水）；
+    # 股票腿只在债券腿同期存在（拆分特征成立）时并入，防附注级零散值漏入
+    debt_st, eq_st = inst("debt_securities_st"), inst("equity_securities_st")
+    st_fill = [d + (e or 0) if d is not None else None
+               for d, e in zip(debt_st, eq_st)]
     st_sec = [a if a is not None else b
-              for a, b in zip(inst("st_securities"), inst("debt_securities_st"))]
+              for a, b in zip(inst("st_securities"), st_fill)]
     lt_sec = [a if a is not None else b
               for a, b in zip(inst("lt_securities"), inst("debt_securities_lt"))]
     securities = _add(st_sec, lt_sec)
+    # 无分类资产负债表的银行（SOFI）整行标 OtherInvestments——该标签太泛，
+    # 只在分类口径整列全空时才启用
+    if all(v is None for v in securities):
+        securities = inst("securities_unclassified")
 
     return {
         "ticker": facts["ticker"],

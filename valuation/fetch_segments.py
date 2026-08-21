@@ -42,12 +42,17 @@ REVENUE_LOCALNAMES = [
     "RevenueFromContractWithCustomerExcludingAssessedTax",
     "RevenueFromContractWithCustomerIncludingAssessedTax",
     "Revenues",
-    # 银行（GS/JPM）与公用事业把分部营收标在行业口径下
+    # 银行（GS/JPM/SOFI）与公用事业把分部营收标在行业口径下
     "RevenuesNetOfInterestExpense",
     "RegulatedAndUnregulatedOperatingRevenue",
     "SalesRevenueNet",
     "SalesRevenueGoodsNet",
 ]
+# 合并总额参照的优先序：RevenuesNetOfInterestExpense 一旦出现即为损益表
+# 第一行（银行的 Total net revenue），必须先于 ASC 606 附注口径
+TOPLINE_PRIORITY = (["RevenuesNetOfInterestExpense"]
+                    + [ln for ln in REVENUE_LOCALNAMES
+                       if ln != "RevenuesNetOfInterestExpense"])
 # 轴按 local name 匹配：属性值里的前缀（srt:/us-gaap:）是申报方自选文本
 TARGET_AXES = {
     "ProductOrServiceAxis": "product",
@@ -58,7 +63,7 @@ TARGET_AXES = {
 REQUEST_GAP = 0.12          # SEC 限速 10 req/s，全局（跨线程）生效
 MAX_FILINGS = 48            # 防误选超大范围
 MAX_INSTANCE_BYTES = 30_000_000
-PARSE_VER = 4               # 解析逻辑变更时递增，旧缓存自动失效
+PARSE_VER = 5               # 解析逻辑变更时递增，旧缓存自动失效
 CACHE_DIR = Path(__file__).resolve().parent.parent / "jobs" / "segments_cache"
 
 _rate_lock = threading.Lock()
@@ -183,31 +188,70 @@ def _parse_instance(xml_bytes: bytes) -> dict:
                 out[key] = (val, bare)
             elif bare == out[key][1]:
                 out[key] = (val, bare)
-        return out
+        return {k: v for k, (v, _) in out.items()}
 
-    periods: dict = {}
-    # concept 按轴独立选：ASC 606 分拆和 ASC 280 分部常在不同 concept 下
-    # （DE 的分部/地区只在 Revenues，产品在 RevenueFromContract...）
-    for axis, axis_key in TARGET_AXES.items():
-        for ln in REVENUE_LOCALNAMES:
-            rows = axis_facts(ln, axis)
-            if not rows:
+    def axis_facts_matrix(ln: str, axis: str):
+        """产品/地区 × 经营分部 的矩阵事实按成员跨分部求和。SOFI 2023 起
+        产品分拆只有双维度矩阵、不再标产品单维合计——仅在该 concept 的
+        单维事实为空时启用，避免与合计双计。"""
+        sums: dict = {}
+        for cref, val in facts[ln].items():
+            c = contexts[cref]
+            if c["typed"] or axis not in c["dims"]:
                 continue
-            for (s, e, member), (val, _) in rows.items():
-                slot = periods.setdefault((s, e), {"total": None, "axes": {}})
-                slot["axes"].setdefault(axis_key, {})[member] = val
-            break
+            extra = {d: m for d, m in c["dims"].items()
+                     if d not in (axis, "StatementBusinessSegmentsAxis")}
+            if "StatementBusinessSegmentsAxis" not in c["dims"]:
+                continue
+            if extra and extra != {"ConsolidationItemsAxis": "OperatingSegmentsMember"}:
+                continue
+            key = (c["start"], c["end"], c["dims"][axis])
+            sums[key] = sums.get(key, 0) + val
+        return sums
 
-    # 合并总额按候选顺序跨 concept 取无维度事实（GOOG 的总额和分部
-    # 不在同一 concept 下）
-    for ln in REVENUE_LOCALNAMES:
+    # 合并总额：按主线口径优先序跨 concept 取无维度事实（银行的
+    # Total net revenue 必须压过 ASC 606 附注口径；GOOG 的总额和分部
+    # 也不在同一 concept 下）
+    ref_totals: dict = {}
+    for ln in TOPLINE_PRIORITY:
         for cref, val in facts[ln].items():
             c = contexts[cref]
             if c["typed"] or c["dims"]:
                 continue
-            key = (c["start"], c["end"])
-            if key in periods and periods[key]["total"] is None:
-                periods[key]["total"] = val
+            ref_totals.setdefault((c["start"], c["end"]), val)
+
+    periods: dict = {}
+    # concept 按轴独立选，且不能「第一个有事实的就用」：SOFI 的分部轴上
+    # ASC 606 附注（子集，缺 Lending）和 ASC 280 分部表并存——按「成员和
+    # 贴近合并总额」的对账质量挑 concept，平手按候选顺序
+    for axis, axis_key in TARGET_AXES.items():
+        cands = []
+        for ln in REVENUE_LOCALNAMES:
+            rows = axis_facts(ln, axis)
+            if not rows and axis != "StatementBusinessSegmentsAxis":
+                rows = axis_facts_matrix(ln, axis)
+            if rows:
+                cands.append((ln, rows))
+        if not cands:
+            continue
+        best = None
+        for order, (ln, rows) in enumerate(cands):
+            sums: dict = {}
+            for (s, e, _m), v in rows.items():
+                sums[(s, e)] = sums.get((s, e), 0) + v
+            diffs = [abs(msum - ref_totals[k]) / abs(ref_totals[k])
+                     for k, msum in sums.items()
+                     if k in ref_totals and ref_totals[k]]
+            score = sorted(diffs)[len(diffs) // 2] if diffs else float("inf")
+            if best is None or score < best[0] - 1e-9:
+                best = (score, order, rows)
+        rows = best[2]
+        for (s, e, member), val in rows.items():
+            slot = periods.setdefault((s, e), {"total": None, "axes": {}})
+            slot["axes"].setdefault(axis_key, {})[member] = val
+
+    for key, slot in periods.items():
+        slot["total"] = ref_totals.get(key)
     return {"periods": periods}
 
 
@@ -310,8 +354,8 @@ def build_segments(ticker: str, email: str, cik: int | None = None,
         picked = sorted((r for r in rows if r["report"] >= cutoff),
                         key=lambda r: r["report"], reverse=True)[:MAX_FILINGS]
 
-        # 整期按 filed 最新的申报取：分部重述（recast）时不混用新旧口径
-        cells: dict = {}
+        # 先收集每期的全部申报版本（比较期会被多份申报覆盖）
+        versions: dict = {}
         totals: dict = {}
         for row in picked:
             parsed = _parse_filing_cached(client, cik, row["acc"])
@@ -321,9 +365,45 @@ def build_segments(ticker: str, email: str, cik: int | None = None,
                     if (s, e) not in totals or row["filed"] > totals[(s, e)][0]:
                         totals[(s, e)] = (row["filed"], slot["total"])
                 for axis_key, members in slot.get("axes", {}).items():
-                    k = (axis_key, s, e)
-                    if k not in cells or row["filed"] > cells[k][0]:
-                        cells[k] = (row["filed"], members)
+                    versions.setdefault((axis_key, s, e), []).append(
+                        (row["filed"], members))
+
+        # 跨申报改名成员缝合：MSFT 把 SearchAndNewsAdvertising 改名
+        # SearchAdvertising 并按新名重标比较期——同一期的新旧两版里，
+        # 值完全相等且双向唯一的成员对视为改名，旧名统一映射到新名
+        aliases: dict = {}
+        for (axis_key, s, e), vers in versions.items():
+            if len(vers) < 2:
+                continue
+            vers.sort(key=lambda t: t[0])  # 只按 filed 排序（dict 不可比较）
+            newest = vers[-1][1]
+            for _, old in vers[:-1]:
+                for om, ov in old.items():
+                    if om in newest:
+                        continue
+                    hits = [nm for nm, nv in newest.items()
+                            if nm not in old and abs(nv - ov) <= max(abs(ov) * 1e-6, 1)]
+                    if len(hits) == 1:
+                        aliases.setdefault(axis_key, {})[om] = hits[0]
+
+        def rename(axis_key: str, members: dict) -> dict:
+            amap = aliases.get(axis_key)
+            if not amap:
+                return members
+            out = {}
+            for m, v in members.items():
+                seen = {m}
+                while m in amap and amap[m] not in seen:
+                    m = amap[m]
+                    seen.add(m)
+                out.setdefault(m, v)
+            return out
+
+        # 整期按 filed 最新的申报取：分部重述（recast）时不混用新旧口径
+        cells: dict = {}
+        for (axis_key, s, e), vers in versions.items():
+            filed, members = max(vers, key=lambda t: t[0])
+            cells[(axis_key, s, e)] = (filed, rename(axis_key, members))
 
     def span(s: str, e: str) -> int:
         return (date.fromisoformat(e) - date.fromisoformat(s)).days

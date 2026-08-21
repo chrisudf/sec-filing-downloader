@@ -15,11 +15,12 @@ from datetime import date, timedelta
 import httpx
 
 TAGS = {
-    # 后三个覆盖银行（RevenuesNetOfInterestExpense）、公用事业等换标签的公司，
-    # 否则窗口会锚定在十年前的陈旧序列上
+    # 后两个覆盖公用事业等换标签的公司，否则窗口会锚定在十年前的陈旧序列上；
+    # 银行的 RevenuesNetOfInterestExpense 走下面的 OVERRIDE_TAGS（必须压过
+    # ASC 606 附注子集，不能平级合并）
     "revenue": ["RevenueFromContractWithCustomerExcludingAssessedTax", "Revenues",
                 "SalesRevenueNet", "RevenueFromContractWithCustomerIncludingAssessedTax",
-                "RevenuesNetOfInterestExpense", "RegulatedAndUnregulatedOperatingRevenue"],
+                "RegulatedAndUnregulatedOperatingRevenue"],
     "cogs": ["CostOfGoodsAndServicesSold", "CostOfRevenue", "CostOfGoodsSold"],
     "gross_profit": ["GrossProfit"],
     "rnd": ["ResearchAndDevelopmentExpense"],
@@ -33,6 +34,8 @@ TAGS = {
         "IncomeLossFromContinuingOperationsBeforeIncomeTaxesExtraordinaryItemsNoncontrollingInterest",
         "IncomeLossFromContinuingOperationsBeforeIncomeTaxesMinorityInterestAndIncomeLossFromEquityMethodInvestments"],
     "income_tax": ["IncomeTaxExpenseBenefit"],
+    # 银行格式没有 OperatingExpenses，非利息支出是对应的费用合计（图表端回退用）
+    "noninterest_expense": ["NoninterestExpense"],
     "net_income": ["NetIncomeLoss"],
     "eps_diluted": ["EarningsPerShareDiluted"],
     "cfo": ["NetCashProvidedByUsedInOperatingActivities"],
@@ -65,16 +68,32 @@ TAGS = {
                         "LongTermDebtAndCapitalLeaseObligationsCurrent"],
     "debt_current": ["DebtCurrent"],
     "st_borrowings": ["ShortTermBorrowings", "OtherShortTermBorrowings"],
+    # NVDA 2026 起把「有价证券」拆成 债券+股票 两行，只跟债券腿会把
+    # 投资组合画成缩水（实际 +18B）
+    "equity_securities_st": ["EquitySecuritiesFvNi"],
+    # SOFI 这类无分类资产负债表的银行把投资证券整行标成 OtherInvestments；
+    # 该标签太泛，只在所有分类证券标签全空时才启用（服务端把关）
+    "securities_unclassified": ["OtherInvestments"],
+    # SOFI 2023 起资产负债表 Debt 行只标长短期合并口径
+    "debt_combined": ["DebtLongtermAndShorttermCombinedAmount"],
     "shares_diluted": ["WeightedAverageNumberOfDilutedSharesOutstanding"],
 }
 INSTANT = {"cash", "st_securities", "lt_securities", "lt_debt", "current_debt",
            "commercial_paper", "debt_securities_st", "debt_securities_lt",
            "lt_debt_noncurrent", "lt_debt_total", "lt_debt_current",
-           "debt_current", "st_borrowings"}
+           "debt_current", "st_borrowings", "equity_securities_st",
+           "securities_unclassified", "debt_combined"}
 # 只补缺不覆盖的回退标签：主标签已有的期一律不动（估值管道基线稳定），
 # 只填缺失期。AVGO 2019 年起季度净利润只标 ProfitLoss（含少数股东权益）
 FILL_TAGS = {
     "net_income": ["ProfitLoss", "NetIncomeLossAvailableToCommonStockholdersBasic"],
+}
+# 报表主线口径覆盖：该标签出现的期直接替换合并结果。银行同一份申报里
+# RevenuesNetOfInterestExpense 是损益表第一行「Total net revenue」，而
+# RevenueFromContractWithCustomer 只是 ASC 606 附注的合同收入子集——
+# 平级合并会让 SOFI 的营收少报 8 倍。非银行公司不标该口径，零影响
+OVERRIDE_TAGS = {
+    "revenue": ["RevenuesNetOfInterestExpense"],
 }
 # 现金流表科目：10-Q 只披露财年累计数，离散季度序列要靠 YTD 差分
 YTD_FLOW = {"cfo", "capex"}
@@ -203,6 +222,9 @@ def build_facts(ticker: str, email: str, cik: int | None = None) -> dict:
                 annual.setdefault(k, v)
             for k, v in pick(facts, [fill_tag], "quarterly").items():
                 quarterly.setdefault(k, v)
+        for ov_tag in OVERRIDE_TAGS.get(name, ()):
+            annual.update(pick(facts, [ov_tag], "annual"))
+            quarterly.update(pick(facts, [ov_tag], "quarterly"))
         for a_end, a_val in annual.items():
             ae = date.fromisoformat(a_end)
             in_year = {k: v for k, v in quarterly.items()
