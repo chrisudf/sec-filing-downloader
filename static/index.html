@@ -144,6 +144,10 @@
       <span class="icon">🗓️</span>
       <div><span class="k">最新财报</span><span id="coLatest">—</span></div>
     </div>
+    <div class="info-box" id="dashRow">
+      <span class="icon">📈</span>
+      <div><span class="k">财务图表</span><a id="dashLink" target="_blank" rel="noopener">损益 · 现金流 · 债务 图表面板 ↗</a></div>
+    </div>
   </div>
 
   <label class="section">下载类型（可多选）</label>
@@ -277,6 +281,8 @@ async function lookup() {
       parts.push(`${form}：报告期 ${d.reportDate || "?"}（${d.filingDate} 提交）`);
     }
     $("coLatest").textContent = parts.length ? parts.join("； ") : "未找到";
+    $("dashLink").href = `/dashboard.html?ticker=${encodeURIComponent(info.ticker)}`;
+    $("dashRow").style.display = "flex";
     $("companyInfo").style.display = "block";
   } catch (e) {
     showCompanyError("查询失败：" + e.message);
@@ -286,6 +292,7 @@ function showCompanyError(msg) {
   state.company = null;
   $("coName").textContent = msg;
   $("coLatest").textContent = "—";
+  $("dashRow").style.display = "none";
   $("companyInfo").style.display = "block";
 }
 

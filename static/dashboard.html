@@ -1,0 +1,468 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>财务图表 · EDGAR 财报下载器</title>
+<style>
+  :root {
+    --bg: #0b0c10;
+    --card: #14151c;
+    --card2: #101118;
+    --border: #2a2b36;
+    --text: #e8e8ee;
+    --muted: #8b8c9a;
+    --accent: #7c7ff3;
+    --accent-dim: #23244a;
+    --err: #f37c7c;
+    --ok: #7cf3a8;
+    /* 数据系列：参考调色板 dark 档，已按 #14151c 底色跑过全套校验 */
+    --s1: #3987e5;
+    --s2: #d95926;
+    --s3: #199e70;
+    --s4: #c98500;
+    --s5: #d55181;
+    --s6: #008300;
+    --s7: #9085e9;
+    --s8: #e66767;
+  }
+  * { box-sizing: border-box; margin: 0; padding: 0; }
+  body {
+    background: var(--bg);
+    color: var(--text);
+    font-family: "Segoe UI", "Microsoft YaHei", system-ui, sans-serif;
+    padding-bottom: 48px;
+  }
+  .wrap { max-width: 1200px; margin: 0 auto; padding: 0 16px; }
+  .topbar {
+    position: sticky; top: 0; z-index: 10;
+    background: rgba(11, 12, 16, .92);
+    backdrop-filter: blur(6px);
+    border-bottom: 1px solid var(--border);
+    padding: 14px 0;
+  }
+  .topbar .wrap { display: flex; align-items: center; gap: 12px; flex-wrap: wrap; }
+  .brand { display: flex; align-items: baseline; gap: 10px; margin-right: 8px; }
+  .brand h1 { font-size: 18px; white-space: nowrap; }
+  .brand a { color: var(--muted); font-size: 12px; text-decoration: none; white-space: nowrap; }
+  .brand a:hover { color: var(--accent); }
+  input[type=text], select {
+    background: var(--card2);
+    border: 1px solid var(--border);
+    border-radius: 10px;
+    color: var(--text);
+    font-size: 14px;
+    padding: 9px 12px;
+    outline: none;
+  }
+  input:focus, select:focus { border-color: var(--accent); }
+  #ticker { width: 110px; text-transform: uppercase; }
+  .seg { display: flex; border: 1px solid var(--border); border-radius: 10px; overflow: hidden; }
+  .seg button {
+    background: var(--card2); color: var(--muted); border: none;
+    font-size: 13px; padding: 9px 14px; cursor: pointer;
+  }
+  .seg button.on { background: var(--accent-dim); color: var(--text); font-weight: 700; }
+  button.go {
+    background: var(--accent); color: #fff; border: none; border-radius: 10px;
+    font-size: 14px; font-weight: 700; padding: 9px 22px; cursor: pointer;
+  }
+  button.go:hover { filter: brightness(1.08); }
+  button.go:disabled { opacity: .5; cursor: wait; }
+  .status { font-size: 13px; color: var(--muted); min-width: 120px; }
+  .status.err { color: var(--err); }
+  .status.ok { color: var(--ok); }
+  .coname { color: var(--muted); font-size: 13px; }
+  .coname b { color: var(--text); }
+  .grid { display: grid; grid-template-columns: 1fr; gap: 16px; margin-top: 18px; }
+  .chart-card {
+    background: var(--card);
+    border: 1px solid var(--border);
+    border-radius: 16px;
+    padding: 20px 20px 8px;
+  }
+  .chart-card h2 { font-size: 16px; letter-spacing: .3px; }
+  .chart-card .sub { color: var(--muted); font-size: 12px; margin-top: 4px; }
+  .chart-head { display: flex; align-items: center; justify-content: space-between; gap: 12px; flex-wrap: wrap; }
+  .chart { width: 100%; height: 420px; }
+  .chart.tall { height: 500px; }
+  .empty {
+    display: flex; align-items: center; justify-content: center;
+    height: 300px; color: var(--muted); font-size: 14px;
+  }
+  #welcome { text-align: center; color: var(--muted); padding: 80px 20px; font-size: 14px; line-height: 2; }
+  #welcome .big { font-size: 40px; }
+</style>
+</head>
+<body>
+<div class="topbar">
+  <div class="wrap">
+    <div class="brand">
+      <h1>📈 财务图表</h1>
+      <a href="/">← 下载器</a>
+    </div>
+    <input type="text" id="ticker" placeholder="AAPL" autocomplete="off" spellcheck="false">
+    <div class="seg" id="freqSeg">
+      <button data-v="quarterly" class="on">季度</button>
+      <button data-v="annual">年度</button>
+    </div>
+    <select id="years">
+      <option value="3">3 年</option>
+      <option value="5">5 年</option>
+      <option value="10">10 年</option>
+    </select>
+    <button class="go" id="go">加载</button>
+    <span class="status" id="status"></span>
+    <span class="coname" id="coname"></span>
+  </div>
+</div>
+
+<div class="wrap">
+  <div id="welcome">
+    <div class="big">📊</div>
+    输入股票代码加载财务图表<br>
+    损益摘要与利润率 · 利润瀑布 · 现金与债务 · 现金流与资本开支<br>
+    数据来自 SEC EDGAR XBRL，季度现金流由累计数差分还原
+  </div>
+  <div class="grid" id="charts" style="display:none">
+    <div class="chart-card">
+      <div class="chart-head">
+        <div><h2>损益摘要</h2><div class="sub">上：金额（十亿美元）；下：利润率。两栏共用同一时间轴</div></div>
+      </div>
+      <div class="chart tall" id="cIncome"></div>
+    </div>
+    <div class="chart-card">
+      <div class="chart-head">
+        <div><h2>利润瀑布</h2><div class="sub">营收到净利润的拆解，蓝=小计 / 橙=扣减；「其他」为对账残差项</div></div>
+        <select id="wfPeriod"></select>
+      </div>
+      <div class="chart" id="cWaterfall"></div>
+    </div>
+    <div class="chart-card">
+      <div class="chart-head">
+        <div><h2>现金与债务</h2><div class="sub">现金及等价物、有价证券（短期+长期）与总债务（期末时点）</div></div>
+      </div>
+      <div class="chart" id="cBalance"></div>
+    </div>
+    <div class="chart-card">
+      <div class="chart-head">
+        <div><h2>现金流与资本开支</h2><div class="sub">资本开支画在零轴下方（现金流出）；FCF = 经营现金流 − 资本开支</div></div>
+      </div>
+      <div class="chart" id="cCashflow"></div>
+    </div>
+  </div>
+</div>
+
+<script src="/vendor/echarts.min.js"></script>
+<script>
+const $ = (id) => document.getElementById(id);
+const css = (name) => getComputedStyle(document.documentElement).getPropertyValue(name).trim();
+const C = { s1: css("--s1"), s2: css("--s2"), s3: css("--s3"), s4: css("--s4"),
+            s5: css("--s5"), s6: css("--s6"), s7: css("--s7"), s8: css("--s8"),
+            text: css("--text"), muted: css("--muted"), border: css("--border"),
+            card2: css("--card2") };
+
+const state = { freq: "quarterly", data: null, charts: {}, seq: 0 };
+
+// ---- 控件与 URL 同步 ----
+const qs = new URLSearchParams(location.search);
+if (qs.get("ticker")) $("ticker").value = qs.get("ticker").toUpperCase();
+if (qs.get("freq") === "annual") setFreq("annual");
+if (["3", "5", "10"].includes(qs.get("years"))) $("years").value = qs.get("years");
+
+function setFreq(v) {
+  state.freq = v;
+  for (const b of $("freqSeg").querySelectorAll("button"))
+    b.classList.toggle("on", b.dataset.v === v);
+}
+$("freqSeg").addEventListener("click", (e) => {
+  if (e.target.dataset.v) { setFreq(e.target.dataset.v); if (state.data) load(); }
+});
+$("years").addEventListener("change", () => { if (state.data) load(); });
+$("go").addEventListener("click", load);
+$("ticker").addEventListener("keydown", (e) => { if (e.key === "Enter") load(); });
+
+function setStatus(cls, msg) {
+  const el = $("status");
+  el.className = "status " + cls;
+  el.textContent = msg;
+}
+
+// ---- 数值格式 ----
+function fmtUSD(v) {
+  if (v == null) return "—";
+  const a = Math.abs(v);
+  if (a >= 1e12) return (v / 1e12).toFixed(2) + "T";
+  if (a >= 1e9) return (v / 1e9).toFixed(1) + "B";
+  return (v / 1e6).toFixed(0) + "M";
+}
+const fmtPct = (v) => v == null ? "—" : (v * 100).toFixed(1) + "%";
+
+// ---- ECharts 公共外观 ----
+function baseOpt() {
+  return {
+    textStyle: { color: C.muted, fontFamily: '"Segoe UI","Microsoft YaHei",system-ui,sans-serif' },
+    tooltip: {
+      trigger: "axis",
+      axisPointer: { type: "shadow" },
+      backgroundColor: C.card2, borderColor: C.border,
+      textStyle: { color: C.text, fontSize: 12, fontFamily: "inherit" },
+      valueFormatter: fmtUSD,
+    },
+    legend: { bottom: 0, textStyle: { color: C.muted, fontSize: 12 }, itemWidth: 14, itemHeight: 10 },
+    grid: { left: 56, right: 20, top: 24, bottom: 56 },
+  };
+}
+const catAxis = (labels) => ({
+  type: "category", data: labels,
+  axisLine: { lineStyle: { color: C.border } },
+  axisTick: { show: false },
+  axisLabel: { color: C.muted, fontSize: 11 },
+});
+const usdAxis = () => ({
+  type: "value",
+  splitLine: { lineStyle: { color: C.border, opacity: .6 } },
+  axisLabel: { color: C.muted, fontSize: 11, formatter: fmtUSD },
+});
+function mount(id, opt) {
+  if (!state.charts[id]) state.charts[id] = echarts.init($(id));
+  state.charts[id].setOption(opt, true);
+}
+window.addEventListener("resize", () => Object.values(state.charts).forEach(c => c.resize()));
+
+const bar = (name, data, color, extra = {}) => Object.assign({
+  name, type: "bar", data,
+  itemStyle: { color, borderRadius: [3, 3, 0, 0] },
+  barMaxWidth: 26, emphasis: { focus: "series" },
+}, extra);
+
+// ---- 图 1：损益摘要（上金额 / 下利润率，共用时间轴）----
+function renderIncome(d, labels) {
+  const inc = d.income, m = inc.margins;
+  const opt = baseOpt();
+  opt.axisPointer = { link: [{ xAxisIndex: "all" }] };
+  opt.tooltip.formatter = (ps) => {
+    let html = `<b>${ps[0].axisValue}</b>`;
+    for (const p of ps) {
+      const pct = p.axisIndex === 1 || p.seriesName.includes("率");
+      html += `<br>${p.marker} ${p.seriesName}: ${pct ? fmtPct(p.value) : fmtUSD(p.value)}`;
+    }
+    return html;
+  };
+  opt.grid = [
+    { left: 56, right: 20, top: 24, height: "48%" },
+    { left: 56, right: 20, top: "66%", height: "20%" },
+  ];
+  opt.xAxis = [
+    Object.assign(catAxis(labels), { gridIndex: 0, axisLabel: { show: false } }),
+    Object.assign(catAxis(labels), { gridIndex: 1 }),
+  ];
+  opt.yAxis = [
+    Object.assign(usdAxis(), { gridIndex: 0 }),
+    { type: "value", gridIndex: 1,
+      splitLine: { lineStyle: { color: C.border, opacity: .6 } },
+      axisLabel: { color: C.muted, fontSize: 11, formatter: (v) => (v * 100).toFixed(0) + "%" } },
+  ];
+  const line = (name, data, color) => ({
+    name, type: "line", data, xAxisIndex: 1, yAxisIndex: 1,
+    lineStyle: { width: 2, color }, itemStyle: { color },
+    symbol: "circle", symbolSize: 5, connectNulls: false,
+  });
+  opt.series = [
+    bar("营收", inc.revenue, C.s1),
+    bar("营业成本", inc.cogs, C.s2),
+    bar("运营费用", inc.opex, C.s3),
+    bar("净利润", inc.net_income, C.s4),
+    line("毛利率", m.gross, C.s5),
+    line("营业利润率", m.operating, C.s6),
+    line("净利润率", m.net, C.s7),
+  ];
+  mount("cIncome", opt);
+}
+
+// ---- 图 2：利润瀑布 ----
+function wfItems(d, i) {
+  const inc = d.income;
+  const v = (arr) => (arr && arr[i] != null) ? arr[i] : null;
+  const rev = v(inc.revenue), cogs = v(inc.cogs), rnd = v(inc.rnd), sga = v(inc.sga),
+        opex = v(inc.opex), op = v(inc.op_income), pretax = v(inc.pretax_income),
+        tax = v(inc.income_tax), ni = v(inc.net_income);
+  if (rev == null || ni == null) return null;
+  const items = [{ name: "营收", val: rev, total: true }];
+  let run = rev;
+  const push = (name, delta) => { items.push({ name, val: delta, total: false }); run += delta; };
+  if (cogs != null) push("营业成本", -cogs);
+  if (rnd != null) push("研发", -rnd);
+  if (sga != null) push("销售及管理", -sga);
+  // 运营费用里未拆出的部分（有 opex 披露时对账出「其他运营费用」）
+  if (opex != null) {
+    const other = opex - (rnd || 0) - (sga || 0);
+    if (Math.abs(other) > Math.abs(rev) * 0.001) push("其他运营费用", -other);
+  }
+  if (op != null) {
+    const drift = op - run;
+    if (Math.abs(drift) > Math.abs(rev) * 0.001) push("其他(经营)", drift);
+    items.push({ name: "营业利润", val: op, total: true });
+    run = op;
+  }
+  if (pretax != null) {
+    const nonop = pretax - run;
+    if (Math.abs(nonop) > Math.abs(rev) * 0.001) push("营业外损益", nonop);
+    run = pretax;
+  }
+  if (tax != null) push("所得税", -tax);
+  const drift = ni - run;
+  if (Math.abs(drift) > Math.abs(rev) * 0.001) push("其他(税后)", drift);
+  items.push({ name: "净利润", val: ni, total: true });
+  return items;
+}
+
+function renderWaterfall(d, i) {
+  const items = wfItems(d, i);
+  const el = $("cWaterfall");
+  if (!items) {
+    if (state.charts.cWaterfall) { state.charts.cWaterfall.dispose(); delete state.charts.cWaterfall; }
+    el.innerHTML = '<div class="empty">该期损益科目不完整，无法绘制瀑布图</div>';
+    return;
+  }
+  // 只在离开空态时清容器：图表活着时清 innerHTML 会把 ECharts 的画布拆下 DOM
+  if (!state.charts.cWaterfall) el.innerHTML = "";
+  const base = [], vis = [];
+  let run = 0;
+  for (const it of items) {
+    if (it.total) { base.push(0); vis.push({ value: it.val, total: true }); run = it.val; }
+    else {
+      const lo = Math.min(run, run + it.val);
+      base.push(lo); vis.push({ value: Math.abs(it.val), delta: it.val }); run += it.val;
+    }
+  }
+  const opt = baseOpt();
+  opt.tooltip.formatter = (ps) => {
+    const p = ps.find(x => x.seriesIndex === 1);
+    if (!p) return "";
+    const it = items[p.dataIndex];
+    return `<b>${it.name}</b><br>${it.total ? fmtUSD(it.val) : (it.val >= 0 ? "+" : "−") + fmtUSD(Math.abs(it.val))}`;
+  };
+  opt.legend = { show: false };
+  opt.grid.bottom = 40;
+  opt.xAxis = catAxis(items.map(x => x.name));
+  opt.xAxis.axisLabel.interval = 0;
+  opt.xAxis.axisLabel.rotate = items.length > 7 ? 30 : 0;
+  opt.yAxis = usdAxis();
+  // stackStrategy "all"：默认 samesign 会让负基座+正可见段从 0 起画，
+  // 亏损期（运行小计跨零）的悬空条会整个错位到零轴上方
+  opt.series = [
+    { type: "bar", stack: "wf", stackStrategy: "all", data: base,
+      itemStyle: { color: "transparent" },
+      emphasis: { itemStyle: { color: "transparent" } }, tooltip: { show: false }, barMaxWidth: 44 },
+    { type: "bar", stack: "wf", stackStrategy: "all",
+      data: vis.map((v, idx) => ({
+        value: v.value,
+        itemStyle: { color: v.total ? C.s1 : C.s2, borderRadius: 3 },
+        label: {
+          show: true, position: v.total ? "top" : (items[idx].val >= 0 && !v.total ? "top" : "bottom"),
+          color: C.muted, fontSize: 11,
+          formatter: () => v.total ? fmtUSD(items[idx].val)
+                                   : (items[idx].val >= 0 ? "+" : "−") + fmtUSD(Math.abs(items[idx].val)),
+        },
+      })),
+      barMaxWidth: 44 },
+  ];
+  mount("cWaterfall", opt);
+}
+
+// ---- 图 3：现金与债务 ----
+function renderBalance(d, labels) {
+  const b = d.balance;
+  const opt = baseOpt();
+  opt.xAxis = catAxis(labels);
+  opt.yAxis = usdAxis();
+  opt.series = [
+    bar("现金及等价物", b.cash, C.s1),
+    bar("有价证券", b.securities, C.s2),
+    bar("总债务", b.total_debt, C.s3),
+  ];
+  mount("cBalance", opt);
+}
+
+// ---- 图 4：现金流与资本开支（capex 取负画到零轴下方）----
+function renderCashflow(d, labels) {
+  const cf = d.cashflow;
+  const opt = baseOpt();
+  opt.tooltip.formatter = (ps) => {
+    let html = `<b>${ps[0].axisValue}</b>`;
+    for (const p of ps) {
+      const raw = p.seriesName === "资本开支" && p.value != null ? -p.value : p.value;
+      html += `<br>${p.marker} ${p.seriesName}: ${fmtUSD(raw)}`;
+    }
+    return html;
+  };
+  opt.xAxis = catAxis(labels);
+  opt.yAxis = usdAxis();
+  opt.series = [
+    bar("经营现金流", cf.ocf, C.s1),
+    bar("自由现金流", cf.fcf, C.s2),
+    bar("资本开支", cf.capex.map(v => v == null ? null : -v), C.s3,
+        { itemStyle: { color: C.s3, borderRadius: [0, 0, 3, 3] } }),
+  ];
+  mount("cCashflow", opt);
+}
+
+// ---- 加载与渲染 ----
+async function load() {
+  const ticker = $("ticker").value.trim().toUpperCase();
+  if (!ticker) return setStatus("err", "请输入股票代码");
+  // 序号防竞态：慢票的旧响应回来时若已有新请求，直接丢弃
+  const seq = ++state.seq;
+  const freq = state.freq;
+  const years = $("years").value;
+  $("go").disabled = true;
+  setStatus("", "从 SEC EDGAR 取数中…");
+  try {
+    const url = `/api/financials/${encodeURIComponent(ticker)}?freq=${freq}&years=${years}`;
+    const res = await fetch(url);
+    if (seq !== state.seq) return;
+    if (!res.ok) {
+      const body = await res.json().catch(() => ({}));
+      throw new Error(body.detail || `请求失败（HTTP ${res.status}）`);
+    }
+    const d = await res.json();
+    if (seq !== state.seq) return;
+    state.data = d;
+    history.replaceState(null, "", `?ticker=${d.ticker}&freq=${freq}&years=${years}`);
+    document.title = `${d.ticker} 财务图表 · EDGAR 财报下载器`;
+    // 公司名来自 EDGAR 第三方数据，必须走 textContent 而不是 innerHTML
+    const co = $("coname");
+    co.textContent = "";
+    const b = document.createElement("b");
+    b.textContent = d.name;
+    co.appendChild(b);
+    co.appendChild(document.createTextNode(`（CIK ${d.cik}）`));
+    $("welcome").style.display = "none";
+    $("charts").style.display = "grid";
+
+    const labels = d.periods.map(p => p.label);
+    renderIncome(d, labels);
+    renderBalance(d, labels);
+    renderCashflow(d, labels);
+    // 瀑布图期数下拉：默认最新一期
+    const sel = $("wfPeriod");
+    sel.innerHTML = "";
+    d.periods.forEach((p, i) => sel.add(new Option(p.label, i)));
+    sel.value = d.periods.length - 1;
+    sel.onchange = () => renderWaterfall(d, +sel.value);
+    renderWaterfall(d, d.periods.length - 1);
+    // 卡片刚显示时容器才有宽度，让 ECharts 重算一次
+    requestAnimationFrame(() => Object.values(state.charts).forEach(c => c.resize()));
+    setStatus("ok", `${d.periods.length} 期 · ${freq === "quarterly" ? "季度" : "年度"}`);
+  } catch (e) {
+    if (seq === state.seq) setStatus("err", e.message);
+  } finally {
+    if (seq === state.seq) $("go").disabled = false;
+  }
+}
+
+if ($("ticker").value) load();
+</script>
+</body>
+</html>
