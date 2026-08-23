@@ -5,7 +5,8 @@ const C = { s1: css("--s1"), s2: css("--s2"), s3: css("--s3"), s4: css("--s4"),
             text: css("--text"), muted: css("--muted"), border: css("--border"),
             card2: css("--card2") };
 
-const state = { freq: "quarterly", data: null, charts: {}, seq: 0, segSeq: 0 };
+const state = { freq: "quarterly", data: null, charts: {}, seq: 0, segSeq: 0,
+                segMode: "abs", segData: null };
 const esc = (s) => String(s).replace(/[&<>"']/g,
   (c) => ({ "&": "&amp;", "<": "&lt;", ">": "&gt;", '"': "&quot;", "'": "&#39;" }[c]));
 
@@ -43,6 +44,12 @@ function fmtUSD(v) {
   return (v / 1e6).toFixed(0) + "M";
 }
 const fmtPct = (v) => v == null ? "—" : (v * 100).toFixed(1) + "%";
+// 同比：季度用 i-4 避开季节性，年度用 i-1
+const yoy = (arr, i, step) =>
+  arr && arr[i] != null && arr[i - step] != null && arr[i - step] !== 0
+    ? arr[i] / arr[i - step] - 1 : null;
+const fmtYoY = (v) => v == null ? "" :
+  `（YoY ${v >= 0 ? "+" : ""}${(v * 100).toFixed(1)}%）`;
 
 // ---- ECharts 公共外观 ----
 function baseOpt() {
@@ -55,7 +62,7 @@ function baseOpt() {
       textStyle: { color: C.text, fontSize: 12, fontFamily: "inherit" },
       valueFormatter: fmtUSD,
     },
-    legend: { bottom: 0, textStyle: { color: C.muted, fontSize: 12 }, itemWidth: 14, itemHeight: 10 },
+    legend: { bottom: 0, left: 10, right: 10, textStyle: { color: C.muted, fontSize: 12 }, itemWidth: 14, itemHeight: 10 },
     grid: { left: 56, right: 20, top: 24, bottom: 56 },
   };
 }
@@ -71,6 +78,12 @@ const usdAxis = () => ({
   axisLabel: { color: C.muted, fontSize: 11, formatter: fmtUSD },
 });
 function mount(id, opt) {
+  if (opt.toolbox === undefined) {
+    opt.toolbox = { right: 4, top: 0, iconStyle: { borderColor: C.muted },
+      feature: { saveAsImage: {
+        name: `${state.data ? state.data.ticker : "chart"}_${id}`,
+        backgroundColor: css("--card"), title: "存图" } } };
+  }
   if (!state.charts[id]) state.charts[id] = echarts.init($(id));
   state.charts[id].setOption(opt, true);
 }
@@ -82,16 +95,59 @@ const bar = (name, data, color, extra = {}) => Object.assign({
   barMaxWidth: 26, emphasis: { focus: "series" },
 }, extra);
 
+// ---- TTM 汇总 tiles：估值锚定的分母（P/E、EV/FCF 都用 TTM）----
+function renderTtm(d) {
+  const box = $("ttmTiles");
+  box.textContent = "";
+  const t = d.ttm || {};
+  const fcf = (t.cfo && t.cfo.value != null && t.capex && t.capex.value != null)
+    ? t.cfo.value - t.capex.value : null;
+  const niv = t.net_income && t.net_income.value;
+  const rev = t.revenue && t.revenue.value;
+  const defs = [
+    ["TTM 营收", t.revenue, fmtUSD],
+    ["TTM 营业利润", t.op_income, fmtUSD],
+    ["TTM 净利", t.net_income, fmtUSD],
+    ["TTM OCF", t.cfo, fmtUSD],
+    ["TTM FCF", { value: fcf, note: fcf != null ? "OCF−资本开支" : null }, fmtUSD],
+    ["TTM EPS", t.eps_diluted, (v) => "$" + v.toFixed(2)],
+    ["TTM 净利率", { value: (niv != null && rev) ? niv / rev : null }, fmtPct],
+  ];
+  let shown = 0;
+  for (const [k, item, fmt] of defs) {
+    if (!item) continue;
+    const tile = document.createElement("div");
+    tile.className = "tile";
+    const kd = document.createElement("div"); kd.className = "k"; kd.textContent = k;
+    const vd = document.createElement("div"); vd.className = "v";
+    vd.textContent = item.value != null ? fmt(item.value) : "—";
+    tile.appendChild(kd); tile.appendChild(vd);
+    const note = item.error || item.note;
+    if (note) {
+      const nd = document.createElement("div"); nd.className = "n";
+      nd.textContent = note;                     // 宁缺勿错：口径注记原样展示
+      tile.appendChild(nd);
+    }
+    box.appendChild(tile);
+    if (item.value != null) shown++;
+  }
+  box.style.display = shown ? "grid" : "none";
+}
+
 // ---- 图 1：损益摘要（上金额 / 下利润率，共用时间轴）----
 function renderIncome(d, labels) {
   const inc = d.income, m = inc.margins;
   const opt = baseOpt();
   opt.axisPointer = { link: [{ xAxisIndex: "all" }] };
+  const step = d.freq === "quarterly" ? 4 : 1;
+  const seriesData = { "营收": inc.revenue, "营业成本": inc.cogs,
+                       "运营费用": inc.opex, "净利润": inc.net_income };
   opt.tooltip.formatter = (ps) => {
     let html = `<b>${ps[0].axisValue}</b>`;
     for (const p of ps) {
-      const pct = p.axisIndex === 1 || p.seriesName.includes("率");
-      html += `<br>${p.marker} ${p.seriesName}: ${pct ? fmtPct(p.value) : fmtUSD(p.value)}`;
+      const pct = p.axisIndex === 1 || p.seriesName.includes("率") || p.seriesName.includes("YoY");
+      const g = yoy(seriesData[p.seriesName], p.dataIndex, step);
+      html += `<br>${p.marker} ${p.seriesName}: ${pct ? fmtPct(p.value) : fmtUSD(p.value)}${fmtYoY(g)}`;
     }
     // 一次性/市值波动项污染净利 ≥20% 的期，hover 直接给明细
     const i = ps[0].dataIndex;
@@ -169,8 +225,67 @@ function renderIncome(d, labels) {
       xAxisIndex: 1, yAxisIndex: 1, connectNulls: false,
       lineStyle: { width: 2, type: "dashed", color: C.s8 },
       itemStyle: { color: C.s8 }, symbol: "circle", symbolSize: 4 },
+    // 营收 YoY 线默认藏在图例里（点图例开），财报前第一问是增速拐点
+    { name: "营收 YoY%", type: "line",
+      data: inc.revenue.map((_, i) => yoy(inc.revenue, i, step)),
+      xAxisIndex: 1, yAxisIndex: 1, connectNulls: false,
+      lineStyle: { width: 2, color: C.s1 }, itemStyle: { color: C.s1 },
+      symbol: "circle", symbolSize: 4 },
   ].filter(s => s.data.some(v => v != null));
+  opt.legend.selected = { "营收 YoY%": false };
   mount("cIncome", opt);
+}
+
+// ---- 图 1b：每股与股本（上 EPS / 下稀释股本，共用时间轴）----
+function renderEps(d, labels) {
+  const inc = d.income;
+  const card = $("epsCard");
+  if (!inc.eps_diluted.some(v => v != null)) {
+    card.style.display = "none";
+    if (state.charts.cEps) { state.charts.cEps.dispose(); delete state.charts.cEps; }
+    return;
+  }
+  card.style.display = "block";
+  const step = d.freq === "quarterly" ? 4 : 1;
+  const opt = baseOpt();
+  opt.axisPointer = { link: [{ xAxisIndex: "all" }] };
+  opt.tooltip.formatter = (ps) => {
+    let html = `<b>${ps[0].axisValue}</b>`;
+    for (const p of ps) {
+      if (p.seriesName === "稀释 EPS") {
+        const g = yoy(inc.eps_diluted, p.dataIndex, step);
+        html += `<br>${p.marker} 稀释 EPS: ${p.value == null ? "—" : "$" + p.value.toFixed(2)}${fmtYoY(g)}`;
+      } else {
+        html += `<br>${p.marker} 稀释股本: ${p.value == null ? "—" : (p.value / 1e9).toFixed(2) + "B 股"}`;
+      }
+    }
+    return html;
+  };
+  opt.grid = [
+    { left: 56, right: 20, top: 24, height: "44%" },
+    { left: 56, right: 20, top: "62%", height: "26%" },
+  ];
+  opt.xAxis = [
+    Object.assign(catAxis(labels), { gridIndex: 0, axisLabel: { show: false } }),
+    Object.assign(catAxis(labels), { gridIndex: 1 }),
+  ];
+  opt.yAxis = [
+    { type: "value", gridIndex: 0, scale: true,
+      splitLine: { lineStyle: { color: C.border, opacity: .6 } },
+      axisLabel: { color: C.muted, fontSize: 11, formatter: (v) => "$" + v } },
+    { type: "value", gridIndex: 1, scale: true,
+      splitLine: { lineStyle: { color: C.border, opacity: .6 } },
+      axisLabel: { color: C.muted, fontSize: 11,
+                   formatter: (v) => (v / 1e9).toFixed(1) + "B" } },
+  ];
+  opt.series = [
+    bar("稀释 EPS", inc.eps_diluted, C.s1),
+    { name: "稀释股本", type: "line", data: inc.shares_diluted,
+      xAxisIndex: 1, yAxisIndex: 1, connectNulls: false,
+      lineStyle: { width: 2, color: C.s2 }, itemStyle: { color: C.s2 },
+      symbol: "circle", symbolSize: 5 },
+  ];
+  mount("cEps", opt);
 }
 
 // ---- 一次性/营业外组件（SEC XBRL 有标准标签，罚款类覆盖较杂）----
@@ -335,37 +450,83 @@ function renderSegments(axis) {
   if (state.charts.cSegments) { state.charts.cSegments.dispose(); delete state.charts.cSegments; }
   el.innerHTML = "";
   const labels = axis.periods.map(p => p.label);
+  const pctMode = state.segMode === "pct";
+  // 占比模式：各成员除以当期成员合计（含其他），回答 mix-shift；
+  // 总营收线在占比下无意义，隐藏
+  const rowSum = labels.map((_, i) => {
+    let t = 0;
+    for (const arr of axis.series) t += arr[i] || 0;
+    if (axis.other) t += axis.other[i] || 0;
+    return t || null;
+  });
+  const toPct = (arr) => arr.map((v, i) =>
+    v != null && rowSum[i] ? v / rowSum[i] : null);
   const opt = baseOpt();
+  const step = (state.data && state.data.freq === "annual") ? 1 : 4;
+  const rawByName = {};
+  axis.members.forEach((m, j) => { rawByName[m.label] = axis.series[j]; });
+  if (axis.other) rawByName["其他"] = axis.other;
   opt.tooltip.formatter = (ps) => {
     let html = `<b>${esc(ps[0].axisValue)}</b>`;
     const i = ps[0].dataIndex;
     for (const p of [...ps].reverse()) {
       if (p.value == null) continue;
-      const mark = p.seriesName === "总营收"
-        ? (axis.derived[i] ? "（Q4=年度-前三季推导）" : "") : "";
+      if (p.seriesName === "总营收") {
+        const mark = axis.derived[i] ? "（Q4=年度-前三季推导）" : "";
+        html += `<br>${p.marker} 总营收: ${fmtUSD(p.value)}${mark}`;
+        continue;
+      }
       // 成员名源自申报文件（第三方数据），拼 HTML 前必须转义
-      html += `<br>${p.marker} ${esc(p.seriesName)}: ${fmtUSD(p.value)}${mark}`;
+      const raw = rawByName[p.seriesName] ? rawByName[p.seriesName][i] : null;
+      const share = raw != null && rowSum[i] ? ` · 占 ${(raw / rowSum[i] * 100).toFixed(1)}%` : "";
+      const g = yoy(rawByName[p.seriesName], i, step);
+      html += `<br>${p.marker} ${esc(p.seriesName)}: ${fmtUSD(raw)}${share}${fmtYoY(g)}`;
     }
     if (axis.reconciled[i] === false) html += `<br>⚠ 该期分部与合并总额未对账`;
     return html;
   };
+  // 图例一键隔离：点亮目标后按「反选」即单看一个分部
+  opt.legend.selector = [{ type: "all", title: "全选" },
+                         { type: "inverse", title: "反选" }];
   opt.xAxis = catAxis(labels);
-  opt.yAxis = usdAxis();
+  opt.yAxis = pctMode
+    ? { type: "value", max: 1,
+        splitLine: { lineStyle: { color: C.border, opacity: .6 } },
+        axisLabel: { color: C.muted, fontSize: 11,
+                     formatter: (v) => (v * 100).toFixed(0) + "%" } }
+    : usdAxis();
   opt.series = axis.members.map((m, i) => ({
-    name: m.label, type: "bar", stack: "seg", data: axis.series[i],
+    name: m.label, type: "bar", stack: "seg",
+    data: pctMode ? toPct(axis.series[i]) : axis.series[i],
     itemStyle: { color: SEG_COLORS[i % SEG_COLORS.length] },
     barMaxWidth: 30, emphasis: { focus: "series" },
   }));
   if (axis.other) {
-    opt.series.push({ name: "其他", type: "bar", stack: "seg", data: axis.other,
+    opt.series.push({ name: "其他", type: "bar", stack: "seg",
+      data: pctMode ? toPct(axis.other) : axis.other,
       itemStyle: { color: OTHER_COLOR }, barMaxWidth: 30 });
   }
-  opt.series.push({ name: "总营收", type: "line", data: axis.total,
-    lineStyle: { width: 2, type: "dashed", color: C.text },
-    itemStyle: { color: C.text }, symbol: "circle", symbolSize: 5,
-    connectNulls: false });
+  if (!pctMode) {
+    opt.series.push({ name: "总营收", type: "line", data: axis.total,
+      lineStyle: { width: 2, type: "dashed", color: C.text },
+      itemStyle: { color: C.text }, symbol: "circle", symbolSize: 5,
+      connectNulls: false });
+  }
   mount("cSegments", opt);
 }
+
+$("segMode").addEventListener("click", (e) => {
+  const m = e.target.dataset.m;
+  if (!m || m === state.segMode) return;
+  state.segMode = m;
+  for (const b of $("segMode").querySelectorAll("button"))
+    b.classList.toggle("on", b.dataset.m === m);
+  if (state.segData) {
+    const cur = state.segData.axes.find(x => x.key === state.segAxis)
+      || state.segData.axes[0];
+    if (cur) renderSegments(cur);
+  }
+});
 
 function renderSegAxisToggle(axes, active) {
   const seg = $("segAxis");
@@ -402,6 +563,7 @@ async function loadSegments(ticker, freq, years) {
     }
     const d = await res.json();
     if (seq !== state.segSeq) return;
+    state.segData = d;
     if (d.axes.length) {
       // 记住用户上次选的轴；没有同名轴再回默认（业务线>经营分部>地区）
       const pick = d.axes.find(x => x.key === state.segAxis) || d.axes[0];
@@ -491,36 +653,77 @@ function renderConcentration(c) {
     }];
     mount("cConcTrend", opt);
   }
-  // 明细表（textContent 构建，成员名来自申报文件）
-  const tbl = document.createElement("table");
-  tbl.className = "conc";
-  const head = tbl.createTHead().insertRow();
-  for (const h of ["交易对手", "类型", "基准（占什么）", "占比", "期间"]) {
-    const th = document.createElement("th");
-    th.textContent = h;
-    head.appendChild(th);
-  }
-  const body = tbl.createTBody();
+  // 明细表透视（textContent 构建，成员名来自申报文件）：
+  // 同一对手方的多基准并成一行，客户/供应商优先，地域/资产折叠
+  const PRIMARY = ["客户", "供应商", "信用", "贷款人", "再保险"];
+  const groups = new Map();
   for (const r of c.latest) {
-    const tr = body.insertRow();
-    tr.insertCell().textContent = r.party + (r.aggregate ? "（合计）" : "");
-    const tdType = tr.insertCell();
-    const tag = document.createElement("span");
-    tag.className = "tag";
-    tag.textContent = r.type;
-    tdType.appendChild(tag);
-    tr.insertCell().textContent = r.benchmark;
-    const tdPct = tr.insertCell();
-    tdPct.className = "pct";
-    tdPct.textContent = (r.pct_lo != null ? r.pct_lo + "–" : "") + r.pct + "%";
-    // 风险配色只给客户集中度：地域占营收 50% 是常态分布，不是风险信号
-    const risky = r.type === "客户" && r.benchmark === "营收";
-    tdPct.style.color = risky && r.pct >= 30 ? css("--err")
-      : risky && r.pct >= 10 ? "#e0a63f" : "";
-    const span = r.annual ? "年度" : r.days <= 100 ? "单季" : "YTD";
-    tr.insertCell().textContent = `截至 ${r.end}（${span}）`;
+    const k = r.party + "|" + r.type;
+    if (!groups.has(k)) groups.set(k, { party: r.party, type: r.type,
+                                        aggregate: r.aggregate, cells: [] });
+    groups.get(k).cells.push(r);
   }
-  tableEl.appendChild(tbl);
+  const revPct = (g) => Math.max(0, ...g.cells.filter(x => x.benchmark === "营收")
+                                              .map(x => x.pct));
+  const allPct = (g) => Math.max(...g.cells.map(x => x.pct));
+  const rows = [...groups.values()].sort((a, b) => {
+    const pa = PRIMARY.indexOf(a.type), pb = PRIMARY.indexOf(b.type);
+    const oa = pa < 0 ? 99 : pa, ob = pb < 0 ? 99 : pb;
+    if (oa !== ob) return oa - ob;
+    return (revPct(b) - revPct(a)) || (allPct(b) - allPct(a));
+  });
+  const primary = rows.filter(g => PRIMARY.includes(g.type));
+  const secondary = rows.filter(g => !PRIMARY.includes(g.type));
+
+  function buildTable(list) {
+    const tbl = document.createElement("table");
+    tbl.className = "conc";
+    const head = tbl.createTHead().insertRow();
+    for (const h of ["交易对手", "类型", "占比（按基准）", "期间"]) {
+      const th = document.createElement("th");
+      th.textContent = h;
+      head.appendChild(th);
+    }
+    const body = tbl.createTBody();
+    for (const g of list) {
+      const tr = body.insertRow();
+      tr.insertCell().textContent = g.party + (g.aggregate ? "（合计）" : "");
+      const tdType = tr.insertCell();
+      const tag = document.createElement("span");
+      tag.className = "tag";
+      tag.textContent = g.type;
+      tdType.appendChild(tag);
+      const tdP = tr.insertCell();
+      g.cells.sort((a, b) => (b.benchmark === "营收") - (a.benchmark === "营收")
+                             || b.pct - a.pct);
+      g.cells.forEach((r, i) => {
+        if (i) tdP.appendChild(document.createTextNode("　"));
+        const sp = document.createElement("span");
+        sp.className = "pct";
+        const range = r.pct_lo != null ? `${r.pct_lo}–${r.pct}` : `${r.pct}`;
+        sp.textContent = `占${r.benchmark} ${range}%`;
+        const risky = r.type === "客户" && r.benchmark === "营收";
+        sp.style.color = risky && r.pct >= 30 ? css("--err")
+          : risky && r.pct >= 10 ? "#e0a63f" : "";
+        tdP.appendChild(sp);
+      });
+      const latestCell = g.cells.reduce((x, y) => x.end >= y.end ? x : y);
+      const sp = latestCell.annual ? "年度" : latestCell.days <= 100 ? "单季" : "YTD";
+      tr.insertCell().textContent = `截至 ${latestCell.end}（${sp}）`;
+    }
+    return tbl;
+  }
+
+  if (primary.length) tableEl.appendChild(buildTable(primary));
+  if (secondary.length) {
+    const det = document.createElement("details");
+    det.className = "fold";
+    const sum = document.createElement("summary");
+    sum.textContent = `地域与其他分布（${secondary.length} 项）`;
+    det.appendChild(sum);
+    det.appendChild(buildTable(secondary));
+    tableEl.appendChild(det);
+  }
 }
 
 // ---- 图 3：现金与债务 ----
@@ -608,9 +811,22 @@ async function load() {
     $("charts").style.display = "grid";
 
     const labels = d.periods.map(p => p.label);
+    renderTtm(d);
     renderIncome(d, labels);
+    renderEps(d, labels);
     renderBalance(d, labels);
     renderCashflow(d, labels);
+    // 点损益柱直接驱动利润瀑布（下拉保留作回退）
+    state.charts.cIncome.off("click");
+    state.charts.cIncome.on("click", (p) => {
+      if (p.dataIndex == null) return;
+      $("wfPeriod").value = p.dataIndex;
+      renderWaterfall(state.data, p.dataIndex);
+    });
+    // 同 labels 的四张卡十字线联动（分部/集中度期间轴不同，不入组）
+    for (const id of ["cIncome", "cEps", "cBalance", "cCashflow"])
+      if (state.charts[id]) state.charts[id].group = "sync";
+    echarts.connect("sync");
     loadSegments(d.ticker, freq, years);  // 独立异步，不阻塞主图状态
     // 瀑布图期数下拉：默认最新一期
     const sel = $("wfPeriod");
@@ -629,5 +845,48 @@ async function load() {
     if (seq === state.seq) $("go").disabled = false;
   }
 }
+
+// ---- CSV 复制：把当前数据拼成 期间×科目 表，直接进剪贴板 ----
+function csvIncome(d) {
+  const L = [["期间", "营收", "营业成本", "运营费用", "净利润", "毛利率",
+              "营业利润率", "净利润率", "稀释EPS"]];
+  d.periods.forEach((p, i) => L.push([p.label,
+    d.income.revenue[i], d.income.cogs[i], d.income.opex[i],
+    d.income.net_income[i], d.income.margins.gross[i],
+    d.income.margins.operating[i], d.income.margins.net[i],
+    d.income.eps_diluted[i]]));
+  return L;
+}
+function csvCashflow(d) {
+  const L = [["期间", "经营现金流", "自由现金流", "资本开支", "回购", "分红", "SBC"]];
+  d.periods.forEach((p, i) => L.push([p.label,
+    d.cashflow.ocf[i], d.cashflow.fcf[i], d.cashflow.capex[i],
+    d.cashflow.buyback[i], d.cashflow.dividends[i], d.cashflow.sbc[i]]));
+  return L;
+}
+function csvConc() {
+  const c = state.segData && state.segData.concentration;
+  if (!c) return null;
+  const L = [["交易对手", "类型", "基准", "占比%", "占比下限%", "合计口径", "期末"]];
+  for (const r of c.latest)
+    L.push([r.party, r.type, r.benchmark, r.pct, r.pct_lo, r.aggregate, r.end]);
+  return L;
+}
+document.addEventListener("click", async (e) => {
+  const kind = e.target.dataset && e.target.dataset.csv;
+  if (!kind) return;
+  const d = state.data;
+  const table = kind === "income" ? (d && csvIncome(d))
+    : kind === "cashflow" ? (d && csvCashflow(d)) : csvConc();
+  if (!table) return;
+  const text = table.map(row => row.map(v =>
+    v == null ? "" : String(v).includes(",") ? `"${v}"` : v).join(",")).join("\n");
+  try {
+    await navigator.clipboard.writeText(text);
+    const old = e.target.textContent;
+    e.target.textContent = "已复制 ✓";
+    setTimeout(() => { e.target.textContent = old; }, 1500);
+  } catch { e.target.textContent = "复制失败"; }
+});
 
 if ($("ticker").value) load();

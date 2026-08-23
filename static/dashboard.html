@@ -103,6 +103,27 @@
   table.conc .tag { display: inline-block; background: var(--card2); border: 1px solid var(--border);
                     border-radius: 6px; padding: 1px 8px; font-size: 12px; color: var(--muted); }
   .conc-empty { color: var(--muted); font-size: 13px; padding: 18px 4px 14px; }
+  #concTable { overflow-x: auto; }
+  .tiles { display: grid; grid-template-columns: repeat(auto-fit, minmax(130px, 1fr));
+           gap: 10px; margin: 14px 0 6px; }
+  .tile { background: var(--card2); border: 1px solid var(--border);
+          border-radius: 10px; padding: 10px 12px; }
+  .tile .k { color: var(--muted); font-size: 11px; }
+  .tile .v { font-size: 17px; font-weight: 700; margin-top: 2px;
+             font-variant-numeric: tabular-nums; }
+  .tile .n { color: var(--muted); font-size: 10px; margin-top: 2px; }
+  button.mini { background: var(--card2); border: 1px solid var(--border);
+                border-radius: 8px; color: var(--muted); font-size: 12px;
+                padding: 5px 10px; cursor: pointer; white-space: nowrap; }
+  button.mini:hover { color: var(--text); border-color: var(--accent); }
+  details.fold { margin: 6px 0 14px; }
+  details.fold summary { color: var(--muted); font-size: 13px; cursor: pointer;
+                         padding: 6px 4px; }
+  @media (max-width: 640px) {
+    .chart { height: 320px; }
+    .chart.tall { height: 460px; }
+    .tile .v { font-size: 15px; }
+  }
 </style>
 </head>
 <body>
@@ -138,20 +159,35 @@
   <div class="grid" id="charts" style="display:none">
     <div class="chart-card">
       <div class="chart-head">
-        <div><h2>损益摘要</h2><div class="sub">上：金额；下：利润率——红虚线=剔除一次性/投资项的净利率（按当期有效税率税后化）；毛利率以总营收为分母（含会员费类非商品收入）。两栏共用同一时间轴</div></div>
+        <div><h2>损益摘要</h2><div class="sub">上：金额；下：利润率——红虚线=剔除一次性/投资项的净利率（按当期有效税率税后化）；毛利率以总营收为分母（含会员费类非商品收入）。两栏共用同一时间轴。点任一期的柱可直接驱动下方利润瀑布</div></div>
+        <button class="mini" data-csv="income">复制 CSV</button>
       </div>
+      <div class="tiles" id="ttmTiles" style="display:none"></div>
       <div class="chart tall" id="cIncome"></div>
+    </div>
+    <div class="chart-card" id="epsCard" style="display:none">
+      <div class="chart-head">
+        <div><h2>每股与股本</h2><div class="sub">上：稀释 EPS；下：加权稀释股本——回购缩股/增发稀释的节奏直读。两栏共用同一时间轴</div></div>
+      </div>
+      <div class="chart" id="cEps"></div>
     </div>
     <div class="chart-card">
       <div class="chart-head">
         <div><h2>各细分业务营收</h2><div class="sub">堆叠=各分部，虚线=合并总营收对照；数据逐份解析自 10-K/10-Q 的 XBRL（首次加载约 10-60 秒）</div></div>
-        <div class="seg" id="segAxis" style="display:none"></div>
+        <div style="display:flex;gap:8px;flex-wrap:wrap">
+          <div class="seg" id="segMode">
+            <button data-m="abs" class="on">金额</button>
+            <button data-m="pct">占比</button>
+          </div>
+          <div class="seg" id="segAxis" style="display:none"></div>
+        </div>
       </div>
       <div class="chart" id="cSegments"><div class="empty" id="segStatus">分部数据加载中…</div></div>
     </div>
     <div class="chart-card">
       <div class="chart-head">
         <div><h2>客户与供应商集中度</h2><div class="sub">来自 10-K/10-Q 的 XBRL 集中度披露；占比含义以「基准」列为准——占应收款 ≠ 占营收。本卡为全部历史披露，不随上方期间设置变化</div></div>
+        <button class="mini" data-csv="conc">复制 CSV</button>
       </div>
       <div id="concBanner" class="conc-banner" style="display:none"></div>
       <div class="chart" id="cConcTrend" style="display:none;height:280px"></div>
@@ -173,6 +209,7 @@
     <div class="chart-card">
       <div class="chart-head">
         <div><h2>现金流 · 股东回报 · 股权激励</h2><div class="sub">流出（资本开支/回购/分红）画零轴下方；SBC 虚线=非现金加回（hover 看回报与 SBC 占 FCF 比例）</div></div>
+        <button class="mini" data-csv="cashflow">复制 CSV</button>
       </div>
       <div class="chart" id="cCashflow"></div>
     </div>
