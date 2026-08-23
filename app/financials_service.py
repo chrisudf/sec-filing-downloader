@@ -171,6 +171,20 @@ def _reshape(facts: dict, info: dict, freq: str, years: int) -> dict:
             for o, g, oi, n in zip(dur("opex"), gross, op_income, nie)]
     net_income = dur("net_income")
 
+    eps = dur("eps_diluted")
+    shares = dur("shares_diluted")
+    # TTM EPS：季度频率下最近四季直加（口径=四季 EPS 之和，与净利 TTM/
+    # 股本口径略有差，注记说明）；有空缺不硬给
+    ttm = dict(facts.get("ttm") or {})
+    q_eps = facts.get("eps_diluted_quarterly") or {}
+    last4 = sorted(q_eps.items())[-4:]
+    if len(last4) == 4:
+        ends4 = [date.fromisoformat(k) for k, _ in last4]
+        if all(80 <= (b - a).days <= 100 for a, b in zip(ends4, ends4[1:])):
+            ttm["eps_diluted"] = {"value": round(sum(v for _, v in last4), 2),
+                                  "quarters": [k for k, _ in last4],
+                                  "note": "四季 EPS 直加"}
+
     ocf = dur("cfo")
     capex = dur("capex")  # PaymentsToAcquire* 是正数（流出）
     fcf = _sub(ocf, capex)
@@ -231,6 +245,8 @@ def _reshape(facts: dict, info: dict, freq: str, years: int) -> dict:
             "pretax_income": dur("pretax_income"),
             "income_tax": dur("income_tax"),
             "net_income": net_income,
+            "eps_diluted": eps,
+            "shares_diluted": shares,
             "margins": {
                 "gross": _ratio(gross, revenue),
                 "operating": _ratio(op_income, revenue),
@@ -245,7 +261,7 @@ def _reshape(facts: dict, info: dict, freq: str, years: int) -> dict:
                    ("equity_inv_gain", "interest_income", "interest_expense_nonop",
                     "fx_gain", "other_nonop", "restructuring", "impairment",
                     "litigation", "disposal_gain")},
-        "ttm": facts.get("ttm") or {},
+        "ttm": ttm,
     }
 
 

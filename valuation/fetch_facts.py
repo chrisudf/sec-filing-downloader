@@ -19,9 +19,9 @@ import httpx
 # fill=只补缺不覆盖的回退、override=报表主线口径覆盖。
 # 曾经的五个平行注册表（TAGS/INSTANT/FILL/OVERRIDE/YTD_FLOW）会漏改：
 # 新时点科目忘加 INSTANT 不报错、只静默产出空序列
-def _item(tags, i=False, y=False, fill=(), override=()):
+def _item(tags, i=False, y=False, fill=(), override=(), no_q4=False):
     return {"tags": list(tags), "instant": i, "ytd_flow": y,
-            "fill": list(fill), "override": list(override)}
+            "fill": list(fill), "override": list(override), "no_q4": no_q4}
 
 
 SPEC = {
@@ -124,7 +124,10 @@ SPEC = {
                             "LongTermDebtAndCapitalLeaseObligationsIncludingCurrentMaturities",
                             "DebtAndCapitalLeaseObligations", "NotesPayable"],
                            i=True),
-    "shares_diluted": _item(["WeightedAverageNumberOfDilutedSharesOutstanding"]),
+    # 加权平均股本是均值不可加减：Q4=年度-前三季 会推出 -30B 的负股数
+    # （原仓库就有的 bug，估值管道取序列末值时可能踩中）
+    "shares_diluted": _item(["WeightedAverageNumberOfDilutedSharesOutstanding"],
+                            no_q4=True),
 }
 
 # 兼容视图：估值管道、图表服务与测试引用的旧接口，全部由 SPEC 推导
@@ -231,6 +234,42 @@ def ttm_via_ytd(facts: dict, tag_names, annual):
     return {"value": a_val + v_cur - prior[0], "note": f"FY({a_end_s}) + YTD至{e} - 上年同期YTD"}
 
 
+def assemble_series(facts: dict, name: str) -> tuple[dict, dict]:
+    """单科目的 年度/季度 序列组装：候选合并（同期取 filed 最新）→
+    现金流 YTD 差分 → 只补缺回退 → 主线口径覆盖 → 营收子集守卫 →
+    Q4 推导。纯函数，护栏规则全部在此，测试直接喂手写 facts。"""
+    annual = pick(facts, TAGS[name], "annual")
+    quarterly = pick(facts, TAGS[name], "quarterly")
+    if name in YTD_FLOW:
+        for k, v in quarterly_from_ytd(facts, TAGS[name]).items():
+            quarterly.setdefault(k, v)
+    for fill_tag in FILL_TAGS.get(name, ()):
+        for k, v in pick(facts, [fill_tag], "annual").items():
+            annual.setdefault(k, v)
+        for k, v in pick(facts, [fill_tag], "quarterly").items():
+            quarterly.setdefault(k, v)
+    for ov_tag in OVERRIDE_TAGS.get(name, ()):
+        annual.update(pick(facts, [ov_tag], "annual"))
+        quarterly.update(pick(facts, [ov_tag], "quarterly"))
+    if name == "revenue":
+        # 子集守卫：保险等行业把 ASC 606 附注子集标在 RFCWC 下
+        # （MET 曾因此少报 31.6 倍），同期 Revenues 显著更大时以其为准
+        for kind_dict, kind in ((annual, "annual"), (quarterly, "quarterly")):
+            for k, v_full in pick(facts, ["Revenues"], kind).items():
+                cur = kind_dict.get(k)
+                if cur is not None and cur < 0.8 * v_full:
+                    kind_dict[k] = v_full
+    if not SPEC[name]["no_q4"]:
+        for a_end, a_val in annual.items():
+            ae = date.fromisoformat(a_end)
+            in_year = {k: v for k, v in quarterly.items()
+                       if timedelta(days=0) < ae - date.fromisoformat(k)
+                       < timedelta(days=340)}
+            if len(in_year) == 3 and a_end not in quarterly:
+                quarterly[a_end] = a_val - sum(in_year.values())
+    return annual, dict(sorted(quarterly.items()))
+
+
 def build_facts(ticker: str, email: str, cik: int | None = None) -> dict:
     """cik 可选：服务端已有缓存的 ticker->CIK 映射时直接传入，省一次 700KB 下载。"""
     ticker = ticker.upper()
@@ -256,35 +295,9 @@ def build_facts(ticker: str, email: str, cik: int | None = None) -> dict:
         if name in INSTANT:
             out[name + "_instant"] = pick(facts, TAGS[name], "instant")
             continue
-        annual = pick(facts, TAGS[name], "annual")
-        quarterly = pick(facts, TAGS[name], "quarterly")
-        if name in YTD_FLOW:
-            for k, v in quarterly_from_ytd(facts, TAGS[name]).items():
-                quarterly.setdefault(k, v)
-        for fill_tag in FILL_TAGS.get(name, ()):
-            for k, v in pick(facts, [fill_tag], "annual").items():
-                annual.setdefault(k, v)
-            for k, v in pick(facts, [fill_tag], "quarterly").items():
-                quarterly.setdefault(k, v)
-        for ov_tag in OVERRIDE_TAGS.get(name, ()):
-            annual.update(pick(facts, [ov_tag], "annual"))
-            quarterly.update(pick(facts, [ov_tag], "quarterly"))
-        if name == "revenue":
-            # 子集守卫：保险等行业把 ASC 606 附注子集标在 RFCWC 下
-            # （MET 曾因此少报 31.6 倍），同期 Revenues 显著更大时以其为准
-            for kind_dict, kind in ((annual, "annual"), (quarterly, "quarterly")):
-                for k, v_full in pick(facts, ["Revenues"], kind).items():
-                    cur = kind_dict.get(k)
-                    if cur is not None and cur < 0.8 * v_full:
-                        kind_dict[k] = v_full
-        for a_end, a_val in annual.items():
-            ae = date.fromisoformat(a_end)
-            in_year = {k: v for k, v in quarterly.items()
-                       if timedelta(days=0) < ae - date.fromisoformat(k) < timedelta(days=340)}
-            if len(in_year) == 3 and a_end not in quarterly:
-                quarterly[a_end] = a_val - sum(in_year.values())
+        annual, quarterly = assemble_series(facts, name)
         out[name + "_annual"] = annual
-        out[name + "_quarterly"] = dict(sorted(quarterly.items()))
+        out[name + "_quarterly"] = quarterly
 
     ttm = {}
     for name in ("revenue", "op_income", "net_income"):

@@ -131,3 +131,14 @@ def test_baseline_contract_frozen():
         "ProfitLoss", "NetIncomeLossAvailableToCommonStockholdersBasic"]
     assert OVERRIDE_TAGS == {"revenue": ["RevenuesNetOfInterestExpense"]}
     assert set(SPEC) == set(TAGS)
+
+
+def test_shares_no_q4_derivation():
+    # 加权平均股本是均值：年度-前三季会推出负股数（AAPL 曾出 -30B）
+    facts = {"WeightedAverageNumberOfDilutedSharesOutstanding": F(
+        ("2025-01-01", "2025-03-31", 14.9e9, "f"),
+        ("2025-04-01", "2025-06-30", 14.9e9, "f"),
+        ("2025-07-01", "2025-09-30", 14.9e9, "f"),
+        ("2025-01-01", "2025-12-31", 14.8e9, "f"))}
+    _, q = assemble_series(facts, "shares_diluted")
+    assert "2025-12-31" not in q  # 不推导，宁缺勿错
