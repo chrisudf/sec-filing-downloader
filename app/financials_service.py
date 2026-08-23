@@ -51,7 +51,7 @@ async def _facts_and_info(ticker: str, email: str) -> tuple[dict, dict]:
         try:
             facts = await asyncio.to_thread(build_facts, ticker, email, info["cik"])
         except FactsError as e:
-            raise edgar.EdgarError(404, str(e))
+            raise edgar.EdgarError(502 if e.transient else 404, str(e))
         except (httpx.HTTPError, json.JSONDecodeError, KeyError) as e:
             raise edgar.EdgarError(502, f"SEC 数据请求失败：{type(e).__name__}，请稍后重试")
         now = time.time()
@@ -206,15 +206,32 @@ def _reshape(facts: dict, info: dict, freq: str, years: int) -> dict:
               for a, b in zip(inst("st_securities"), st_fill)]
     lt_sec = [a if a is not None else b
               for a, b in zip(inst("lt_securities"), inst("debt_securities_lt"))]
-    securities = _add(st_sec, lt_sec)
-    # 无分类资产负债表的银行（SOFI）整行标 OtherInvestments——该标签太泛，
-    # 只在分类口径整列全空时才启用
-    if all(v is None for v in securities):
-        securities = inst("securities_unclassified")
+    # 证券源按覆盖度整列选择：分类口径（AAPL/NVDA）、无分类整行
+    # （SOFI 的 OtherInvestments）、保险 AFS 总口径（MET ~$316B）——
+    # 混着逐期取会跨口径，整列取「非空中位数最大」的那个源
+    def _median(arr):
+        vals = sorted(v for v in arr if v is not None)
+        return vals[len(vals) // 2] if vals else None
 
+    candidates = [_add(st_sec, lt_sec), inst("securities_unclassified"),
+                  inst("afs_securities_total")]
+    securities = max(candidates, key=lambda a: _median(a) or 0)
+    if all(v is None for v in securities):
+        securities = candidates[0]
+
+    # 报告断档警示：新控股壳（XOM 重组后新 CIK）申报历史很短，相邻季度
+    # 间隔超过一个季度说明有断档，前端提示而不是让相隔一年的柱贴着画
+    warning = None
+    if freq == "quarterly" and len(ends) >= 2:
+        gaps = [(date.fromisoformat(b) - date.fromisoformat(a)).days
+                for a, b in zip(ends, ends[1:])]
+        if any(g > 100 for g in gaps):
+            warning = "该主体的季度申报存在断档（可能为重组后的新申报主体），趋势阅读需谨慎"
     return {
         "ticker": facts["ticker"],
         "cik": facts["cik"],
+        "bank_format": bool(facts.get("bank_format")),
+        "warning": warning,
         "name": info.get("name") or "",
         "fiscalYearEnd": info.get("fiscalYearEnd") or "",
         "freq": freq,

@@ -91,15 +91,19 @@ TAGS = {
     # SOFI 这类无分类资产负债表的银行把投资证券整行标成 OtherInvestments；
     # 该标签太泛，只在所有分类证券标签全空时才启用（服务端把关）
     "securities_unclassified": ["OtherInvestments"],
+    # 保险公司的债券组合常只标 AFS 总口径（MET ~$316B），图表端按覆盖度选源
+    "afs_securities_total": ["AvailableForSaleSecuritiesDebtSecurities"],
     # SOFI 2023 起资产负债表 Debt 行只标长短期合并口径
-    "debt_combined": ["DebtLongtermAndShorttermCombinedAmount"],
+    "debt_combined": ["DebtLongtermAndShorttermCombinedAmount",
+                      "LongTermDebtAndCapitalLeaseObligationsIncludingCurrentMaturities",
+                      "DebtAndCapitalLeaseObligations", "NotesPayable"],
     "shares_diluted": ["WeightedAverageNumberOfDilutedSharesOutstanding"],
 }
 INSTANT = {"cash", "st_securities", "lt_securities", "lt_debt", "current_debt",
            "commercial_paper", "debt_securities_st", "debt_securities_lt",
            "lt_debt_noncurrent", "lt_debt_total", "lt_debt_current",
            "debt_current", "st_borrowings", "equity_securities_st",
-           "securities_unclassified", "debt_combined"}
+           "securities_unclassified", "debt_combined", "afs_securities_total"}
 # 只补缺不覆盖的回退标签：主标签已有的期一律不动（估值管道基线稳定），
 # 只填缺失期。AVGO 2019 年起季度净利润只标 ProfitLoss（含少数股东权益）
 FILL_TAGS = {
@@ -117,7 +121,12 @@ YTD_FLOW = {"cfo", "capex", "buyback", "dividends", "sbc"}
 
 
 class FactsError(ValueError):
-    """取数失败（代码不存在 / 无 us-gaap 数据等），信息可直接展示给用户。"""
+    """取数失败（代码不存在 / 无 us-gaap 数据等），信息可直接展示给用户。
+    transient=True 表示上游瞬态错误（限速/维护），应映射 5xx 而非「没有数据」。"""
+
+    def __init__(self, msg: str, transient: bool = False):
+        self.transient = transient
+        super().__init__(msg)
 
 
 def _headers(email: str) -> dict:
@@ -128,7 +137,7 @@ def resolve_cik(ticker: str, headers: dict) -> int:
     r = httpx.get("https://www.sec.gov/files/company_tickers.json",
                   headers=headers, timeout=60)
     if r.status_code != 200:
-        raise FactsError(f"SEC 代码表接口返回 {r.status_code}")
+        raise FactsError(f"SEC 代码表接口返回 {r.status_code}", transient=True)
     for v in r.json().values():
         if v["ticker"].upper() == ticker:
             return int(v["cik_str"])
@@ -218,7 +227,7 @@ def build_facts(ticker: str, email: str, cik: int | None = None) -> dict:
     if r.status_code == 404:
         raise FactsError(f"SEC 没有 {ticker} 的 XBRL companyfacts 数据")
     if r.status_code != 200:
-        raise FactsError(f"SEC companyfacts 接口返回 {r.status_code}（稍后重试）")
+        raise FactsError(f"SEC companyfacts 接口返回 {r.status_code}（稍后重试）", transient=True)
     all_facts = r.json()["facts"]
     if "us-gaap" not in all_facts:
         raise FactsError(f"{ticker} 没有 us-gaap 口径数据（可能是 IFRS 外国发行人），暂不支持")
@@ -245,6 +254,14 @@ def build_facts(ticker: str, email: str, cik: int | None = None) -> dict:
         for ov_tag in OVERRIDE_TAGS.get(name, ()):
             annual.update(pick(facts, [ov_tag], "annual"))
             quarterly.update(pick(facts, [ov_tag], "quarterly"))
+        if name == "revenue":
+            # 子集守卫：保险等行业把 ASC 606 附注子集标在 RFCWC 下
+            # （MET 曾因此少报 31.6 倍），同期 Revenues 显著更大时以其为准
+            for kind_dict, kind in ((annual, "annual"), (quarterly, "quarterly")):
+                for k, v_full in pick(facts, ["Revenues"], kind).items():
+                    cur = kind_dict.get(k)
+                    if cur is not None and cur < 0.8 * v_full:
+                        kind_dict[k] = v_full
         for a_end, a_val in annual.items():
             ae = date.fromisoformat(a_end)
             in_year = {k: v for k, v in quarterly.items()

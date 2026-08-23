@@ -426,7 +426,9 @@ def build_segments(ticker: str, email: str, cik: int | None = None,
             newest = vers[-1][1]
             for _, old in vers[:-1]:
                 for om, ov in old.items():
-                    if om in newest:
+                    if om in newest or abs(ov) < 1e6:
+                        # 近零值谁都能对上（LLY 曾把 FY22 的 COVID 抗体 0 值
+                        # 错配成 Zepbound），$1M 以下不参与改名判定
                         continue
                     hits = [nm for nm, nv in newest.items()
                             if nm not in old and abs(nv - ov) <= max(abs(ov) * 1e-6, 1)]

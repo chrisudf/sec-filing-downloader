@@ -140,6 +140,8 @@ def _conc_reshape(raw: list) -> dict | None:
                 bench_m = m
             elif "StatementBusinessSegments" in axis:
                 continue  # 归属注记：NVDA「客户A占总营收22%（计算分部）」分母仍是总营收
+            elif "Range" in axis:
+                continue  # 区间注记（Min/Max 两条一组），LLY「三大批发商各占 16-24%」
             elif any(k in axis for k in ("ProductOrService",
                                          "StatementGeographical")):
                 scope_axes.append((axis, m))
@@ -162,6 +164,10 @@ def _conc_reshape(raw: list) -> dict | None:
             continue  # 纯产品限定的样板行
         else:
             party_axis, party_m = None, None
+        if bench_m is None:
+            # 无基准轴的行不可解读（GS 的信贷组合构成披露曾灌进十几行
+            # 「占未注明基准 100%」），宁缺勿错整行丢弃
+            continue
         if party_m is None and pct >= 99:
             continue  # 「基本全部…」的样板行，无对手方、无信息量
         base = _member_base(party_m) if party_m else None
@@ -177,12 +183,27 @@ def _conc_reshape(raw: list) -> dict | None:
             "type": row_type,
             "benchmark": _zh(CONC_BENCH_ZH, bench_m or "") or (_member_label(bench_m) if bench_m else "未注明基准"),
             "aggregate": aggregate,
-            "pct": round(pct, 1),
+            "pct": round(pct, 1), "pct_lo": None,
             "start": e["start"], "end": e["end"], "days": e["days"],
             "annual": e["days"] >= 340,
         })
     if not rows:
         return None
+
+    # Min/Max 区间归并：同（对手,类型,基准,期末,跨度）取上限为 pct、
+    # 下限记 pct_lo（风险分级用上限，展示为「16-24%」）
+    grouped: dict = {}
+    for r in rows:
+        k = (r["party"], r["type"], r["benchmark"], r["end"], r["days"])
+        g = grouped.get(k)
+        if g is None:
+            grouped[k] = r
+        else:
+            hi, lo = max(g["pct"], r["pct"]), min(g["pct"], r["pct"])
+            g["pct"] = hi
+            if hi != lo:
+                g["pct_lo"] = lo
+    rows = list(grouped.values())
 
     def is_rev(r):
         return r["benchmark"] == "营收"
@@ -195,7 +216,7 @@ def _conc_reshape(raw: list) -> dict | None:
     for r in sorted(rows, key=lambda r: (r["end"], r["days"])):
         dedup[(r["party"], r["type"], r["benchmark"])] = r
     latest = sorted((r for r in dedup.values() if r["end"] >= cutoff),
-                    key=lambda r: -r["pct"])
+                    key=lambda r: -r["pct"])[:15]
 
     # 趋势：营收基准的单一客户按年度期加总；先按对手方去重再求和——
     # 跨申报改名（CustomerA vs CustomerOne）和比较期重复会双倍计数
@@ -280,6 +301,28 @@ def _reshape_axis(data: dict, freq: str, years: int) -> dict | None:
         return None
     n = years if freq == "annual" else 4 * years
     ends = sorted(cells)[-n:]
+    # 窗口约束：Q4 被宁缺勿错丢弃后不许拿窗口外老季度凑数（GOOG 曾把
+    # 「3 年」拉成 3.8 年且四个 Dec 旺季无痕消失，与损益卡期间错位）
+    latest_end = ends[-1]
+    cutoff = (date.fromisoformat(latest_end)
+              - timedelta(days=int(years * 366))).isoformat()
+    ends = [e for e in ends if e >= cutoff]
+    # 窗口内缺失的期补 null 占位（与集中度趋势的断线呈现对齐），
+    # 类目轴等距画柱时缺季才有视觉痕迹
+    span = 95 if kind == "quarterly" else 365
+    grid: list[tuple[str, bool]] = []
+    prev = None
+    for e in ends:
+        if prev is not None:
+            gap = (date.fromisoformat(e) - date.fromisoformat(prev)).days
+            k = min(round(gap / span), 8)
+            # 占位期末在两个真实期之间线性插值（固定步进会把 Dec 30 推成 Jan 3）
+            for j in range(1, k):
+                pe = (date.fromisoformat(prev)
+                      + timedelta(days=round(gap * j / k))).isoformat()
+                grid.append((pe, True))
+        grid.append((e, False))
+        prev = e
     # 先按剥后缀的 base 归并改名成员（改名的新旧世代不会同期出现，
     # 取先见值），再按窗口内合计排序；超过上限的折叠进「其他」
     merged: dict[str, dict[str, float]] = {}
@@ -294,17 +337,21 @@ def _reshape_axis(data: dict, freq: str, years: int) -> dict | None:
     ranked = sorted(sums, key=lambda m: -sums[m])
     kept, folded = ranked[:MAX_MEMBERS], ranked[MAX_MEMBERS:]
 
-    series = {m: [merged[e].get(m) for e in ends] for m in kept}
-    other = [sum(merged[e].get(m, 0) for m in folded) or None
-             for e in ends] if folded else None
+    def cell_vals(fn):
+        return [None if ph else fn(e) for e, ph in grid]
+
+    series = {m: cell_vals(lambda e, _m=m: merged[e].get(_m)) for m in kept}
+    other = cell_vals(lambda e: sum(merged[e].get(m, 0) for m in folded) or None) \
+        if folded else None
     return {
-        "periods": [{"end": e, "label": _label(e)} for e in ends],
+        "periods": [{"end": e, "label": _label(e), "placeholder": ph}
+                    for e, ph in grid],
         "members": [{"key": m, "label": _member_label(m)} for m in kept],
         "series": [series[m] for m in kept],
         "other": other,
-        "total": [cells[e]["total"] for e in ends],
-        "reconciled": [cells[e]["reconciled"] for e in ends],
-        "derived": [cells[e]["derived"] for e in ends],
+        "total": cell_vals(lambda e: cells[e]["total"]),
+        "reconciled": cell_vals(lambda e: cells[e]["reconciled"]),
+        "derived": [False if ph else cells[e]["derived"] for e, ph in grid],
     }
 
 
