@@ -304,7 +304,10 @@ def _parse_filing_cached(client: httpx.Client, cik: int, acc: str) -> dict:
     fd, tmp = tempfile.mkstemp(dir=CACHE_DIR, suffix=".tmp")
     with os.fdopen(fd, "w", encoding="utf-8") as f:
         f.write(json.dumps(out, ensure_ascii=False))
-    os.replace(tmp, cache)
+    try:
+        os.replace(tmp, cache)
+    except FileNotFoundError:
+        pass  # 并发清扫删了 tmp：数据已在手，丢一次落盘无害
     return out
 
 
@@ -513,10 +516,17 @@ def _sweep_stale_cache() -> None:
     if not CACHE_DIR.exists():
         return
     keep = f"_v{PARSE_VER}.json"
+    now = time.time()
     for f in CACHE_DIR.iterdir():
-        if f.name.endswith(".tmp") or (f.name.endswith(".json")
-                                       and not f.name.endswith(keep)):
-            f.unlink(missing_ok=True)
+        try:
+            if f.name.endswith(".tmp"):
+                # 只清一小时前的残留 tmp：并发冷取数正在写的不能碰
+                if now - f.stat().st_mtime > 3600:
+                    f.unlink(missing_ok=True)
+            elif f.name.endswith(".json") and not f.name.endswith(keep):
+                f.unlink(missing_ok=True)
+        except OSError:
+            pass  # Windows 上删被占用文件会 PermissionError，跳过即可
 
 
 def build_segments(ticker: str, email: str, cik: int | None = None,

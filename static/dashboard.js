@@ -49,14 +49,14 @@ function fmtUSD(v) {
 const fmtPct = (v) => v == null ? "—" : (v * 100).toFixed(1) + "%";
 // 同比：季度用 i-4 避开季节性，年度用 i-1
 const yoy = (arr, i, step) =>
-  arr && arr[i] != null && arr[i - step] != null && arr[i - step] !== 0
-    ? arr[i] / arr[i - step] - 1 : null;
+  arr && arr[i] != null && arr[i - step] != null && arr[i - step] > 0
+    ? arr[i] / arr[i - step] - 1 : null;  // 负基数（去年亏损）不算同比
 // 对比票按日历季对齐：NVDA(1月年结) vs AAPL(9月年结) 的期末就近匹配
-function alignCompare(mainPeriods, cmpPeriods, cmpArr) {
+function alignCompare(mainPeriods, cmpPeriods, cmpArr, winDays) {
   const cmpDates = cmpPeriods.map(p => new Date(p.end).getTime());
   return mainPeriods.map(p => {
     const t = new Date(p.end).getTime();
-    let best = -1, bestGap = 45 * 864e5;
+    let best = -1, bestGap = (winDays || 45) * 864e5;
     cmpDates.forEach((ct, j) => {
       const gap = Math.abs(ct - t);
       if (gap < bestGap) { best = j; bestGap = gap; }
@@ -116,7 +116,9 @@ function renderTtm(d) {
   const box = $("ttmTiles");
   box.textContent = "";
   const t = d.ttm || {};
-  const fcf = (t.cfo && t.cfo.value != null && t.capex && t.capex.value != null)
+  const bank = !!d.bank_format;
+  const fcf = (!bank && t.cfo && t.cfo.value != null
+               && t.capex && t.capex.value != null)
     ? t.cfo.value - t.capex.value : null;
   const niv = t.net_income && t.net_income.value;
   const rev = t.revenue && t.revenue.value;
@@ -124,8 +126,10 @@ function renderTtm(d) {
     ["TTM 营收", t.revenue, fmtUSD],
     ["TTM 营业利润", t.op_income, fmtUSD],
     ["TTM 净利", t.net_income, fmtUSD],
-    ["TTM OCF", t.cfo, fmtUSD],
-    ["TTM FCF", { value: fcf, note: fcf != null ? "OCF−资本开支" : null }, fmtUSD],
+    ["TTM OCF", t.cfo && (bank ? { ...t.cfo, note: "银行口径：含贷款业务现金流" }
+                                : t.cfo), fmtUSD],
+    ["TTM FCF", bank ? null
+      : { value: fcf, note: fcf != null ? "OCF−资本开支" : null }, fmtUSD],
     ["TTM EPS", t.eps_diluted, (v) => "$" + v.toFixed(2)],
     ["TTM 净利率", { value: (niv != null && rev) ? niv / rev : null }, fmtPct],
   ];
@@ -252,12 +256,15 @@ function renderIncome(d, labels) {
   // 对比票 overlay：只叠无量纲的比率线（利润率/YoY），绝对金额不混叠
   if (state.cmp && state.cmp.data) {
     const cd = state.cmp.data, ct = state.cmp.ticker;
-    const al = (arr) => alignCompare(d.periods, cd.periods, arr);
-    const cmpLine = (name, arr, color, off) => ({
+    // 年度间距 365 天，窗口放宽到 183 天才能对上错位财年（AAPL 9月年结
+    // vs NVDA 1月年结）；季度维持 45 天防止重复映射
+    const win = d.freq === "annual" ? 183 : 45;
+    const al = (arr) => alignCompare(d.periods, cd.periods, arr, win);
+    const cmpLine = (name, arr, color) => ({
       name: `${name}(${ct})`, type: "line", data: al(arr),
       xAxisIndex: 1, yAxisIndex: 1, connectNulls: false,
-      lineStyle: { width: 1.5, type: "dashed", color, opacity: .55 },
-      itemStyle: { color, opacity: .55 }, symbol: "diamond", symbolSize: 4,
+      lineStyle: { width: 2, type: "dashed", color, opacity: .8 },
+      itemStyle: { color, opacity: .8 }, symbol: "diamond", symbolSize: 4,
     });
     const cm = cd.income.margins;
     const cmpYoY = cd.income.revenue.map((_, i) =>
@@ -308,13 +315,17 @@ function renderEps(d, labels) {
     Object.assign(catAxis(labels), { gridIndex: 1 }),
   ];
   opt.yAxis = [
-    { type: "value", gridIndex: 0, scale: true,
+    // 柱轴必须包含 0：全负 EPS 票（RKLB）用 scale 会把零基线推出网格，
+    // 柱形从面板顶边倒挂、越亏柱越长
+    { type: "value", gridIndex: 0,
+      min: (v) => Math.min(0, v.min), max: (v) => Math.max(0, v.max),
       splitLine: { lineStyle: { color: C.border, opacity: .6 } },
       axisLabel: { color: C.muted, fontSize: 11, formatter: (v) => "$" + v } },
     { type: "value", gridIndex: 1, scale: true,
       splitLine: { lineStyle: { color: C.border, opacity: .6 } },
       axisLabel: { color: C.muted, fontSize: 11,
-                   formatter: (v) => (v / 1e9).toFixed(1) + "B" } },
+                   formatter: (v) => v >= 1e9 ? (v / 1e9).toFixed(2) + "B"
+                                              : (v / 1e6).toFixed(0) + "M" } },
   ];
   opt.series = [
     bar("稀释 EPS", inc.eps_diluted, C.s1),
@@ -590,6 +601,7 @@ async function loadSegments(ticker, freq, years) {
   // 分部卡片用独立序号：主请求失败的新一轮不该作废仍然有效的在途分部
   // 响应，否则卡片会永久停在「加载中…」
   const seq = ++state.segSeq;
+  state.segData = null;  // 加载窗口内点占比/金额不许渲染上一只票
   segEmpty("分部数据加载中…（冷启动要逐份解析 10-K/10-Q，约 10-60 秒）");
   concReset("集中度数据加载中…");  // 别让上一只股票的风险横幅挂在加载窗口里
   try {
@@ -739,7 +751,9 @@ function renderConcentration(c) {
         const sp = document.createElement("span");
         sp.className = "pct";
         const range = r.pct_lo != null ? `${r.pct_lo}–${r.pct}` : `${r.pct}`;
-        sp.textContent = `占${r.benchmark} ${range}%`;
+        const latestEnd = g.cells.reduce((x, y) => x.end >= y.end ? x : y).end;
+        sp.textContent = `占${r.benchmark} ${range}%`
+          + (r.end !== latestEnd ? `（截至 ${r.end}）` : "");
         const risky = r.type === "客户" && r.benchmark === "营收";
         sp.style.color = risky && r.pct >= 30 ? css("--err")
           : risky && r.pct >= 10 ? "#e0a63f" : "";
@@ -839,14 +853,11 @@ async function load() {
       throw new Error(body.detail || `请求失败（HTTP ${res.status}）`);
     }
     const d = await res.json();
-    const cmpD = await cmpP;
     if (seq !== state.seq) return;
     state.data = d;
-    state.cmp = cmpD ? { ticker: cmpD.ticker, data: cmpD } : null;
-    if (cmpT && !cmpD) setStatus("err", `对比票 ${cmpT} 加载失败，已按单票渲染`);
+    state.cmp = null;  // 先按单票渲染，对比票回来后再叠线（不阻塞主图）
     history.replaceState(null, "",
-      `?ticker=${d.ticker}&freq=${freq}&years=${years}` +
-      (state.cmp ? `&compare=${state.cmp.ticker}` : ""));
+      `?ticker=${d.ticker}&freq=${freq}&years=${years}`);
     document.title = `${d.ticker} 财务图表 · EDGAR 财报下载器`;
     // 公司名来自 EDGAR 第三方数据，必须走 textContent 而不是 innerHTML
     const co = $("coname");
@@ -885,8 +896,25 @@ async function load() {
     renderWaterfall(d, d.periods.length - 1);
     // 卡片刚显示时容器才有宽度，让 ECharts 重算一次
     requestAnimationFrame(() => Object.values(state.charts).forEach(c => c.resize()));
+    const baseStatus = `${d.periods.length} 期 · ${freq === "quarterly" ? "季度" : "年度"}`;
     if (d.warning) setStatus("err", `${d.periods.length} 期 · ⚠ ${d.warning}`);
-    else setStatus("ok", `${d.periods.length} 期 · ${freq === "quarterly" ? "季度" : "年度"}`);
+    else setStatus("ok", baseStatus);
+    // 对比票异步落地：主图先出，虚线后叠；失败提示写进最终状态不被覆盖
+    cmpP.then((cmpD) => {
+      if (seq !== state.seq) return;
+      if (cmpD) {
+        state.cmp = { ticker: cmpD.ticker, data: cmpD };
+        history.replaceState(null, "",
+          `?ticker=${d.ticker}&freq=${freq}&years=${years}&compare=${cmpD.ticker}`);
+        renderIncome(d, labels);
+        const align = alignCompare(d.periods, cmpD.periods,
+          cmpD.income.margins.net, d.freq === "annual" ? 183 : 45);
+        if (!align.some(v => v != null))
+          setStatus("err", `${baseStatus} · ⚠ 对比票 ${cmpD.ticker} 财年错位超出对齐窗口`);
+      } else if (cmpT && cmpT !== ticker) {
+        setStatus("err", `${baseStatus} · ⚠ 对比票 ${cmpT} 加载失败，已按单票渲染`);
+      }
+    });
   } catch (e) {
     if (seq === state.seq) setStatus("err", e.message);
   } finally {
@@ -902,7 +930,8 @@ function csvIncome(d) {
     d.income.revenue[i], d.income.cogs[i], d.income.opex[i],
     d.income.net_income[i], d.income.margins.gross[i],
     d.income.margins.operating[i], d.income.margins.net[i],
-    d.income.eps_diluted[i]]));
+    d.income.eps_diluted[i] == null ? null
+      : +d.income.eps_diluted[i].toFixed(2)]));
   return L;
 }
 function csvCashflow(d) {
@@ -927,14 +956,30 @@ document.addEventListener("click", async (e) => {
   const table = kind === "income" ? (d && csvIncome(d))
     : kind === "cashflow" ? (d && csvCashflow(d)) : csvConc();
   if (!table) return;
-  const text = table.map(row => row.map(v =>
-    v == null ? "" : String(v).includes(",") ? `"${v}"` : v).join(",")).join("\n");
+  // RFC4180：含逗号/引号/换行的字段包引号并把引号加倍
+  const cell = (v) => {
+    if (v == null) return "";
+    const t = String(v);
+    return /[",\n]/.test(t) ? `"${t.replace(/"/g, '""')}"` : t;
+  };
+  const text = table.map(row => row.map(cell).join(",")).join("\n");
+  const btn = e.target;
+  if (!btn.dataset.label) btn.dataset.label = btn.textContent;
+  let ok = false;
   try {
     await navigator.clipboard.writeText(text);
-    const old = e.target.textContent;
-    e.target.textContent = "已复制 ✓";
-    setTimeout(() => { e.target.textContent = old; }, 1500);
-  } catch { e.target.textContent = "复制失败"; }
+    ok = true;
+  } catch {
+    // http 非安全上下文没有 clipboard API：退回临时 textarea
+    const ta = document.createElement("textarea");
+    ta.value = text;
+    document.body.appendChild(ta);
+    ta.select();
+    try { ok = document.execCommand("copy"); } catch { ok = false; }
+    ta.remove();
+  }
+  btn.textContent = ok ? "已复制 ✓" : "复制失败";
+  setTimeout(() => { btn.textContent = btn.dataset.label; }, 1500);
 });
 
 if ($("ticker").value) load();

@@ -231,7 +231,8 @@ def ttm_via_ytd(facts: dict, tag_names, annual):
              and abs((date.fromisoformat(pe) - date.fromisoformat(ps)).days - span) <= 10]
     if not prior:
         return None
-    return {"value": a_val + v_cur - prior[0], "note": f"FY({a_end_s}) + YTD至{e} - 上年同期YTD"}
+    return {"value": a_val + v_cur - prior[0], "end": e,
+            "note": f"FY({a_end_s}) + YTD至{e} - 上年同期YTD"}
 
 
 def assemble_series(facts: dict, name: str) -> tuple[dict, dict]:
@@ -299,11 +300,18 @@ def build_facts(ticker: str, email: str, cik: int | None = None) -> dict:
         out[name + "_annual"] = annual
         out[name + "_quarterly"] = quarterly
 
+    # TTM 全部科目锚定到营收窗口末季：某科目标签断更时（COHR 的营业
+    # 利润曾停在 2024）不许拿旧窗口的 TTM 与新窗口的营收并排展示
     ttm = {}
+    anchor = max(out["revenue_quarterly"], default=None)
     for name in ("revenue", "op_income", "net_income"):
         q = out[name + "_quarterly"]
         if len(q) >= 4:
             last4 = list(q.items())[-4:]
+            if anchor and last4[-1][0] != anchor:
+                ttm[name] = {"value": None,
+                             "error": f"口径滞后：最新期 {last4[-1][0]}"}
+                continue
             ends = [date.fromisoformat(k) for k, _ in last4]
             gaps = [(ends[i + 1] - ends[i]).days for i in range(3)]
             if all(80 <= g <= 100 for g in gaps):
@@ -313,6 +321,9 @@ def build_facts(ticker: str, email: str, cik: int | None = None) -> dict:
     for name in ("cfo", "capex"):
         r = ttm_via_ytd(facts, TAGS[name], out[name + "_annual"])
         if r:
+            if anchor and abs((date.fromisoformat(anchor)
+                               - date.fromisoformat(r["end"])).days) > 100:
+                r = {"value": None, "error": f"口径滞后：最新期 {r['end']}"}
             ttm[name] = r
     out["ttm"] = ttm
     return out
