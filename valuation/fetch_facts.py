@@ -36,6 +36,19 @@ TAGS = {
     "income_tax": ["IncomeTaxExpenseBenefit"],
     # 银行格式没有 OperatingExpenses，非利息支出是对应的费用合计（图表端回退用）
     "noninterest_expense": ["NoninterestExpense"],
+    # ---- 营业外/一次性项目组件（图表端拆解与标色用，全部为新增 key）----
+    # 股权投资公允价值变动：GOOG 持 SpaceX/Anthropic 类股权的浮盈浮亏，
+    # Q2'26 单季 +99B，把净利润污染到 94% 净利率——必须单独拆出来标示
+    "equity_inv_gain": ["EquitySecuritiesFvNiGainLoss", "GainLossOnInvestments"],
+    "interest_income": ["InvestmentIncomeInterest"],
+    "interest_expense_nonop": ["InterestExpense", "InterestExpenseNonoperating"],
+    "fx_gain": ["ForeignCurrencyTransactionGainLossBeforeTax"],
+    "other_nonop": ["OtherNonoperatingIncomeExpense"],
+    "restructuring": ["RestructuringCharges"],
+    "impairment": ["GoodwillImpairmentLoss", "AssetImpairmentCharges",
+                   "ImpairmentOfIntangibleAssetsExcludingGoodwill"],
+    "litigation": ["LitigationSettlementExpense", "LossContingencyLossInPeriod"],
+    "disposal_gain": ["GainLossOnDispositionOfBusiness"],
     "net_income": ["NetIncomeLoss"],
     "eps_diluted": ["EarningsPerShareDiluted"],
     "cfo": ["NetCashProvidedByUsedInOperatingActivities"],

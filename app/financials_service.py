@@ -236,6 +236,11 @@ def _reshape(facts: dict, info: dict, freq: str, years: int) -> dict:
         },
         "cashflow": {"ocf": ocf, "capex": capex, "fcf": fcf},
         "balance": {"cash": cash, "securities": securities, "total_debt": _total_debt(inst)},
+        # 营业外/一次性组件：前端拆解瀑布图的营业外损益并标记一次性主导的期
+        "oneoff": {k: dur(k) for k in
+                   ("equity_inv_gain", "interest_income", "interest_expense_nonop",
+                    "fx_gain", "other_nonop", "restructuring", "impairment",
+                    "litigation", "disposal_gain")},
         "ttm": facts.get("ttm") or {},
     }
 

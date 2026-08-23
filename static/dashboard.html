@@ -159,7 +159,7 @@
     </div>
     <div class="chart-card">
       <div class="chart-head">
-        <div><h2>利润瀑布</h2><div class="sub">营收到净利润的拆解，蓝=小计 / 橙=扣减 / 绿=增加；「其他」为对账残差项</div></div>
+        <div><h2>利润瀑布</h2><div class="sub">蓝=小计 / 橙=扣减 / 绿=增加 / <span style="color:var(--s7)">紫=投资损益主导的营业外项</span>（hover 看 XBRL 组件拆解）；「其他」为对账残差项</div></div>
         <select id="wfPeriod"></select>
       </div>
       <div class="chart" id="cWaterfall"></div>
@@ -275,6 +275,16 @@ function renderIncome(d, labels) {
       const pct = p.axisIndex === 1 || p.seriesName.includes("率");
       html += `<br>${p.marker} ${p.seriesName}: ${pct ? fmtPct(p.value) : fmtUSD(p.value)}`;
     }
+    // 一次性/市值波动项污染净利 ≥20% 的期，hover 直接给明细
+    const i = ps[0].dataIndex;
+    const ni = d.income.net_income[i];
+    const impact = oneoffImpact(d, i);
+    if (ni && Math.abs(impact) >= Math.abs(ni) * 0.2) {
+      html += `<br><span style="color:${C.s7}">⚡ 本期含大额一次性/投资项：</span>`;
+      for (const cx of oneoffAt(d, i))
+        if (!["interest_income", "interest_expense_nonop", "fx_gain", "other_nonop"].includes(cx.key))
+          html += `<br>&nbsp;&nbsp;${esc(cx.label)}: ${cx.val >= 0 ? "+" : "−"}${fmtUSD(Math.abs(cx.val))}`;
+    }
     return html;
   };
   // 利润率面板给足高度：太矮时 0-100% 的刻度会把 20-50% 的正常波段挤成一团
@@ -300,16 +310,58 @@ function renderIncome(d, labels) {
     symbol: "circle", symbolSize: 5, connectNulls: false,
   });
   // 整列为空的系列不画也不进图例（银行没有营业成本/毛利率，硬挂着会误导）
+  // ⚡ 标记：一次性/投资项污染净利 ≥20% 的期，净利润柱顶加标（hover 有明细）
+  const flags = inc.net_income.map((ni, i) =>
+    ni && Math.abs(oneoffImpact(d, i)) >= Math.abs(ni) * 0.2 ? i : null)
+    .filter(v => v !== null);
+  const niBar = bar("净利润", inc.net_income, C.s4, {
+    markPoint: {
+      symbol: "circle", symbolSize: 1, silent: true,
+      label: { show: true, formatter: "⚡", fontSize: 13, color: C.s7 },
+      data: flags.map(i => ({ coord: [i, inc.net_income[i]],
+                              symbolOffset: [0, -12] })),
+    },
+  });
   opt.series = [
     bar("营收", inc.revenue, C.s1),
     bar("营业成本", inc.cogs, C.s2),
     bar("运营费用", inc.opex, C.s3),
-    bar("净利润", inc.net_income, C.s4),
+    niBar,
     line("毛利率", m.gross, C.s5),
     line("营业利润率", m.operating, C.s6),
     line("净利润率", m.net, C.s7),
   ].filter(s => s.data.some(v => v != null));
   mount("cIncome", opt);
+}
+
+// ---- 一次性/营业外组件（SEC XBRL 有标准标签，罚款类覆盖较杂）----
+const ONEOFF_LABELS = {
+  equity_inv_gain: "股权投资公允价值变动", interest_income: "利息收入",
+  interest_expense_nonop: "利息支出", fx_gain: "汇兑损益",
+  other_nonop: "其他营业外", restructuring: "重组费用",
+  impairment: "资产/商誉减值", litigation: "诉讼和解/罚金",
+  disposal_gain: "业务处置损益",
+};
+// 支出性质的组件按报表口径取负号
+const ONEOFF_SIGN = { interest_expense_nonop: -1, restructuring: -1,
+                      impairment: -1, litigation: -1 };
+
+function oneoffAt(d, i) {
+  const out = [];
+  for (const [k, arr] of Object.entries(d.oneoff || {})) {
+    const v = arr[i];
+    if (v == null || v === 0) continue;
+    out.push({ key: k, label: ONEOFF_LABELS[k], val: (ONEOFF_SIGN[k] || 1) * v });
+  }
+  return out;
+}
+
+// 一次性/市值波动类（利息收支是经常性的，不算）对净利的污染程度
+function oneoffImpact(d, i) {
+  return oneoffAt(d, i)
+    .filter(x => !["interest_income", "interest_expense_nonop", "fx_gain",
+                   "other_nonop"].includes(x.key))
+    .reduce((s, x) => s + x.val, 0);
 }
 
 // ---- 图 2：利润瀑布 ----
@@ -351,6 +403,19 @@ function wfItems(d, i) {
 
 function renderWaterfall(d, i) {
   const items = wfItems(d, i);
+  // 营业外损益按 XBRL 组件拆解：投资损益主导时改紫色并在 hover 里列明细
+  const nonoffComp = oneoffAt(d, i).filter(x =>
+    ["equity_inv_gain", "interest_income", "interest_expense_nonop",
+     "fx_gain", "other_nonop"].includes(x.key));
+  const eqv = nonoffComp.find(x => x.key === "equity_inv_gain");
+  if (items) {
+    for (const it of items) {
+      if (it.name !== "营业外损益") continue;
+      it.components = nonoffComp;
+      it.unexplained = it.val - nonoffComp.reduce((s, x) => s + x.val, 0);
+      it.investmentDriven = !!(eqv && Math.abs(eqv.val) > Math.abs(it.val) * 0.5);
+    }
+  }
   const el = $("cWaterfall");
   if (!items) {
     if (state.charts.cWaterfall) { state.charts.cWaterfall.dispose(); delete state.charts.cWaterfall; }
@@ -373,7 +438,17 @@ function renderWaterfall(d, i) {
     const p = ps.find(x => x.seriesIndex === 1);
     if (!p) return "";
     const it = items[p.dataIndex];
-    return `<b>${it.name}</b><br>${it.total ? fmtUSD(it.val) : (it.val >= 0 ? "+" : "−") + fmtUSD(Math.abs(it.val))}`;
+    let html = `<b>${it.name}</b><br>${it.total ? fmtUSD(it.val) : (it.val >= 0 ? "+" : "−") + fmtUSD(Math.abs(it.val))}`;
+    if (it.components && it.components.length) {
+      html += `<br><span style="color:${C.muted}">按 XBRL 组件拆解：</span>`;
+      for (const cx of it.components)
+        html += `<br>&nbsp;&nbsp;${esc(cx.label)}: ${cx.val >= 0 ? "+" : "−"}${fmtUSD(Math.abs(cx.val))}`;
+      if (Math.abs(it.unexplained) > Math.abs(it.val) * 0.02)
+        html += `<br>&nbsp;&nbsp;未拆解余项: ${it.unexplained >= 0 ? "+" : "−"}${fmtUSD(Math.abs(it.unexplained))}`;
+      if (it.investmentDriven)
+        html += `<br><span style="color:${C.s7}">◆ 投资损益主导（市值波动，非经营所得）</span>`;
+    }
+    return html;
   };
   opt.legend = { show: false };
   opt.grid.bottom = 40;
@@ -390,8 +465,10 @@ function renderWaterfall(d, i) {
     { type: "bar", stack: "wf", stackStrategy: "all",
       data: vis.map((v, idx) => ({
         value: v.value,
-        // 蓝=小计，橙=扣减，绿=增加（GOOG 的 +98B 投资收益画成橙色会误读）
-        itemStyle: { color: v.total ? C.s1 : (items[idx].val >= 0 ? C.s3 : C.s2),
+        // 蓝=小计，橙=扣减，绿=增加，紫=投资损益主导的营业外项（市值波动）
+        itemStyle: { color: v.total ? C.s1
+                     : items[idx].investmentDriven ? C.s7
+                     : (items[idx].val >= 0 ? C.s3 : C.s2),
                      borderRadius: 3 },
         label: {
           show: true, position: v.total ? "top" : (items[idx].val >= 0 && !v.total ? "top" : "bottom"),
