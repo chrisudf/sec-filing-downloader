@@ -191,6 +191,9 @@ def _reshape(facts: dict, info: dict, freq: str, years: int) -> dict:
     ocf = dur("cfo")
     capex = dur("capex")  # PaymentsToAcquire* 是正数（流出）
     fcf = _sub(ocf, capex)
+    buyback = dur("buyback")      # Payments* 均为正数（流出）
+    dividends = dur("dividends")
+    sbc = dur("sbc")              # 非现金加回项，正数
 
     cash = inst("cash")
     # 证券类：基线口径优先。NVDA 2026 起把该行拆成 债券+股票 两个新标签，
@@ -234,7 +237,8 @@ def _reshape(facts: dict, info: dict, freq: str, years: int) -> dict:
                 "net": _ratio(net_income, revenue),
             },
         },
-        "cashflow": {"ocf": ocf, "capex": capex, "fcf": fcf},
+        "cashflow": {"ocf": ocf, "capex": capex, "fcf": fcf,
+                     "buyback": buyback, "dividends": dividends, "sbc": sbc},
         "balance": {"cash": cash, "securities": securities, "total_debt": _total_debt(inst)},
         # 营业外/一次性组件：前端拆解瀑布图的营业外损益并标记一次性主导的期
         "oneoff": {k: dur(k) for k in

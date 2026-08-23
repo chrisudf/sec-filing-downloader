@@ -55,6 +55,10 @@ TAGS = {
     "capex": ["PaymentsToAcquirePropertyPlantAndEquipment",
               "PaymentsToAcquirePropertyPlantAndEquipmentAndIntangibleAssets",
               "PaymentsToAcquireProductiveAssets"],
+    # 股东回报与股权激励（图表端；现金流量表科目，10-Q 为累计口径）
+    "buyback": ["PaymentsForRepurchaseOfCommonStock"],
+    "dividends": ["PaymentsOfDividends", "PaymentsOfDividendsCommonStock"],
+    "sbc": ["ShareBasedCompensation"],
     "cash": ["CashAndCashEquivalentsAtCarryingValue"],
     "st_securities": ["MarketableSecuritiesCurrent", "ShortTermInvestments",
                       "AvailableForSaleSecuritiesDebtSecuritiesCurrent"],
@@ -109,7 +113,7 @@ OVERRIDE_TAGS = {
     "revenue": ["RevenuesNetOfInterestExpense"],
 }
 # 现金流表科目：10-Q 只披露财年累计数，离散季度序列要靠 YTD 差分
-YTD_FLOW = {"cfo", "capex"}
+YTD_FLOW = {"cfo", "capex", "buyback", "dividends", "sbc"}
 
 
 class FactsError(ValueError):

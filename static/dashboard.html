@@ -172,7 +172,7 @@
     </div>
     <div class="chart-card">
       <div class="chart-head">
-        <div><h2>现金流与资本开支</h2><div class="sub">资本开支画在零轴下方（现金流出）；FCF = 经营现金流 − 资本开支</div></div>
+        <div><h2>现金流 · 股东回报 · 股权激励</h2><div class="sub">流出（资本开支/回购/分红）画零轴下方；SBC 虚线=非现金加回（hover 看回报与 SBC 占 FCF 比例）</div></div>
       </div>
       <div class="chart" id="cCashflow"></div>
     </div>
@@ -691,26 +691,40 @@ function renderBalance(d, labels) {
   mount("cBalance", opt);
 }
 
-// ---- 图 4：现金流与资本开支（capex 取负画到零轴下方）----
+// ---- 图 4：现金流·股东回报·股权激励（流出取负画到零轴下方）----
 function renderCashflow(d, labels) {
   const cf = d.cashflow;
+  const OUT = ["资本开支", "回购", "分红"];
   const opt = baseOpt();
   opt.tooltip.formatter = (ps) => {
     let html = `<b>${ps[0].axisValue}</b>`;
     for (const p of ps) {
-      const raw = p.seriesName === "资本开支" && p.value != null ? -p.value : p.value;
+      const raw = OUT.includes(p.seriesName) && p.value != null ? -p.value : p.value;
       html += `<br>${p.marker} ${p.seriesName}: ${fmtUSD(raw)}`;
     }
+    // 股东回报与 SBC 相对 FCF 的比例——回购是不是 FCF 付得起、激励有多重
+    const i = ps[0].dataIndex;
+    const fcf = cf.fcf[i], ret = (cf.buyback[i] || 0) + (cf.dividends[i] || 0);
+    if (fcf && ret) html += `<br><span style="color:${C.muted}">股东回报(回购+分红) ${fmtUSD(ret)} = FCF 的 ${(ret / fcf * 100).toFixed(0)}%</span>`;
+    if (fcf && cf.sbc[i]) html += `<br><span style="color:${C.muted}">SBC = FCF 的 ${(cf.sbc[i] / fcf * 100).toFixed(0)}%</span>`;
     return html;
   };
   opt.xAxis = catAxis(labels);
   opt.yAxis = usdAxis();
+  const negBar = (name, arr, color) =>
+    bar(name, arr.map(v => v == null ? null : -v), color,
+        { itemStyle: { color, borderRadius: [0, 0, 3, 3] } });
   opt.series = [
     bar("经营现金流", cf.ocf, C.s1),
     bar("自由现金流", cf.fcf, C.s2),
-    bar("资本开支", cf.capex.map(v => v == null ? null : -v), C.s3,
-        { itemStyle: { color: C.s3, borderRadius: [0, 0, 3, 3] } }),
-  ];
+    negBar("资本开支", cf.capex, C.s3),
+    negBar("回购", cf.buyback, C.s4),
+    negBar("分红", cf.dividends, C.s5),
+    { name: "SBC(股权激励)", type: "line", data: cf.sbc,
+      lineStyle: { width: 2, type: "dashed", color: C.s6 },
+      itemStyle: { color: C.s6 }, symbol: "circle", symbolSize: 5,
+      connectNulls: false },
+  ].filter(s => s.data.some(v => v != null));
   mount("cCashflow", opt);
 }
 
