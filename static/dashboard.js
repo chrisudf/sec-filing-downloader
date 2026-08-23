@@ -13,6 +13,7 @@ const esc = (s) => String(s).replace(/[&<>"']/g,
 // ---- 控件与 URL 同步 ----
 const qs = new URLSearchParams(location.search);
 if (qs.get("ticker")) $("ticker").value = qs.get("ticker").toUpperCase();
+if (qs.get("compare")) $("compare").value = qs.get("compare").toUpperCase();
 if (qs.get("freq") === "annual") setFreq("annual");
 if (["3", "5", "10"].includes(qs.get("years"))) $("years").value = qs.get("years");
 
@@ -28,6 +29,8 @@ $("freqSeg").addEventListener("click", (e) => {
 $("years").addEventListener("change", () => { if ($("ticker").value.trim()) load(); });
 $("go").addEventListener("click", load);
 $("ticker").addEventListener("keydown", (e) => { if (e.key === "Enter") load(); });
+$("compare").addEventListener("keydown", (e) => { if (e.key === "Enter") load(); });
+$("compare").addEventListener("change", () => { if ($("ticker").value.trim()) load(); });
 
 function setStatus(cls, msg) {
   const el = $("status");
@@ -48,6 +51,19 @@ const fmtPct = (v) => v == null ? "—" : (v * 100).toFixed(1) + "%";
 const yoy = (arr, i, step) =>
   arr && arr[i] != null && arr[i - step] != null && arr[i - step] !== 0
     ? arr[i] / arr[i - step] - 1 : null;
+// 对比票按日历季对齐：NVDA(1月年结) vs AAPL(9月年结) 的期末就近匹配
+function alignCompare(mainPeriods, cmpPeriods, cmpArr) {
+  const cmpDates = cmpPeriods.map(p => new Date(p.end).getTime());
+  return mainPeriods.map(p => {
+    const t = new Date(p.end).getTime();
+    let best = -1, bestGap = 45 * 864e5;
+    cmpDates.forEach((ct, j) => {
+      const gap = Math.abs(ct - t);
+      if (gap < bestGap) { best = j; bestGap = gap; }
+    });
+    return best >= 0 ? cmpArr[best] : null;
+  });
+}
 const fmtYoY = (v) => v == null ? "" :
   `（YoY ${v >= 0 ? "+" : ""}${(v * 100).toFixed(1)}%）`;
 
@@ -233,6 +249,28 @@ function renderIncome(d, labels) {
       symbol: "circle", symbolSize: 4 },
   ].filter(s => s.data.some(v => v != null));
   opt.legend.selected = { "营收 YoY%": false };
+  // 对比票 overlay：只叠无量纲的比率线（利润率/YoY），绝对金额不混叠
+  if (state.cmp && state.cmp.data) {
+    const cd = state.cmp.data, ct = state.cmp.ticker;
+    const al = (arr) => alignCompare(d.periods, cd.periods, arr);
+    const cmpLine = (name, arr, color, off) => ({
+      name: `${name}(${ct})`, type: "line", data: al(arr),
+      xAxisIndex: 1, yAxisIndex: 1, connectNulls: false,
+      lineStyle: { width: 1.5, type: "dashed", color, opacity: .55 },
+      itemStyle: { color, opacity: .55 }, symbol: "diamond", symbolSize: 4,
+    });
+    const cm = cd.income.margins;
+    const cmpYoY = cd.income.revenue.map((_, i) =>
+      yoy(cd.income.revenue, i, cd.freq === "quarterly" ? 4 : 1));
+    const cmpSeries = [
+      cmpLine("毛利率", cm.gross, C.s5),
+      cmpLine("营业利润率", cm.operating, C.s6),
+      cmpLine("净利润率", cm.net, C.s7),
+      cmpLine("营收 YoY%", cmpYoY, C.s1),
+    ].filter(x => x.data.some(v => v != null));
+    opt.series.push(...cmpSeries);
+    opt.legend.selected[`营收 YoY%(${ct})`] = false;
+  }
   mount("cIncome", opt);
 }
 
@@ -788,7 +826,12 @@ async function load() {
   $("go").disabled = true;
   setStatus("", "从 SEC EDGAR 取数中…");
   try {
+    const cmpT = $("compare").value.trim().toUpperCase();
     const url = `/api/financials/${encodeURIComponent(ticker)}?freq=${freq}&years=${years}`;
+    const cmpP = (cmpT && cmpT !== ticker)
+      ? fetch(`/api/financials/${encodeURIComponent(cmpT)}?freq=${freq}&years=${years}`)
+          .then(r => r.ok ? r.json() : null).catch(() => null)
+      : Promise.resolve(null);
     const res = await fetch(url);
     if (seq !== state.seq) return;
     if (!res.ok) {
@@ -796,9 +839,14 @@ async function load() {
       throw new Error(body.detail || `请求失败（HTTP ${res.status}）`);
     }
     const d = await res.json();
+    const cmpD = await cmpP;
     if (seq !== state.seq) return;
     state.data = d;
-    history.replaceState(null, "", `?ticker=${d.ticker}&freq=${freq}&years=${years}`);
+    state.cmp = cmpD ? { ticker: cmpD.ticker, data: cmpD } : null;
+    if (cmpT && !cmpD) setStatus("err", `对比票 ${cmpT} 加载失败，已按单票渲染`);
+    history.replaceState(null, "",
+      `?ticker=${d.ticker}&freq=${freq}&years=${years}` +
+      (state.cmp ? `&compare=${state.cmp.ticker}` : ""));
     document.title = `${d.ticker} 财务图表 · EDGAR 财报下载器`;
     // 公司名来自 EDGAR 第三方数据，必须走 textContent 而不是 innerHTML
     const co = $("coname");
