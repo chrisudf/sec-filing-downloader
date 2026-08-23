@@ -355,122 +355,110 @@ def _list_filings(client: httpx.Client, cik: int, cutoff: str) -> list[dict]:
             if r["form"] in ("10-K", "10-Q") and r["report"] and r["report"] >= cutoff]
 
 
-def build_segments(ticker: str, email: str, cik: int | None = None,
-                   years: int = 3) -> dict:
-    """返回 {ticker, cik, axes: {product|segment|geo: {"annual": {end: {...}},
-    "quarterly": {end: {"members", "total", "reconciled", "derived"}}}}}"""
-    ticker = ticker.upper()
-    with httpx.Client(headers=_headers(email), timeout=90,
-                      follow_redirects=True) as client:
-        if cik is None:
-            m = _get(client, "https://www.sec.gov/files/company_tickers.json").json()
-            cik = next((int(v["cik_str"]) for v in m.values()
-                        if v["ticker"].upper() == ticker), None)
-            if cik is None:
-                raise SegmentsError(f"SEC EDGAR 中未找到 {ticker}")
+def _conc_group(entry: dict):
+    """集中度分组键（期间+类型+基准）：序数命名跨申报不稳定（FY24 的
+    10-K 叫 CustomerOne、下年比较期叫 CustomerB，同一家客户），必须
+    整组取 filed 最新；分组不带类型+基准又会被 10-Q 复用年度上下文的
+    应收款事实把 10-K 的营收集中度整组误杀。"""
+    bench = type_m = ""
+    for axis, m in entry["dims"].items():
+        if "Benchmark" in axis:
+            bench = m
+        elif "ConcentrationRiskByType" in axis:
+            type_m = m
+    return (entry["start"], entry["end"], type_m, bench)
 
-        rows = _list_filings(
-            client, cik,
-            (date.today() - timedelta(days=int(years * 366) + 400)).isoformat())
-        if not rows:
-            raise SegmentsError(f"{ticker} 没有 10-K/10-Q 申报（外国发行人暂不支持分部图）")
-        latest = max(r["report"] for r in rows)
-        cutoff = (date.fromisoformat(latest)
-                  - timedelta(days=int(years * 366) + 30)).isoformat()
-        picked = sorted((r for r in rows if r["report"] >= cutoff),
-                        key=lambda r: r["report"], reverse=True)[:MAX_FILINGS]
 
-        # 先收集每期的全部申报版本（比较期会被多份申报覆盖）
-        versions: dict = {}
-        totals: dict = {}
-        # 集中度按（期间+类型+基准）整组取 filed 最新的申报：序数命名
-        # 跨申报不稳定（FY24 的 10-K 叫 CustomerOne、下年比较期叫
-        # CustomerB，同一家客户），逐事实合并会把同一期的新旧命名都留下；
-        # 分组必须带上类型+基准——10-Q 会用上年年度跨度的上下文标应收款
-        # 集中度，按期整组会把 10-K 的营收集中度整组误杀
-        def conc_group(entry: dict):
-            bench = type_m = ""
-            for axis, m in entry["dims"].items():
-                if "Benchmark" in axis:
-                    bench = m
-                elif "ConcentrationRiskByType" in axis:
-                    type_m = m
-            return (entry["start"], entry["end"], type_m, bench)
+def _collect_versions(client: httpx.Client, cik: int, picked: list[dict]):
+    """逐申报收集：每期全部成员版本（比较期会被多份申报覆盖）、
+    无维度总额、集中度分组。"""
+    versions: dict = {}
+    totals: dict = {}
+    conc_cells: dict = {}  # _conc_group -> (filed, [entries])
+    for row in picked:
+        parsed = _parse_filing_cached(client, cik, row["acc"])
+        for entry in parsed.get("concentration", []):
+            k = _conc_group(entry)
+            if k not in conc_cells or row["filed"] > conc_cells[k][0]:
+                conc_cells[k] = (row["filed"], [entry])
+            elif row["filed"] == conc_cells[k][0]:
+                conc_cells[k][1].append(entry)
+        for pkey, slot in parsed["periods"].items():
+            s, e = pkey.split("|")
+            if slot.get("total") is not None:
+                if (s, e) not in totals or row["filed"] > totals[(s, e)][0]:
+                    totals[(s, e)] = (row["filed"], slot["total"])
+            for axis_key, members in slot.get("axes", {}).items():
+                versions.setdefault((axis_key, s, e), []).append(
+                    (row["filed"], members))
+    return versions, totals, conc_cells
 
-        conc_cells: dict = {}  # group -> (filed, [entries])
-        for row in picked:
-            parsed = _parse_filing_cached(client, cik, row["acc"])
-            for entry in parsed.get("concentration", []):
-                k = conc_group(entry)
-                if k not in conc_cells or row["filed"] > conc_cells[k][0]:
-                    conc_cells[k] = (row["filed"], [entry])
-                elif row["filed"] == conc_cells[k][0]:
-                    conc_cells[k][1].append(entry)
-            for pkey, slot in parsed["periods"].items():
-                s, e = pkey.split("|")
-                if slot.get("total") is not None:
-                    if (s, e) not in totals or row["filed"] > totals[(s, e)][0]:
-                        totals[(s, e)] = (row["filed"], slot["total"])
-                for axis_key, members in slot.get("axes", {}).items():
-                    versions.setdefault((axis_key, s, e), []).append(
-                        (row["filed"], members))
 
-        # 跨申报改名成员缝合：MSFT 把 SearchAndNewsAdvertising 改名
-        # SearchAdvertising 并按新名重标比较期——同一期的新旧两版里，
-        # 值完全相等且双向唯一的成员对视为改名，旧名统一映射到新名
-        aliases: dict = {}
-        for (axis_key, s, e), vers in versions.items():
-            if len(vers) < 2:
-                continue
-            vers.sort(key=lambda t: t[0])  # 只按 filed 排序（dict 不可比较）
-            newest = vers[-1][1]
-            for _, old in vers[:-1]:
-                for om, ov in old.items():
-                    if om in newest or abs(ov) < 1e6:
-                        # 近零值谁都能对上（LLY 曾把 FY22 的 COVID 抗体 0 值
-                        # 错配成 Zepbound），$1M 以下不参与改名判定
-                        continue
-                    hits = [nm for nm, nv in newest.items()
-                            if nm not in old and abs(nv - ov) <= max(abs(ov) * 1e-6, 1)]
-                    if len(hits) == 1:
-                        aliases.setdefault(axis_key, {})[om] = hits[0]
+def _detect_aliases(versions: dict) -> dict:
+    """跨申报改名成员缝合：MSFT 把 SearchAndNewsAdvertising 改名
+    SearchAdvertising 并按新名重标比较期——同一期的新旧两版里，
+    值完全相等且双向唯一的成员对视为改名，旧名统一映射到新名。"""
+    aliases: dict = {}
+    for (axis_key, _s, _e), vers in versions.items():
+        if len(vers) < 2:
+            continue
+        vers.sort(key=lambda t: t[0])  # 只按 filed 排序（dict 不可比较）
+        newest = vers[-1][1]
+        for _, old in vers[:-1]:
+            for om, ov in old.items():
+                if om in newest or abs(ov) < 1e6:
+                    # 近零值谁都能对上（LLY 曾把 FY22 的 COVID 抗体 0 值
+                    # 错配成 Zepbound），$1M 以下不参与改名判定
+                    continue
+                hits = [nm for nm, nv in newest.items()
+                        if nm not in old and abs(nv - ov) <= max(abs(ov) * 1e-6, 1)]
+                if len(hits) == 1:
+                    aliases.setdefault(axis_key, {})[om] = hits[0]
+    return aliases
 
-        def rename(axis_key: str, members: dict) -> dict:
-            amap = aliases.get(axis_key)
-            if not amap:
-                return members
-            out = {}
-            for m, v in members.items():
-                seen = {m}
-                while m in amap and amap[m] not in seen:
-                    m = amap[m]
-                    seen.add(m)
-                out.setdefault(m, v)
-            return out
 
-        # 整期按 filed 最新的申报取：分部重述（recast）时不混用新旧口径
-        cells: dict = {}
-        for (axis_key, s, e), vers in versions.items():
-            filed, members = max(vers, key=lambda t: t[0])
-            cells[(axis_key, s, e)] = (filed, rename(axis_key, members))
+def _pick_cells(versions: dict, aliases: dict) -> dict:
+    """整期按 filed 最新的申报取（分部重述时不混用新旧口径），
+    成员名过一遍改名映射（防环）。"""
+    def rename(axis_key: str, members: dict) -> dict:
+        amap = aliases.get(axis_key)
+        if not amap:
+            return members
+        out = {}
+        for m, v in members.items():
+            seen = {m}
+            while m in amap and amap[m] not in seen:
+                m = amap[m]
+                seen.add(m)
+            out.setdefault(m, v)
+        return out
 
-    def span(s: str, e: str) -> int:
-        return (date.fromisoformat(e) - date.fromisoformat(s)).days
+    cells: dict = {}
+    for (axis_key, s, e), vers in versions.items():
+        filed, members = max(vers, key=lambda t: t[0])
+        cells[(axis_key, s, e)] = (filed, rename(axis_key, members))
+    return cells
 
+
+def _build_axes(cells: dict, totals: dict) -> dict:
     axes: dict = {}
     for (axis_key, s, e), (_, members) in cells.items():
         total = totals.get((s, e), (None, None))[1]
         members, reconciled = _drop_rollups(dict(members), total)
-        kind = "quarterly" if span(s, e) <= 100 else "annual"
+        days = (date.fromisoformat(e) - date.fromisoformat(s)).days
+        kind = "quarterly" if days <= 100 else "annual"
         axes.setdefault(axis_key, {"annual": {}, "quarterly": {}})[kind][e] = {
             "members": members, "total": total,
             "reconciled": reconciled, "derived": False,
         }
+    return axes
 
-    # Q4 推导：年度 - 同财年前三季（成员必须三季齐全才推）。
-    # 推导后按成员和 vs 推导总额重新对账：重述会让新旧口径相减出坏数
-    # （NVDA 地区轴曾差 14-26%），超容差整期丢弃，宁缺勿错
-    for axis_key, data in axes.items():
+
+def _derive_q4(axes: dict) -> None:
+    """Q4 推导：年度 - 同财年前三季（成员必须三季齐全才推）。
+    推导后按成员和 vs 推导总额重新对账：重述会让新旧口径相减出坏数
+    （NVDA 地区轴曾差 14-26%），超容差整期丢弃，宁缺勿错。"""
+    for data in axes.values():
         for a_end, a_cell in data["annual"].items():
             if a_end in data["quarterly"]:
                 continue
@@ -500,22 +488,72 @@ def build_segments(ticker: str, email: str, cik: int | None = None,
                 "members": q4, "total": total,
                 "reconciled": reconciled, "derived": True,
             }
-
     for data in axes.values():
         data["annual"] = dict(sorted(data["annual"].items()))
         data["quarterly"] = dict(sorted(data["quarterly"].items()))
-    # 同一份申报内 inline-XBRL 可能重复吐同一事实，按维度+期间去重
+
+
+def _dedupe_concentration(conc_cells: dict) -> list:
+    """同一份申报内 inline-XBRL 可能重复吐同一事实，按维度+期间去重。"""
     seen: set = set()
-    concentration = []
+    out = []
     for _, (_filed, entries) in sorted(conc_cells.items()):
         for e in entries:
             k = (tuple(sorted(e["dims"].items())), e["start"], e["end"])
             if k not in seen:
                 seen.add(k)
-                concentration.append(e)
-    concentration.sort(key=lambda e: (e["end"], -e["value"]))
+                out.append(e)
+    out.sort(key=lambda e: (e["end"], -e["value"]))
+    return out
+
+
+def _sweep_stale_cache() -> None:
+    """PARSE_VER 升级后旧版本缓存全部变孤儿（曾积到六成死重），连同
+    进程被杀残留的 .tmp 一起清掉；容忍并发（missing_ok）。"""
+    if not CACHE_DIR.exists():
+        return
+    keep = f"_v{PARSE_VER}.json"
+    for f in CACHE_DIR.iterdir():
+        if f.name.endswith(".tmp") or (f.name.endswith(".json")
+                                       and not f.name.endswith(keep)):
+            f.unlink(missing_ok=True)
+
+
+def build_segments(ticker: str, email: str, cik: int | None = None,
+                   years: int = 3) -> dict:
+    """返回 {ticker, cik, axes: {product|segment|geo: {"annual": {end: {...}},
+    "quarterly": {end: {"members", "total", "reconciled", "derived"}}}},
+    concentration: [...]}"""
+    ticker = ticker.upper()
+    with httpx.Client(headers=_headers(email), timeout=90,
+                      follow_redirects=True) as client:
+        if cik is None:
+            m = _get(client, "https://www.sec.gov/files/company_tickers.json").json()
+            cik = next((int(v["cik_str"]) for v in m.values()
+                        if v["ticker"].upper() == ticker), None)
+            if cik is None:
+                raise SegmentsError(f"SEC EDGAR 中未找到 {ticker}")
+
+        rows = _list_filings(
+            client, cik,
+            (date.today() - timedelta(days=int(years * 366) + 400)).isoformat())
+        if not rows:
+            raise SegmentsError(f"{ticker} 没有 10-K/10-Q 申报（外国发行人暂不支持分部图）")
+        latest = max(r["report"] for r in rows)
+        cutoff = (date.fromisoformat(latest)
+                  - timedelta(days=int(years * 366) + 30)).isoformat()
+        picked = sorted((r for r in rows if r["report"] >= cutoff),
+                        key=lambda r: r["report"], reverse=True)[:MAX_FILINGS]
+
+        _sweep_stale_cache()
+        versions, totals, conc_cells = _collect_versions(client, cik, picked)
+
+    aliases = _detect_aliases(versions)
+    cells = _pick_cells(versions, aliases)
+    axes = _build_axes(cells, totals)
+    _derive_q4(axes)
     return {"ticker": ticker, "cik": cik, "axes": axes,
-            "concentration": concentration}
+            "concentration": _dedupe_concentration(conc_cells)}
 
 
 def main() -> None:

@@ -14,110 +14,125 @@ from datetime import date, timedelta
 
 import httpx
 
-TAGS = {
-    # 后两个覆盖公用事业等换标签的公司，否则窗口会锚定在十年前的陈旧序列上；
-    # 银行的 RevenuesNetOfInterestExpense 走下面的 OVERRIDE_TAGS（必须压过
-    # ASC 606 附注子集，不能平级合并）
-    "revenue": ["RevenueFromContractWithCustomerExcludingAssessedTax", "Revenues",
-                "SalesRevenueNet", "RevenueFromContractWithCustomerIncludingAssessedTax",
-                "RegulatedAndUnregulatedOperatingRevenue"],
-    "cogs": ["CostOfGoodsAndServicesSold", "CostOfRevenue", "CostOfGoodsSold"],
-    "gross_profit": ["GrossProfit"],
-    "rnd": ["ResearchAndDevelopmentExpense"],
-    # SG&A：有的公司合并披露，有的拆成 销售营销 + 管理 两条，三者不能混进同一候选列表
-    "sga": ["SellingGeneralAndAdministrativeExpense"],
-    "sm": ["SellingAndMarketingExpense"],
-    "ga": ["GeneralAndAdministrativeExpense"],
-    "opex": ["OperatingExpenses"],
-    "op_income": ["OperatingIncomeLoss"],
-    "pretax_income": [
+# 科目注册表：每个科目一行内聚声明——tags=候选标签（合并时同期取 filed
+# 最新）、i=资产负债表时点、y=现金流累计口径（季度靠 YTD 差分）、
+# fill=只补缺不覆盖的回退、override=报表主线口径覆盖。
+# 曾经的五个平行注册表（TAGS/INSTANT/FILL/OVERRIDE/YTD_FLOW）会漏改：
+# 新时点科目忘加 INSTANT 不报错、只静默产出空序列
+def _item(tags, i=False, y=False, fill=(), override=()):
+    return {"tags": list(tags), "instant": i, "ytd_flow": y,
+            "fill": list(fill), "override": list(override)}
+
+
+SPEC = {
+    # 后两个覆盖公用事业等换标签的公司，否则窗口会锚定在十年前的陈旧
+    # 序列上；银行的 RevenuesNetOfInterestExpense 走 override（必须压过
+    # ASC 606 附注子集，不能平级合并——SOFI 曾少报 8 倍）
+    "revenue": _item(["RevenueFromContractWithCustomerExcludingAssessedTax",
+                      "Revenues", "SalesRevenueNet",
+                      "RevenueFromContractWithCustomerIncludingAssessedTax",
+                      "RegulatedAndUnregulatedOperatingRevenue"],
+                     override=["RevenuesNetOfInterestExpense"]),
+    "cogs": _item(["CostOfGoodsAndServicesSold", "CostOfRevenue",
+                   "CostOfGoodsSold"]),
+    "gross_profit": _item(["GrossProfit"]),
+    "rnd": _item(["ResearchAndDevelopmentExpense"]),
+    # SG&A：有的公司合并披露，有的拆成 销售营销+管理 两条，不能混进同一候选列表
+    "sga": _item(["SellingGeneralAndAdministrativeExpense"]),
+    "sm": _item(["SellingAndMarketingExpense"]),
+    "ga": _item(["GeneralAndAdministrativeExpense"]),
+    "opex": _item(["OperatingExpenses"]),
+    "op_income": _item(["OperatingIncomeLoss"]),
+    "pretax_income": _item([
         "IncomeLossFromContinuingOperationsBeforeIncomeTaxesExtraordinaryItemsNoncontrollingInterest",
-        "IncomeLossFromContinuingOperationsBeforeIncomeTaxesMinorityInterestAndIncomeLossFromEquityMethodInvestments"],
-    "income_tax": ["IncomeTaxExpenseBenefit"],
+        "IncomeLossFromContinuingOperationsBeforeIncomeTaxesMinorityInterestAndIncomeLossFromEquityMethodInvestments"]),
+    "income_tax": _item(["IncomeTaxExpenseBenefit"]),
     # 银行格式没有 OperatingExpenses，非利息支出是对应的费用合计（图表端回退用）
-    "noninterest_expense": ["NoninterestExpense"],
-    # ---- 营业外/一次性项目组件（图表端拆解与标色用，全部为新增 key）----
+    "noninterest_expense": _item(["NoninterestExpense"]),
+    # ---- 营业外/一次性项目组件（图表端拆解与标色用）----
     # 股权投资公允价值变动：GOOG 持 SpaceX/Anthropic 类股权的浮盈浮亏，
-    # Q2'26 单季 +99B，把净利润污染到 94% 净利率——必须单独拆出来标示
-    "equity_inv_gain": ["EquitySecuritiesFvNiGainLoss", "GainLossOnInvestments"],
-    "interest_income": ["InvestmentIncomeInterest"],
-    "interest_expense_nonop": ["InterestExpense", "InterestExpenseNonoperating"],
-    "fx_gain": ["ForeignCurrencyTransactionGainLossBeforeTax"],
-    "other_nonop": ["OtherNonoperatingIncomeExpense"],
-    "restructuring": ["RestructuringCharges"],
-    "impairment": ["GoodwillImpairmentLoss", "AssetImpairmentCharges",
-                   "ImpairmentOfIntangibleAssetsExcludingGoodwill"],
-    "litigation": ["LitigationSettlementExpense", "LossContingencyLossInPeriod"],
-    "disposal_gain": ["GainLossOnDispositionOfBusiness"],
-    "net_income": ["NetIncomeLoss"],
-    "eps_diluted": ["EarningsPerShareDiluted"],
-    "cfo": ["NetCashProvidedByUsedInOperatingActivities"],
-    "capex": ["PaymentsToAcquirePropertyPlantAndEquipment",
-              "PaymentsToAcquirePropertyPlantAndEquipmentAndIntangibleAssets",
-              "PaymentsToAcquireProductiveAssets"],
+    # Q2'26 单季 +99B 把净利率推到 94%——必须单独拆出来标示
+    "equity_inv_gain": _item(["EquitySecuritiesFvNiGainLoss",
+                              "GainLossOnInvestments"]),
+    "interest_income": _item(["InvestmentIncomeInterest"]),
+    "interest_expense_nonop": _item(["InterestExpense",
+                                     "InterestExpenseNonoperating"]),
+    "fx_gain": _item(["ForeignCurrencyTransactionGainLossBeforeTax"]),
+    "other_nonop": _item(["OtherNonoperatingIncomeExpense"]),
+    "restructuring": _item(["RestructuringCharges"]),
+    "impairment": _item(["GoodwillImpairmentLoss", "AssetImpairmentCharges",
+                         "ImpairmentOfIntangibleAssetsExcludingGoodwill"]),
+    "litigation": _item(["LitigationSettlementExpense",
+                         "LossContingencyLossInPeriod"]),
+    "disposal_gain": _item(["GainLossOnDispositionOfBusiness"]),
+    # AVGO 2019 年起季度净利润只标 ProfitLoss（含少数股东权益），
+    # fill=只补缺不覆盖：主标签已有的期一律不动（估值管道基线稳定）
+    "net_income": _item(["NetIncomeLoss"],
+                        fill=["ProfitLoss",
+                              "NetIncomeLossAvailableToCommonStockholdersBasic"]),
+    "eps_diluted": _item(["EarningsPerShareDiluted"]),
+    "cfo": _item(["NetCashProvidedByUsedInOperatingActivities"], y=True),
+    "capex": _item(["PaymentsToAcquirePropertyPlantAndEquipment",
+                    "PaymentsToAcquirePropertyPlantAndEquipmentAndIntangibleAssets",
+                    "PaymentsToAcquireProductiveAssets"], y=True),
     # 股东回报与股权激励（图表端；现金流量表科目，10-Q 为累计口径）
-    "buyback": ["PaymentsForRepurchaseOfCommonStock"],
-    "dividends": ["PaymentsOfDividends", "PaymentsOfDividendsCommonStock"],
-    "sbc": ["ShareBasedCompensation"],
-    "cash": ["CashAndCashEquivalentsAtCarryingValue"],
-    "st_securities": ["MarketableSecuritiesCurrent", "ShortTermInvestments",
-                      "AvailableForSaleSecuritiesDebtSecuritiesCurrent"],
+    "buyback": _item(["PaymentsForRepurchaseOfCommonStock"], y=True),
+    "dividends": _item(["PaymentsOfDividends", "PaymentsOfDividendsCommonStock"],
+                       y=True),
+    "sbc": _item(["ShareBasedCompensation"], y=True),
+    "cash": _item(["CashAndCashEquivalentsAtCarryingValue"], i=True),
+    "st_securities": _item(["MarketableSecuritiesCurrent", "ShortTermInvestments",
+                            "AvailableForSaleSecuritiesDebtSecuritiesCurrent"],
+                           i=True),
     # 长期有价证券：AAPL 这类公司大头在这里，漏掉会把净现金算成净负债
-    "lt_securities": ["MarketableSecuritiesNoncurrent",
-                      "AvailableForSaleSecuritiesDebtSecuritiesNoncurrent",
-                      "LongTermInvestments"],
-    "lt_debt": ["LongTermDebtNoncurrent", "LongTermDebt"],
+    "lt_securities": _item(["MarketableSecuritiesNoncurrent",
+                            "AvailableForSaleSecuritiesDebtSecuritiesNoncurrent",
+                            "LongTermInvestments"], i=True),
+    "lt_debt": _item(["LongTermDebtNoncurrent", "LongTermDebt"], i=True),
     # 短期债务两个口径分开给（相互不可加总合并），判断层参考后以 10-Q 原文为准
-    "current_debt": ["DebtCurrent", "LongTermDebtCurrent"],
-    "commercial_paper": ["CommercialPaper"],
-    # ---- 以下为图表端专用口径。基线 key（上面的）一律不改动：
-    # 它们喂给估值判断层，候选列表变了会静默改变已有输出 ----
+    "current_debt": _item(["DebtCurrent", "LongTermDebtCurrent"], i=True),
+    "commercial_paper": _item(["CommercialPaper"], i=True),
+    # ---- 以下为图表端专用口径。基线 key（上面的）候选列表一律不改动：
+    # 它们喂给估值判断层，变了会静默改变已有输出 ----
     # NVDA 2026 起改用 DebtSecurities* 标签；单独给出、由图表端按期回填
-    "debt_securities_st": ["DebtSecuritiesCurrent"],
-    "debt_securities_lt": ["DebtSecuritiesNoncurrent"],
+    "debt_securities_st": _item(["DebtSecuritiesCurrent"], i=True),
+    "debt_securities_lt": _item(["DebtSecuritiesNoncurrent"], i=True),
     # 债务四个不可混加的口径分开给，总债务的组合规则在图表端：
     # LongTermDebt(总口径) 含当期到期部分，不能与 DebtCurrent 直接相加；
     # KO 2024 起只标 LongTermDebtAndCapitalLeaseObligations
-    "lt_debt_noncurrent": ["LongTermDebtNoncurrent",
-                           "LongTermDebtAndCapitalLeaseObligations"],
-    "lt_debt_total": ["LongTermDebt"],
-    "lt_debt_current": ["LongTermDebtCurrent",
-                        "LongTermDebtAndCapitalLeaseObligationsCurrent"],
-    "debt_current": ["DebtCurrent"],
-    "st_borrowings": ["ShortTermBorrowings", "OtherShortTermBorrowings"],
+    "lt_debt_noncurrent": _item(["LongTermDebtNoncurrent",
+                                 "LongTermDebtAndCapitalLeaseObligations"], i=True),
+    "lt_debt_total": _item(["LongTermDebt"], i=True),
+    "lt_debt_current": _item(["LongTermDebtCurrent",
+                              "LongTermDebtAndCapitalLeaseObligationsCurrent"],
+                             i=True),
+    "debt_current": _item(["DebtCurrent"], i=True),
+    "st_borrowings": _item(["ShortTermBorrowings", "OtherShortTermBorrowings"],
+                           i=True),
     # NVDA 2026 起把「有价证券」拆成 债券+股票 两行，只跟债券腿会把
     # 投资组合画成缩水（实际 +18B）
-    "equity_securities_st": ["EquitySecuritiesFvNi"],
+    "equity_securities_st": _item(["EquitySecuritiesFvNi"], i=True),
     # SOFI 这类无分类资产负债表的银行把投资证券整行标成 OtherInvestments；
     # 该标签太泛，只在所有分类证券标签全空时才启用（服务端把关）
-    "securities_unclassified": ["OtherInvestments"],
+    "securities_unclassified": _item(["OtherInvestments"], i=True),
     # 保险公司的债券组合常只标 AFS 总口径（MET ~$316B），图表端按覆盖度选源
-    "afs_securities_total": ["AvailableForSaleSecuritiesDebtSecurities"],
-    # SOFI 2023 起资产负债表 Debt 行只标长短期合并口径
-    "debt_combined": ["DebtLongtermAndShorttermCombinedAmount",
-                      "LongTermDebtAndCapitalLeaseObligationsIncludingCurrentMaturities",
-                      "DebtAndCapitalLeaseObligations", "NotesPayable"],
-    "shares_diluted": ["WeightedAverageNumberOfDilutedSharesOutstanding"],
+    "afs_securities_total": _item(["AvailableForSaleSecuritiesDebtSecurities"],
+                                  i=True),
+    # SOFI 2023 起资产负债表 Debt 行只标长短期合并口径；后三个覆盖
+    # REIT/保险的无分类资产负债表（O $25B、MET $14.5B 曾整列 null）
+    "debt_combined": _item(["DebtLongtermAndShorttermCombinedAmount",
+                            "LongTermDebtAndCapitalLeaseObligationsIncludingCurrentMaturities",
+                            "DebtAndCapitalLeaseObligations", "NotesPayable"],
+                           i=True),
+    "shares_diluted": _item(["WeightedAverageNumberOfDilutedSharesOutstanding"]),
 }
-INSTANT = {"cash", "st_securities", "lt_securities", "lt_debt", "current_debt",
-           "commercial_paper", "debt_securities_st", "debt_securities_lt",
-           "lt_debt_noncurrent", "lt_debt_total", "lt_debt_current",
-           "debt_current", "st_borrowings", "equity_securities_st",
-           "securities_unclassified", "debt_combined", "afs_securities_total"}
-# 只补缺不覆盖的回退标签：主标签已有的期一律不动（估值管道基线稳定），
-# 只填缺失期。AVGO 2019 年起季度净利润只标 ProfitLoss（含少数股东权益）
-FILL_TAGS = {
-    "net_income": ["ProfitLoss", "NetIncomeLossAvailableToCommonStockholdersBasic"],
-}
-# 报表主线口径覆盖：该标签出现的期直接替换合并结果。银行同一份申报里
-# RevenuesNetOfInterestExpense 是损益表第一行「Total net revenue」，而
-# RevenueFromContractWithCustomer 只是 ASC 606 附注的合同收入子集——
-# 平级合并会让 SOFI 的营收少报 8 倍。非银行公司不标该口径，零影响
-OVERRIDE_TAGS = {
-    "revenue": ["RevenuesNetOfInterestExpense"],
-}
-# 现金流表科目：10-Q 只披露财年累计数，离散季度序列要靠 YTD 差分
-YTD_FLOW = {"cfo", "capex", "buyback", "dividends", "sbc"}
+
+# 兼容视图：估值管道、图表服务与测试引用的旧接口，全部由 SPEC 推导
+TAGS = {k: v["tags"] for k, v in SPEC.items()}
+INSTANT = {k for k, v in SPEC.items() if v["instant"]}
+FILL_TAGS = {k: v["fill"] for k, v in SPEC.items() if v["fill"]}
+OVERRIDE_TAGS = {k: v["override"] for k, v in SPEC.items() if v["override"]}
+YTD_FLOW = {k for k, v in SPEC.items() if v["ytd_flow"]}
 
 
 class FactsError(ValueError):

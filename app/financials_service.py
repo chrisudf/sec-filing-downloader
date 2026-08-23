@@ -19,6 +19,8 @@ import httpx
 from fastapi import APIRouter, Query
 
 from . import edgar
+from .common import (FREQ_PATTERN, YEARS_MAX, YEARS_MIN, get_or_fetch,
+                     period_label, validate_ticker)
 
 ROOT = Path(__file__).resolve().parent.parent
 if str(ROOT) not in sys.path:
@@ -29,22 +31,11 @@ router = APIRouter()
 
 FACTS_TTL = 6 * 3600   # companyfacts 一天最多更新几次，6 小时内直接用缓存
 CACHE_MAX = 256        # 防爬全量代码把内存吃满
-_facts_cache: dict[str, tuple[float, dict, dict]] = {}
+_facts_cache: dict[str, tuple[float, tuple[dict, dict]]] = {}
 _fetch_locks: dict[str, asyncio.Lock] = {}  # 按 ticker 加锁：防同票惊群，不同票并行
 
-MONTHS = ("Jan", "Feb", "Mar", "Apr", "May", "Jun",
-          "Jul", "Aug", "Sep", "Oct", "Nov", "Dec")
-
-
 async def _facts_and_info(ticker: str, email: str) -> tuple[dict, dict]:
-    hit = _facts_cache.get(ticker)
-    if hit and time.time() - hit[0] < FACTS_TTL:
-        return hit[1], hit[2]
-    lock = _fetch_locks.setdefault(ticker, asyncio.Lock())
-    async with lock:
-        hit = _facts_cache.get(ticker)
-        if hit and time.time() - hit[0] < FACTS_TTL:
-            return hit[1], hit[2]
+    async def fetch():
         # 先查公司信息：走 edgar 的 24h 缓存代码表拿 CIK，避免 build_facts
         # 再下载一遍 700KB 的 company_tickers.json
         info = await edgar.company_info(ticker, email)
@@ -54,18 +45,10 @@ async def _facts_and_info(ticker: str, email: str) -> tuple[dict, dict]:
             raise edgar.EdgarError(502 if e.transient else 404, str(e))
         except (httpx.HTTPError, json.JSONDecodeError, KeyError) as e:
             raise edgar.EdgarError(502, f"SEC 数据请求失败：{type(e).__name__}，请稍后重试")
-        now = time.time()
-        for k in [k for k, (ts, *_) in _facts_cache.items() if now - ts > FACTS_TTL]:
-            del _facts_cache[k]
-        if len(_facts_cache) >= CACHE_MAX:
-            del _facts_cache[min(_facts_cache, key=lambda k: _facts_cache[k][0])]
-        _facts_cache[ticker] = (now, facts, info)
         return facts, info
 
-
-def _label(end: str) -> str:
-    d = date.fromisoformat(end)
-    return f"{MONTHS[d.month - 1]} '{d.year % 100:02d}"
+    return await get_or_fetch(_facts_cache, _fetch_locks, ticker,
+                              FACTS_TTL, CACHE_MAX, fetch)
 
 
 def _nearest_instant(inst: dict, ends: list[str], window: int = 10) -> list:
@@ -236,7 +219,7 @@ def _reshape(facts: dict, info: dict, freq: str, years: int) -> dict:
         "fiscalYearEnd": info.get("fiscalYearEnd") or "",
         "freq": freq,
         "years": years,
-        "periods": [{"end": e, "label": _label(e)} for e in ends],
+        "periods": [{"end": e, "label": period_label(e)} for e in ends],
         "income": {
             "revenue": revenue,
             "cogs": cogs,
@@ -269,12 +252,10 @@ def _reshape(facts: dict, info: dict, freq: str, years: int) -> dict:
 @router.get("/api/financials/{ticker}")
 async def financials(
     ticker: str,
-    freq: str = Query(default="quarterly", pattern="^(quarterly|annual)$"),
-    years: int = Query(default=3, ge=1, le=10),
+    freq: str = Query(default="quarterly", pattern=FREQ_PATTERN),
+    years: int = Query(default=3, ge=YEARS_MIN, le=YEARS_MAX),
 ):
-    ticker = ticker.strip().upper()
-    if not re.match(r"^[A-Z.\-]{1,10}$", ticker):
-        raise edgar.EdgarError(400, "股票代码格式不对")
+    ticker = validate_ticker(ticker)
     email = edgar.contact_email()
     facts, info = await _facts_and_info(ticker, email)
     return _reshape(facts, info, freq, years)
