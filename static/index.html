@@ -132,6 +132,15 @@
   .status.err { color: var(--err); }
   .status.ok { color: var(--ok); }
   .status.busy { color: var(--muted); }
+  /* 状态区里的行内动作按钮（登录/重试）——不抢主按钮的视觉权重 */
+  .inline-act {
+    display: inline-block; margin: 8px 8px 0 0; padding: 6px 12px;
+    font-size: 12px; font-family: inherit; cursor: pointer;
+    color: var(--text); background: var(--card2);
+    border: 1px solid var(--border); border-radius: 8px;
+  }
+  .inline-act:hover:not(:disabled) { border-color: var(--muted); }
+  .inline-act:disabled { opacity: .5; cursor: default; }
   .foot { color: var(--muted); font-size: 12px; margin-top: 24px; text-align: center; }
   .foot a { color: var(--muted); }
 </style>
@@ -365,7 +374,9 @@ function setStatus(cls, msg) {
 }
 
 // ---- 估值报告 ----
-$("valBtn").addEventListener("click", async () => {
+$("valBtn").addEventListener("click", runValuation);
+
+async function runValuation() {
   const ticker = $("ticker").value.trim().toUpperCase();
   if (!ticker) return setValStatus("err", "请输入股票代码");
 
@@ -382,35 +393,138 @@ $("valBtn").addEventListener("click", async () => {
       throw new Error(body.detail || `提交失败（HTTP ${res.status}）`);
     }
     const { job_id } = await res.json();
+    let pollErrors = 0;
     while (true) {
       await new Promise(r => setTimeout(r, 4000));
-      const st = await (await fetch(`/api/valuation/${job_id}`)).json();
+      let st;
+      try {
+        const stRes = await fetch(`/api/valuation/${job_id}`);
+        if (stRes.status === 404) throw new Error("任务已丢失（服务可能重启过），请重新提交");
+        if (!stRes.ok) throw new Error(`查询状态失败（HTTP ${stRes.status}）`);
+        st = await stRes.json();
+        pollErrors = 0;
+      } catch (e) {
+        // 偶发网络抖动容忍 3 次，任务丢失（404）直接终止。
+        // 抛出值可能不是 Error（个别环境 fetch 的拒绝原因），先归一化再读文本
+        const msg = (e && e.message) || String(e);
+        if (msg.includes("任务已丢失") || ++pollErrors >= 3) throw new Error(msg);
+        continue;
+      }
+      // 登录失效是"点一下就能解决"的状态问题，不该只甩一段红字：给登录按钮
+      if (st.status === "failed" && st.error_kind === "auth") return showAuthPrompt(st.error);
       if (st.status === "failed") throw new Error(st.error || "任务失败");
       if (st.status === "done") {
         const parts = Object.entries(st.summary || {}).map(
           ([k, v]) => `${k} $${v.blend}（${(v.upside * 100).toFixed(0)}%）`);
-        const blob = await (await fetch(`/api/valuation/${job_id}/result`)).blob();
+        // 交易区间与三情景并列：情景=基本面公允价，区间=按历史倍数该在哪交易
+        // lo/hi/mid 三重判空是防御：现状服务端只在五档分位齐时才出 trading_range
+        // （engine.py 闸门），缺档不可达；防的是未来服务端改成逐档可缺时渲染出
+        // "$undefined~$undefined"——宁可整块不出
+        const tr = st.trading_range;
+        // 标清三件事：①价格对应哪 12 个月的盈利（不是"近3年"——那是倍数历史的长度）
+        // ②倍数窗口的真实起止与滞后 ③中位涨幅全部来自倍数回归
+        let trTxt = "";
+        if (tr && tr.lo != null && tr.hi != null && tr.mid != null) {
+          const win = tr.eps_window ? `盈利窗口 ${tr.eps_window}` : "base EPS";
+          trTxt = `；交易区间（${win}；倍数取自${tr.window}已实现 NTM PE`;
+          if (tr.span && tr.span.start) {
+            trTxt += ` ${tr.span.start}~${tr.span.end}`;
+            if (tr.span.lag_days) trTxt += `，止于 ${tr.span.lag_days} 天前`;
+          }
+          trTxt += `）$${tr.lo}~$${tr.hi}，中位 $${tr.mid}`;
+          if (tr.fwd_pe_now != null) {
+            trTxt += `；现价隐含 ${tr.fwd_pe_now}x`;
+            // 带外只给关系：低于 P10 的值会被 _pctile_rank 截断成"第10百分位"，
+            // 直接显示会与"跌出下沿"的说法自相矛盾
+            if (tr.fwd_pe_now_position) trTxt += `（${tr.fwd_pe_now_position}）`;
+            if (tr.target_pe != null) trTxt += ` vs 目标 ${tr.target_pe}x`;
+            if (tr.mult_reversion != null) {
+              // "纯倍数差距"而非"与盈利预测无关"：恒等式只在给定同一 base EPS 时成立，
+              // 改 EPS 会同比例移动中位价
+              trTxt += `，中位涨幅 ${(tr.mult_reversion * 100).toFixed(0)}% 是纯倍数差距（同一 base EPS 下）`;
+            }
+          }
+        }
+        const resultRes = await fetch(`/api/valuation/${job_id}/result`);
+        if (!resultRes.ok) throw new Error(`下载报告失败（HTTP ${resultRes.status}）`);
+        const blob = await resultRes.blob();
         const a = document.createElement("a");
         a.href = URL.createObjectURL(blob);
         a.download = `${ticker}_valuation_bundle.zip`;
         a.click();
         URL.revokeObjectURL(a.href);
-        setValStatus("ok", `完成！综合目标价：${parts.join("， ")}。已下载 zip（报告+财报+假设留档）`);
+        setValStatus("ok", `完成！综合目标价：${parts.join("， ")}${trTxt}。已下载 zip（报告+财报+假设留档）`);
         break;
       }
       setValStatus("busy", st.step_label || st.step);
     }
   } catch (e) {
-    setValStatus("err", e.message);
+    setValStatus("err", (e && e.message) || String(e));
   } finally {
     $("valBtn").disabled = false;
   }
-});
+}
 
+// textContent 而不是 innerHTML：msg 里可能带 CLI stderr 原文，不能当 HTML 解析
 function setValStatus(cls, msg) {
   const el = $("valStatus");
   el.className = "status " + cls;
   el.textContent = msg;
+  return el;
+}
+
+function statusButton(el, label, onClick) {
+  const b = document.createElement("button");
+  b.type = "button";
+  b.className = "inline-act";
+  b.textContent = label;
+  b.addEventListener("click", onClick);
+  el.appendChild(b);
+  return b;
+}
+
+// 判断层登录失效：弹出真终端让用户登录（claude -p 是无头模式，OAuth 登录必须
+// 在交互式终端里走浏览器回填，没法在后台子进程内完成），登录后原地重试。
+function showAuthPrompt(errMsg) {
+  const el = setValStatus("err", "判断层（Claude Code）未登录或登录已失效，需要重新登录。");
+  const detail = document.createElement("div");
+  detail.className = "hint";
+  detail.textContent = errMsg || "";
+  el.appendChild(detail);
+
+  const loginBtn = statusButton(el, "🔑 打开登录窗口", async () => {
+    loginBtn.disabled = true;
+    try {
+      const r = await fetch("/api/valuation/login", { method: "POST" });
+      const body = await r.json().catch(() => ({}));
+      if (!r.ok) throw new Error(body.detail || `HTTP ${r.status}`);
+      detail.textContent = "已弹出终端窗口，在其中完成登录（会自动开浏览器）。登录成功后这里会自动转绿。";
+      pollAuth(detail);
+    } catch (e) {
+      detail.textContent = "无法自动弹窗（" + ((e && e.message) || e)
+        + "）。请手动开一个终端运行： claude /login";
+      loginBtn.disabled = false;
+    }
+  });
+  statusButton(el, "↻ 重试", runValuation);
+}
+
+// 轮询登录状态，转绿后把「重试」提上来——不自动重跑：重跑要几分钟且会占住
+// _running 单任务槽，什么时候开始该由用户点
+async function pollAuth(detail) {
+  for (let i = 0; i < 100; i++) {
+    await new Promise(r => setTimeout(r, 3000));
+    try {
+      const r = await fetch("/api/valuation/auth");
+      if (!r.ok) continue;
+      const st = await r.json();
+      if (st.ok) {
+        detail.textContent = "✅ 登录已恢复（" + st.reason + "），点上面的「↻ 重试」继续。";
+        return;
+      }
+    } catch (e) { /* 轮询期间的抖动忽略，下一轮再试 */ }
+  }
+  detail.textContent = "登录状态仍未恢复。请确认终端里的登录流程已走完，或手动运行 claude /login。";
 }
 
 refreshRange();

@@ -3,7 +3,8 @@
 输入美股股票代码，自动从 **SEC EDGAR 官方数据库** 查找并批量下载财报文件（10-K / 10-Q / 20-F / 6-K），
 按 `代码_表单_报告期` 统一重命名后打包成 zip，作为后续 DCF / PE 估值分析的数据底座。
 
-> 第一阶段目标：**搜索 → 下载 → 重命名**。财务数据提取与估值模型见 [TODO.md](TODO.md)。
+> 第一阶段目标：**搜索 → 下载 → 重命名**。财务数据提取与估值模型见 [TODO.md](TODO.md)，
+> 口径类事故的复盘见 [LESSONS.md](LESSONS.md)。
 
 ## ✨ 功能
 
@@ -61,7 +62,7 @@ flowchart TB
    （增速/利润率/倍数/WACC/FCF路径 + 每条依据与出处）；服务器注入价格/股本等事实并做
    schema 硬校验，不合格自动重试——**LLM 永远不碰算术**
 3. **计算层**（确定性 Python）：引擎算出全部数字 → Excel 里所有结果是引用黄色假设格的活公式 →
-   `formulas` 包独立复算 16 个关键单元格与引擎交叉核对，全部一致才交付
+   `formulas` 包独立复算 16~17 个关键单元格与引擎交叉核对（交易区间块在时多一项），全部一致才交付
 
 ## 📁 目录结构
 
@@ -74,33 +75,64 @@ sec-filing-downloader/
 ├── static/
 │   └── index.html             # 深色主题单页前端（原生 JS，无构建步骤）
 ├── valuation/                 # 估值确定性计算层 + 判断层提示词
-│   ├── fetch_facts.py         # XBRL companyfacts 取数（多标签合并/Q4推导/TTM）
+│   ├── fetch_facts.py         # XBRL companyfacts 取数（多标签合并/Q4推导/TTM/SBC/带子/Ro40）
+│   ├── pe_band.py             # 历史 PE/P.S/P.TBV 分位带（三口径 + 畸变剔除 + 逆向匹配）
 │   ├── extract_sections.py    # 财报关键章节定位（分部/税率/capex/流动性）
 │   ├── judgment_prompt.md     # 判断层提示词（假设 schema + 检查清单）
-│   ├── engine.py              # PE 法 / 十年 FCFF DCF / SOTP / 反向 DCF / 敏感性
+│   ├── engine.py              # PE 法 / 十年 FCFF DCF / SOTP / 反向 DCF / 交易区间 / 敏感性
 │   ├── build_report.py        # 六表 Excel（假设=黄色活格，全表公式联动）
-│   ├── verify_report.py       # formulas 包独立复算，16 项交叉核对
+│   ├── verify_report.py       # formulas 包独立复算，16~17 项交叉核对
+│   ├── compare.py             # 两次运行对比（基本面/假设漂移/结论变动）
+│   ├── vintages.py            # 估值快照归档：按报告期存，同期多次运行=多样本
+│   ├── trend.py               # N 期趋势视图：变化 vs 组内采样噪声的显著性对照
 │   └── README.md              # 流水线用法与 config schema
 ├── jobs/                      # 估值任务工作目录（gitignore）
 ├── reports/                   # 手动生成的报告（gitignore）
 ├── requirements.txt
 ├── README.md
-└── TODO.md                    # 路线图
+├── TODO.md                    # 路线图
+└── LESSONS.md                 # 事故与教训（口径类问题必读）
 ```
 
-## 🚀 快速开始（Windows）
+## 🚀 快速开始
+
+> **依赖全部声明在 `requirements.txt`**（FastAPI/uvicorn/httpx/openpyxl/formulas/yfinance/beautifulsoup4/lxml），
+> 干净 venv 里 `pip install -r requirements.txt` 一次装齐即可。
+> 每个估值步骤都是独立子进程运行，务必**用 venv 的 Python 启动服务器**（子进程继承它的解释器）——
+> 别用系统/pyenv 的 python 起服务，否则子进程找不到这些包。
+
+### macOS / Linux
+
+```bash
+git clone https://github.com/chrisudf/sec-filing-downloader.git
+cd sec-filing-downloader
+python3 -m venv .venv
+.venv/bin/python -m pip install -r requirements.txt
+# SEC 合规：配置联系邮箱（二选一，推荐用文件——持久且已 gitignore）
+echo "you@example.com" > .sec_email          # 项目根目录文件
+export SEC_EMAIL="you@example.com"           # 或环境变量（仅当前终端会话有效）
+.venv/bin/python -m uvicorn app.main:app --port 8756
+# 打开 http://127.0.0.1:8756
+```
+
+### Windows (PowerShell)
 
 ```powershell
 git clone https://github.com/chrisudf/sec-filing-downloader.git
 cd sec-filing-downloader
 python -m venv .venv
-.venv\Scripts\pip install -r requirements.txt
+.venv\Scripts\python -m pip install -r requirements.txt
 # SEC 合规：配置联系邮箱（二选一）
-$env:SEC_EMAIL = "you@example.com"          # 环境变量
-"you@example.com" | Out-File .sec_email     # 或项目根目录文件（已 gitignore）
+"you@example.com" | Out-File -Encoding ascii .sec_email  # 项目根目录文件（已 gitignore，推荐）
+$env:SEC_EMAIL = "you@example.com"                       # 或环境变量（仅当前会话）
 .venv\Scripts\python -m uvicorn app.main:app --port 8756
 # 打开 http://127.0.0.1:8756
 ```
+
+> **一键估值报告**额外依赖判断层 LLM：默认调用本机 **Claude Code CLI**（`claude -p` 无头模式），
+> 需先装好 `claude` 并 `claude /login` 登录；路径可用 `CLAUDE_CLI_PATH` 覆盖，
+> 整个判断层命令可用 `VALUATION_JUDGMENT_CMD` 换成任意"stdin 收 prompt、stdout 出 JSON"的程序。
+> 只用"下载财报"功能则**不需要** claude CLI。
 
 ## 🔌 API
 
@@ -139,12 +171,51 @@ $env:SEC_EMAIL = "you@example.com"          # 环境变量
 ### `POST /api/valuation` → `{job_id}`
 
 `{"ticker": "NVDA"}` 提交估值任务（单并发）。
-判断层默认走本机 Claude Code（`claude -p`，需先 `claude /login`；路径可用 `CLAUDE_CLI_PATH` 覆盖，
-整个判断层命令可用 `VALUATION_JUDGMENT_CMD` 替换成任何"stdin 进 prompt、stdout 出 JSON"的程序）。
+判断层默认走本机 Claude Code（`claude -p --model opus`，需先 `claude /login`；模型可用
+`VALUATION_MODEL` 覆盖——默认 opus 因 sonnet 判断层同输入采样全距实测达 25.7%，
+路径可用 `CLAUDE_CLI_PATH` 覆盖，整个判断层命令可用 `VALUATION_JUDGMENT_CMD` 替换成
+任何"stdin 进 prompt、stdout 出 JSON"的程序）。
+
+假设连续性（v2，2026-07-22 起**默认开启**，仅 standard 模式自动持久化）：每次 gate-clean
+（无诊断红旗）的假设留档自动持久化到 `prev_configs/{ticker}.json`，下次运行注入判断层
+并要求"无新证据不改数、改数必须留痕"。出现新报告期 / 现价变动 >15% / 语义版本不符时
+自动作废重建。`VALUATION_NO_CONTINUITY=1` 关闭；`VALUATION_PREV_CONFIG=<path>` 显式指定基准文件。
 
 ### `GET /api/valuation/{job_id}` / `GET /api/valuation/{job_id}/result`
 
 轮询进度（九个步骤逐步显示）；完成后下载 zip（财报原件 + manifest + 估值 Excel + 假设留档 config.json）。
+
+## 📈 跨期跟踪（CLI）
+
+价值投资的实际用法是"新财报出来 → 基本面变没变 → 更新估值"，两个工具覆盖这一步：
+
+```bash
+# 两期对比：基本面变化 / 假设漂移 / 结论变动
+python valuation/compare.py 旧_valuation.json 新_valuation.json
+
+# N 期趋势：一行一个报告期，看估计值被怎么修正
+python valuation/trend.py MSFT
+python valuation/trend.py MSFT --ingest 历史bundle里的*_valuation.json   # 回填归档
+```
+
+```bash
+# 参考表复刻：财年一致预期 EPS × PE 带 -> 价值交易区间 + 中位价 + EPS 修正轨迹
+python valuation/ref_table.py AMZN you@example.com
+```
+
+`ref_table.py` 复刻「前瞻 EPS × 历史 PE 带」类参考表的公式（区间=PE带×财年EPS，中位价=PE中位×EPS）：
+EPS 用 yfinance 免费一致预期（0y/+1y 财年口径 + 90 天修正轨迹，一次性项目污染 GAAP consensus 时自动预警），
+带子默认 pe_band 分位数、可在 `ref_table_overrides.json` 钉死手拍带（输出自动给逆向匹配：框住历史的百分之几）。
+每次运行快照进 `ref_snapshots/`，攒出参考表「一行一个季度」的修正轨迹。与估值管线的三情景互为对照。
+
+`trend.py` 与普通趋势表的区别在于**把季度间的变化和同一报告期内的采样噪声放在一起看**。
+判断层有运行间噪声（MSFT 实测 base 综合目标价 CV 2.4%，NVDA bear CV≈12%），
+所以 vintage 按**报告期**归档、同期多次运行存为多个样本，相邻期用
+`|Δ|/SE`（`SE=sqrt(sd1²/n1+sd2²/n2)`）判断变化是否可与噪声区分：
+`<1` 噪声内 / `1~2` 弱信号 / `≥2` 显著。这不是统计检验（n=3 时秩检验到不了 p<0.05），
+只是把噪声量级摆到变化旁边做量纲对照——**要有意义，每个报告期至少跑 3 次**。
+
+归档在 `vintages/{TICKER}/{report_end}.json`，服务端每次估值完成后自动写入。
 
 ## ⚠️ SEC 使用注意
 

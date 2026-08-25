@@ -45,6 +45,12 @@ async def _facts_and_info(ticker: str, email: str) -> tuple[dict, dict]:
             raise edgar.EdgarError(502 if e.transient else 404, str(e))
         except (httpx.HTTPError, json.JSONDecodeError, KeyError) as e:
             raise edgar.EdgarError(502, f"SEC 数据请求失败：{type(e).__name__}，请稍后重试")
+        # 估值管道支持 IFRS 外国发行人（20-F），图表端不支持：科目映射能对上，
+        # 但分部/集中度解析、毛利与债务组合规则全按 us-gaap 标签写，画出来是
+        # 缺一半系列的半张图——不如明确报不支持
+        if facts.get("taxonomy") != "us-gaap":
+            raise edgar.EdgarError(
+                404, f"{ticker} 是 IFRS 口径外国发行人（20-F），财务图表暂不支持")
         return facts, info
 
     return await get_or_fetch(_facts_cache, _fetch_locks, ticker,
