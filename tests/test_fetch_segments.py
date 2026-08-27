@@ -193,3 +193,35 @@ def test_fetch_instance_bad_zip_raises():
     client = _FakeClient({"index.json": idx, "a-xbrl.zip": b"not a zip"})
     with pytest.raises(SegmentsError):
         _fetch_instance(client, 1, "0000000000-00-000001")
+
+
+# ---- 单申报结构性失败：降级跳过，瞬态冒泡 ----
+from valuation import fetch_segments as fs
+
+
+def test_collect_versions_skips_structural_failure(monkeypatch):
+    parsed_ok = {"periods": {"2026-01-01|2026-03-31": {
+        "total": 100e6, "axes": {"segment": {"A": 60e6, "B": 40e6}}}},
+        "concentration": []}
+
+    def fake_parse(client, cik, acc):
+        if acc == "bad-acc":
+            raise SegmentsError("申报 bad-acc 里找不到 XBRL instance")
+        return parsed_ok
+
+    monkeypatch.setattr(fs, "_parse_filing_cached", fake_parse)
+    versions, totals, conc, skipped = fs._collect_versions(
+        None, 1, [{"acc": "bad-acc", "filed": "2026-08-26"},
+                  {"acc": "good-acc", "filed": "2026-05-20"}])
+    assert skipped == [("bad-acc", "申报 bad-acc 里找不到 XBRL instance")]
+    assert ("segment", "2026-01-01", "2026-03-31") in versions
+    assert totals[("2026-01-01", "2026-03-31")][1] == 100e6
+
+
+def test_collect_versions_transient_still_raises(monkeypatch):
+    def fake_parse(client, cik, acc):
+        raise SegmentsError("SEC 接口返回 429: index.json", transient=True)
+
+    monkeypatch.setattr(fs, "_parse_filing_cached", fake_parse)
+    with pytest.raises(SegmentsError):
+        fs._collect_versions(None, 1, [{"acc": "x", "filed": "2026-01-01"}])

@@ -604,6 +604,7 @@ async function loadSegments(ticker, freq, years) {
   state.segData = null;  // 加载窗口内点占比/金额不许渲染上一只票
   segEmpty("分部数据加载中…（冷启动要逐份解析 10-K/10-Q，约 10-60 秒）");
   concReset("集中度数据加载中…");  // 别让上一只股票的风险横幅挂在加载窗口里
+  $("segWarn").style.display = "none";
   try {
     const res = await fetch(`/api/segments/${encodeURIComponent(ticker)}?freq=${freq}&years=${years}`);
     if (seq !== state.segSeq) return;
@@ -614,6 +615,11 @@ async function loadSegments(ticker, freq, years) {
     const d = await res.json();
     if (seq !== state.segSeq) return;
     state.segData = d;
+    // 服务端逐份跳过了缺 instance 的申报：如实展示，别让缺柱看起来像没披露
+    if (d.warning) {
+      $("segWarn").textContent = "⚠ " + d.warning;
+      $("segWarn").style.display = "";
+    }
     if (d.axes.length) {
       // 记住用户上次选的轴；没有同名轴再回默认（业务线>经营分部>地区）
       const pick = d.axes.find(x => x.key === state.segAxis) || d.axes[0];

@@ -263,6 +263,13 @@ async def segments(
     if not axes and concentration is None:
         raise edgar.EdgarError(
             404, f"{ticker} 的申报里没有可用的{('季度' if freq == 'quarterly' else '年度')}分部营收数据")
+    # 结构性缺 instance 的申报被逐份跳过（fetch_segments），这里如实上浮：
+    # 沉默截断会让「已覆盖全部申报」成为假象
+    warning = None
+    skipped = data.get("skipped") or []
+    if skipped:
+        warning = (f"{len(skipped)} 份申报缺 XBRL instance 已跳过"
+                   f"（{skipped[0][0]} 等），对应期间可能缺柱")
     return {"ticker": ticker, "name": info.get("name") or "",
             "freq": freq, "years": years, "axes": axes,
-            "concentration": concentration}
+            "concentration": concentration, "warning": warning}

@@ -404,12 +404,23 @@ def _conc_group(entry: dict):
 
 def _collect_versions(client: httpx.Client, cik: int, picked: list[dict]):
     """逐申报收集：每期全部成员版本（比较期会被多份申报覆盖）、
-    无维度总额、集中度分组。"""
+    无维度总额、集中度分组。
+
+    单份申报结构性缺 instance（zip 兜底后仍没有）只跳过该申报并记录，
+    不再击杀整卡——否则其余十几份可解析申报陪葬，卡片只剩一行报错。
+    瞬态失败（限速/维护）必须继续冒泡：吞掉会把空结果焊死进落盘缓存。"""
     versions: dict = {}
     totals: dict = {}
     conc_cells: dict = {}  # _conc_group -> (filed, [entries])
+    skipped: list = []     # [(acc, 原因)]，上浮到 API warning
     for row in picked:
-        parsed = _parse_filing_cached(client, cik, row["acc"])
+        try:
+            parsed = _parse_filing_cached(client, cik, row["acc"])
+        except SegmentsError as e:
+            if e.transient:
+                raise
+            skipped.append((row["acc"], str(e)))
+            continue
         for entry in parsed.get("concentration", []):
             k = _conc_group(entry)
             if k not in conc_cells or row["filed"] > conc_cells[k][0]:
@@ -424,7 +435,7 @@ def _collect_versions(client: httpx.Client, cik: int, picked: list[dict]):
             for axis_key, members in slot.get("axes", {}).items():
                 versions.setdefault((axis_key, s, e), []).append(
                     (row["filed"], members))
-    return versions, totals, conc_cells
+    return versions, totals, conc_cells, skipped
 
 
 def _detect_aliases(versions: dict) -> dict:
@@ -586,14 +597,16 @@ def build_segments(ticker: str, email: str, cik: int | None = None,
                         key=lambda r: r["report"], reverse=True)[:MAX_FILINGS]
 
         _sweep_stale_cache()
-        versions, totals, conc_cells = _collect_versions(client, cik, picked)
+        versions, totals, conc_cells, skipped = _collect_versions(
+            client, cik, picked)
 
     aliases = _detect_aliases(versions)
     cells = _pick_cells(versions, aliases)
     axes = _build_axes(cells, totals)
     _derive_q4(axes)
     return {"ticker": ticker, "cik": cik, "axes": axes,
-            "concentration": _dedupe_concentration(conc_cells)}
+            "concentration": _dedupe_concentration(conc_cells),
+            "skipped": skipped}
 
 
 def main() -> None:
