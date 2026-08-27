@@ -419,8 +419,23 @@ function renderWaterfall(d, i) {
   if (items) {
     for (const it of items) {
       if (it.name !== "营业外损益") continue;
-      it.components = nonoffComp;
-      it.unexplained = it.val - nonoffComp.reduce((s, x) => s + x.val, 0);
+      let comps = nonoffComp;
+      // equity_inv_gain（附注级 tag）与 other_nonop（利润表「Other, net」行）
+      // 可能是同一笔钱的两次标注：NVDA Q1 FY27 两者同为 ~$15.9B，直接并列
+      // 会把同一笔拆成三行互相打架（+15.9 / +15.9 / 余项 −15.9）。判据取
+      // 数据自身：余项恰好抵消 equity ⇒ other_nonop 含 equity，剔除后重算；
+      // 股权收益单列成行的申报（余项≈0，NVDA Q2 FY27）不受影响。
+      const other = comps.find(x => x.key === "other_nonop");
+      const gap = it.val - comps.reduce((s, x) => s + x.val, 0);
+      if (eqv && other &&
+          Math.abs(gap + eqv.val) <= Math.max(Math.abs(it.val) * 0.02, 2e6)) {
+        comps = comps
+          .map(x => x.key !== "other_nonop" ? x
+            : { ...x, label: "其他营业外（剔股权投资）", val: x.val - eqv.val })
+          .filter(x => x.key !== "other_nonop" || Math.abs(x.val) >= 1e6);
+      }
+      it.components = comps;
+      it.unexplained = it.val - comps.reduce((s, x) => s + x.val, 0);
       it.investmentDriven = !!(eqv && Math.abs(eqv.val) > Math.abs(it.val) * 0.5);
     }
   }
