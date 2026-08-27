@@ -499,7 +499,14 @@ def build_facts(ticker: str, email: str, cik: int | None = None) -> dict:
     fx = 1.0
     if currency != "USD":
         import yfinance as yf
-        fx = float(yf.Ticker(f"{currency}USD=X").fast_info["lastPrice"])
+        try:
+            fx = float(yf.Ticker(f"{currency}USD=X").fast_info["lastPrice"])
+        except Exception as e:  # noqa: BLE001 —— Yahoo 抛什么都算取汇率失败
+            # 非美元申报发行人的整份序列都按这个汇率折算，取不到就没有可用输出。
+            # 归一成 FactsError(transient) 而不是让 TypeError/网络异常裸奔：
+            # CLI 得到可读报错，服务端由既有的 transient 分支映射 502 而非 500
+            raise FactsError(f"{currency}/USD 现汇取不到"
+                             f"（{type(e).__name__}: {e}）——请稍后重试", transient=True)
         print(f"{ticker} 申报货币 {currency}，按现汇 {fx:.5f} 折算美元"
               "（历史序列为恒定汇率口径）", file=sys.stderr)
     units = (currency, f"{currency}/shares", "shares")
@@ -649,7 +656,8 @@ def main() -> None:
     if os.environ.get("VALUATION_NO_PE_BAND") != "1":
         _add_bands(out, ticker, email)
 
-    json.dump(out, open(out_path, "w", encoding="utf-8"), ensure_ascii=False, indent=1)
+    with open(out_path, "w", encoding="utf-8") as f:
+        json.dump(out, f, ensure_ascii=False, indent=1)
     ttm, q = out["ttm"], out["revenue_quarterly"]
     print(f"{ticker} (CIK {out['cik']}): mode={out['mode']} taxonomy={out['taxonomy']} "
           f"currency={out['currency']} 年度 {len(out['revenue_annual'])} 期, "

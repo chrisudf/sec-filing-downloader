@@ -43,7 +43,8 @@ async def _facts_and_info(ticker: str, email: str) -> tuple[dict, dict]:
             facts = await asyncio.to_thread(build_facts, ticker, email, info["cik"])
         except FactsError as e:
             raise edgar.EdgarError(502 if e.transient else 404, str(e))
-        except (httpx.HTTPError, json.JSONDecodeError, KeyError) as e:
+        except (httpx.HTTPError, json.JSONDecodeError, KeyError,
+                TypeError, ValueError) as e:
             raise edgar.EdgarError(502, f"SEC 数据请求失败：{type(e).__name__}，请稍后重试")
         # 估值管道支持 IFRS 外国发行人（20-F），图表端不支持：科目映射能对上，
         # 但分部/集中度解析、毛利与债务组合规则全按 us-gaap 标签写，画出来是

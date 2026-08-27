@@ -573,7 +573,8 @@ def main() -> None:
         out = build_segments(ticker, email, years=years)
     except SegmentsError as e:
         raise SystemExit(str(e))
-    json.dump(out, open(out_path, "w", encoding="utf-8"), ensure_ascii=False, indent=1)
+    with open(out_path, "w", encoding="utf-8") as f:
+        json.dump(out, f, ensure_ascii=False, indent=1)
     for axis_key, data in out["axes"].items():
         q, a = data["quarterly"], data["annual"]
         print(f"{axis_key}: 季度 {len(q)} 期 / 年度 {len(a)} 期")
