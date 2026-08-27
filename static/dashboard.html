@@ -1,0 +1,225 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>财务图表 · EDGAR 财报下载器</title>
+<style>
+  :root {
+    --bg: #0b0c10;
+    --card: #14151c;
+    --card2: #101118;
+    --border: #2a2b36;
+    --text: #e8e8ee;
+    --muted: #8b8c9a;
+    --accent: #7c7ff3;
+    --accent-dim: #23244a;
+    --err: #f37c7c;
+    --ok: #7cf3a8;
+    /* 数据系列：参考调色板 dark 档，已按 #14151c 底色跑过全套校验 */
+    --s1: #3987e5;
+    --s2: #d95926;
+    --s3: #199e70;
+    --s4: #c98500;
+    --s5: #d55181;
+    --s6: #008300;
+    --s7: #9085e9;
+    --s8: #e66767;
+  }
+  * { box-sizing: border-box; margin: 0; padding: 0; }
+  body {
+    background: var(--bg);
+    color: var(--text);
+    font-family: "Segoe UI", "Microsoft YaHei", system-ui, sans-serif;
+    padding-bottom: 48px;
+  }
+  .wrap { max-width: 1200px; margin: 0 auto; padding: 0 16px; }
+  .topbar {
+    position: sticky; top: 0; z-index: 10;
+    background: rgba(11, 12, 16, .92);
+    backdrop-filter: blur(6px);
+    border-bottom: 1px solid var(--border);
+    padding: 14px 0;
+  }
+  .topbar .wrap { display: flex; align-items: center; gap: 12px; flex-wrap: wrap; }
+  .brand { display: flex; align-items: baseline; gap: 10px; margin-right: 8px; }
+  .brand h1 { font-size: 18px; white-space: nowrap; }
+  .brand a { color: var(--muted); font-size: 12px; text-decoration: none; white-space: nowrap; }
+  .brand a:hover { color: var(--accent); }
+  input[type=text], select {
+    background: var(--card2);
+    border: 1px solid var(--border);
+    border-radius: 10px;
+    color: var(--text);
+    font-size: 14px;
+    padding: 9px 12px;
+    outline: none;
+  }
+  input:focus, select:focus { border-color: var(--accent); }
+  #ticker { width: 110px; text-transform: uppercase; }
+  .seg { display: flex; border: 1px solid var(--border); border-radius: 10px; overflow: hidden; }
+  .seg button {
+    background: var(--card2); color: var(--muted); border: none;
+    font-size: 13px; padding: 9px 14px; cursor: pointer;
+  }
+  .seg button.on { background: var(--accent-dim); color: var(--text); font-weight: 700; }
+  button.go {
+    background: var(--accent); color: #fff; border: none; border-radius: 10px;
+    font-size: 14px; font-weight: 700; padding: 9px 22px; cursor: pointer;
+  }
+  button.go:hover { filter: brightness(1.08); }
+  button.go:disabled { opacity: .5; cursor: wait; }
+  .status { font-size: 13px; color: var(--muted); min-width: 120px; }
+  .status.err { color: var(--err); }
+  .status.ok { color: var(--ok); }
+  .coname { color: var(--muted); font-size: 13px; }
+  .coname b { color: var(--text); }
+  .grid { display: grid; grid-template-columns: 1fr; gap: 16px; margin-top: 18px; }
+  .chart-card {
+    background: var(--card);
+    border: 1px solid var(--border);
+    border-radius: 16px;
+    padding: 20px 20px 8px;
+  }
+  .chart-card h2 { font-size: 16px; letter-spacing: .3px; }
+  .chart-card .sub { color: var(--muted); font-size: 12px; margin-top: 4px; }
+  .chart-head { display: flex; align-items: center; justify-content: space-between; gap: 12px; flex-wrap: wrap; }
+  .chart { width: 100%; height: 420px; }
+  .chart.tall { height: 580px; }
+  .empty {
+    display: flex; align-items: center; justify-content: center;
+    height: 300px; color: var(--muted); font-size: 14px;
+  }
+  #welcome { text-align: center; color: var(--muted); padding: 80px 20px; font-size: 14px; line-height: 2; }
+  #welcome .big { font-size: 40px; }
+  .conc-banner { border-radius: 10px; padding: 12px 16px; font-size: 14px; margin: 14px 0 4px; }
+  .conc-banner.high { background: rgba(243, 124, 124, .12); color: var(--err); border: 1px solid rgba(243, 124, 124, .4); }
+  .conc-banner.medium { background: rgba(201, 133, 0, .12); color: #e0a63f; border: 1px solid rgba(201, 133, 0, .4); }
+  .conc-banner.low { background: var(--card2); color: var(--muted); border: 1px solid var(--border); }
+  table.conc { width: 100%; border-collapse: collapse; margin: 12px 0 16px; font-size: 13px; }
+  table.conc th, table.conc td { text-align: left; padding: 9px 12px; border-bottom: 1px solid var(--border); }
+  table.conc th { color: var(--muted); font-weight: 600; font-size: 12px; }
+  table.conc td.pct { font-variant-numeric: tabular-nums; font-weight: 700; }
+  table.conc .tag { display: inline-block; background: var(--card2); border: 1px solid var(--border);
+                    border-radius: 6px; padding: 1px 8px; font-size: 12px; color: var(--muted); }
+  .conc-empty { color: var(--muted); font-size: 13px; padding: 18px 4px 14px; }
+  #concTable { overflow-x: auto; }
+  .tiles { display: grid; grid-template-columns: repeat(auto-fit, minmax(130px, 1fr));
+           gap: 10px; margin: 14px 0 6px; }
+  .tile { background: var(--card2); border: 1px solid var(--border);
+          border-radius: 10px; padding: 10px 12px; }
+  .tile .k { color: var(--muted); font-size: 11px; }
+  .tile .v { font-size: 17px; font-weight: 700; margin-top: 2px;
+             font-variant-numeric: tabular-nums; }
+  .tile .n { color: var(--muted); font-size: 10px; margin-top: 2px; }
+  button.mini { background: var(--card2); border: 1px solid var(--border);
+                border-radius: 8px; color: var(--muted); font-size: 12px;
+                padding: 5px 10px; cursor: pointer; white-space: nowrap; }
+  button.mini:hover { color: var(--text); border-color: var(--accent); }
+  details.fold { margin: 6px 0 14px; }
+  details.fold summary { color: var(--muted); font-size: 13px; cursor: pointer;
+                         padding: 6px 4px; }
+  @media (max-width: 640px) {
+    .chart { height: 320px; }
+    .chart.tall { height: 460px; }
+    .tile .v { font-size: 15px; }
+  }
+</style>
+</head>
+<body>
+<div class="topbar">
+  <div class="wrap">
+    <div class="brand">
+      <h1>📈 财务图表</h1>
+      <a href="/">← 下载器</a>
+    </div>
+    <input type="text" id="ticker" placeholder="AAPL" autocomplete="off" spellcheck="false">
+    <input type="text" id="compare" placeholder="对比: MU" autocomplete="off"
+           spellcheck="false" style="width:90px" title="第二个代码：利润率与增速虚线叠加对比">
+    <div class="seg" id="freqSeg">
+      <button data-v="quarterly" class="on">季度</button>
+      <button data-v="annual">年度</button>
+    </div>
+    <select id="years">
+      <option value="3">3 年</option>
+      <option value="5">5 年</option>
+      <option value="10">10 年</option>
+    </select>
+    <button class="go" id="go">加载</button>
+    <span class="status" id="status"></span>
+    <span class="coname" id="coname"></span>
+  </div>
+</div>
+
+<div class="wrap">
+  <div id="welcome">
+    <div class="big">📊</div>
+    输入股票代码加载财务图表<br>
+    损益摘要与利润率 · 利润瀑布 · 现金与债务 · 现金流与资本开支<br>
+    数据来自 SEC EDGAR XBRL，季度现金流由累计数差分还原
+  </div>
+  <div class="grid" id="charts" style="display:none">
+    <div class="chart-card">
+      <div class="chart-head">
+        <div><h2>损益摘要</h2><div class="sub">上：金额；下：利润率——红虚线=剔除一次性/投资项的净利率（按当期有效税率税后化）；毛利率以总营收为分母（含会员费类非商品收入）。两栏共用同一时间轴。点任一期的柱可直接驱动下方利润瀑布</div></div>
+        <button class="mini" data-csv="income">复制 CSV</button>
+      </div>
+      <div class="tiles" id="ttmTiles" style="display:none"></div>
+      <div class="chart tall" id="cIncome"></div>
+    </div>
+    <div class="chart-card" id="epsCard" style="display:none">
+      <div class="chart-head">
+        <div><h2>每股与股本</h2><div class="sub">上：稀释 EPS；下：加权稀释股本——回购缩股/增发稀释的节奏直读。股本线的财年 Q4 为均值口径、无法由年度倒推，留空断线。两栏共用同一时间轴</div></div>
+      </div>
+      <div class="chart" id="cEps"></div>
+    </div>
+    <div class="chart-card">
+      <div class="chart-head">
+        <div><h2>各细分业务营收</h2><div class="sub">堆叠=各分部，虚线=合并总营收对照；数据逐份解析自 10-K/10-Q 的 XBRL（首次加载约 10-60 秒）</div></div>
+        <div style="display:flex;gap:8px;flex-wrap:wrap">
+          <div class="seg" id="segMode">
+            <button data-m="abs" class="on">金额</button>
+            <button data-m="pct">占比</button>
+          </div>
+          <div class="seg" id="segAxis" style="display:none"></div>
+        </div>
+      </div>
+      <div class="chart" id="cSegments"><div class="empty" id="segStatus">分部数据加载中…</div></div>
+    </div>
+    <div class="chart-card">
+      <div class="chart-head">
+        <div><h2>客户与供应商集中度</h2><div class="sub">来自 10-K/10-Q 的 XBRL 集中度披露；占比含义以「基准」列为准——占应收款 ≠ 占营收。本卡为全部历史披露，不随上方期间设置变化</div></div>
+        <button class="mini" data-csv="conc">复制 CSV</button>
+      </div>
+      <div id="concBanner" class="conc-banner" style="display:none"></div>
+      <div class="chart" id="cConcTrend" style="display:none;height:280px"></div>
+      <div id="concTable"></div>
+    </div>
+    <div class="chart-card">
+      <div class="chart-head">
+        <div><h2>利润瀑布</h2><div class="sub">蓝=小计 / 橙=扣减 / 绿=增加 / <span style="color:var(--s7)">紫=投资损益主导的营业外项</span>（hover 看 XBRL 组件拆解）；「其他」为对账残差项</div></div>
+        <select id="wfPeriod"></select>
+      </div>
+      <div class="chart" id="cWaterfall"></div>
+    </div>
+    <div class="chart-card">
+      <div class="chart-head">
+        <div><h2>现金与债务</h2><div class="sub">现金及等价物、有价证券（短期+长期）与总债务（期末时点）</div></div>
+      </div>
+      <div class="chart" id="cBalance"></div>
+    </div>
+    <div class="chart-card">
+      <div class="chart-head">
+        <div><h2>现金流 · 股东回报 · 股权激励</h2><div class="sub">流出（资本开支/回购/分红）画零轴下方；SBC 虚线=非现金加回（hover 看回报与 SBC 占 FCF 比例）</div></div>
+        <button class="mini" data-csv="cashflow">复制 CSV</button>
+      </div>
+      <div class="chart" id="cCashflow"></div>
+    </div>
+  </div>
+</div>
+
+<script src="/vendor/echarts.min.js"></script>
+<script src="/dashboard.js"></script>
+
+</body>
+</html>
