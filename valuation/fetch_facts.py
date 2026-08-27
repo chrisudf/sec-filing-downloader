@@ -346,6 +346,34 @@ def assemble_series(facts: dict, name: str, spec=None, units=USD_UNITS,
     return annual, dict(sorted(quarterly.items()))
 
 
+def _guard_derived_q4_eps(out: dict) -> None:
+    """财年末季 EPS 的拆股口径守卫（NVDA 2024-06 10:1 拆股实测）。
+
+    companyfacts 每个季度帧来自「最后一份报告该期的申报」：拆股当年，
+    早季度帧可能停在拆前口径而年度/晚季度帧已是拆后口径，
+    Q4 = 年度 − 前三季 会混用两种口径相减——NVDA Q4 FY24 推导出
+    −0.25（真实 +0.49：1.19 − (0.82拆前 + 0.25 + 0.37)）。
+
+    EPS 本就不满足「年度=四季相加」（加权股本逐季变化），推导值只是
+    近似——必须经 净利 ÷ 年度稀释股本 的隐含 EPS 交叉核对：符号翻转
+    或相对偏差超 35%（绝对差 5 美分以内豁免，容纳银行优先股股利等
+    口径差）即置空。宁缺勿错：图表缺一根柱诚实，画一根错柱有毒。"""
+    eps_q = out.get("eps_diluted_quarterly") or {}
+    eps_a = out.get("eps_diluted_annual") or {}
+    ni_q = out.get("net_income_quarterly") or {}
+    sh_a = out.get("shares_diluted_annual") or {}
+    for end in [e for e in eps_q if e in eps_a]:  # 推导只发生在财年末季
+        ni, sh, eps = ni_q.get(end), sh_a.get(end), eps_q[end]
+        if ni is None or not sh:
+            continue
+        implied = ni / sh
+        if abs(eps - implied) <= 0.05:
+            continue
+        if eps * implied < 0 or \
+                abs(eps - implied) > 0.35 * max(abs(implied), abs(eps)):
+            del eps_q[end]
+
+
 def _newest_end(facts: dict, tag: str) -> str:
     if tag not in facts:
         return ""
@@ -524,6 +552,8 @@ def build_facts(ticker: str, email: str, cik: int | None = None) -> dict:
         annual, quarterly = assemble_series(facts, name, spec, units, fx)
         out[name + "_annual"] = annual
         out[name + "_quarterly"] = quarterly
+
+    _guard_derived_q4_eps(out)
 
     # TTM 全部科目锚定到营收窗口末季：某科目标签断更时（COHR 的营业利润曾停在
     # 2024）不许拿旧窗口的 TTM 与新窗口的营收并排展示。
