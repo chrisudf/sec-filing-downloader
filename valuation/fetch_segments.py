@@ -31,6 +31,7 @@ import threading
 import time
 import xml.etree.ElementTree as ET
 import zipfile
+import zlib
 from datetime import date, timedelta
 from itertools import combinations
 from pathlib import Path
@@ -169,8 +170,10 @@ def _fetch_instance(client: httpx.Client, cik: int, acc: str) -> bytes | None:
                     if zf.getinfo(pick).file_size > MAX_INSTANCE_BYTES:
                         return None
                     return zf.read(pick)
-        except zipfile.BadZipFile:
-            raise SegmentsError(f"申报 {acc} 的 -xbrl.zip 损坏") from None
+        except (zipfile.BadZipFile, zlib.error) as e:
+            # 成员数据损坏走 zlib.error 而非 BadZipFile：不归一会以未处理
+            # 异常逃出结构性跳过路径，整个请求变 500
+            raise SegmentsError(f"申报 {acc} 的 -xbrl.zip 损坏（{e}）") from None
     raise SegmentsError(f"申报 {acc} 里找不到 XBRL instance")
 
 
@@ -663,6 +666,14 @@ def build_segments(ticker: str, email: str, cik: int | None = None,
         versions, totals, conc_cells, skipped = _collect_versions(
             client, cik, picked)
 
+    if skipped and not versions and not totals and not conc_cells:
+        # 全军覆没时必须响亮携带真实原因：静默返回空结果会被服务端缓存
+        # 6 小时，且 404 文案「没有可用的分部营收数据」把取数故障说成
+        # 公司未披露——这正是逐份跳过想避免的假阴性
+        raise SegmentsError(
+            f"{ticker} 的 {len(skipped)} 份申报全部取不到 XBRL instance"
+            f"（如 {skipped[0][1]}）")
+
     aliases = _detect_aliases(versions)
     cells = _pick_cells(versions, aliases)
     axes = _build_axes(cells, totals)
@@ -681,6 +692,9 @@ def main() -> None:
         raise SystemExit(str(e))
     with open(out_path, "w", encoding="utf-8") as f:
         json.dump(out, f, ensure_ascii=False, indent=1)
+    # 与 API/前端 warning 同等的降级可见性：CLI 不能静默丢申报
+    for acc, reason in out.get("skipped") or []:
+        print(f"⚠ 跳过 {acc}: {reason}", file=sys.stderr)
     for axis_key, data in out["axes"].items():
         q, a = data["quarterly"], data["annual"]
         print(f"{axis_key}: 季度 {len(q)} 期 / 年度 {len(a)} 期")

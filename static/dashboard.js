@@ -427,8 +427,11 @@ function renderWaterfall(d, i) {
       // 股权收益单列成行的申报（余项≈0，NVDA Q2 FY27）不受影响。
       const other = comps.find(x => x.key === "other_nonop");
       const gap = it.val - comps.reduce((s, x) => s + x.val, 0);
-      if (eqv && other &&
-          Math.abs(gap + eqv.val) <= Math.max(Math.abs(it.val) * 0.02, 2e6)) {
+      const tol = Math.max(Math.abs(it.val) * 0.02, 2e6);
+      // |eqv| 必须显著大于容差：小额且本就单列的 equity（gap≈0）会让
+      // |gap+eqv| 撞进容差、误触发去重，把正确的拆解改坏
+      if (eqv && other && Math.abs(eqv.val) > tol &&
+          Math.abs(gap + eqv.val) <= tol) {
         comps = comps
           .map(x => x.key !== "other_nonop" ? x
             : { ...x, label: "其他营业外（剔股权投资）", val: x.val - eqv.val })

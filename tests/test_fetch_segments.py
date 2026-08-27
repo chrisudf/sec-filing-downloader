@@ -312,3 +312,62 @@ def test_fetch_instance_zip_ixbrl_primary_doc():
                           "0001045810-26-000075-xbrl.zip": buf.getvalue()})
     assert _fetch_instance(
         client, 1045810, "0001045810-26-000075") == b"<html>primary</html>"
+
+
+# ---- 评审修复批：zip 边界、超大守卫、全跳过响亮报错 ----
+def test_fetch_instance_zip_only_linkbases_raises():
+    buf = io.BytesIO()
+    with zipfile.ZipFile(buf, "w") as zf:
+        zf.writestr("a-20260101_cal.xml", "<cal/>")
+        zf.writestr("a-20260101_lab.xml", "<lab/>")
+    idx = _index_json(["a-xbrl.zip"])
+    client = _FakeClient({"index.json": idx, "a-xbrl.zip": buf.getvalue()})
+    with pytest.raises(SegmentsError):
+        _fetch_instance(client, 1, "0000000000-00-000002")
+
+
+def test_fetch_instance_direct_oversized_returns_none(monkeypatch):
+    monkeypatch.setattr(fs, "MAX_INSTANCE_BYTES", 4)
+    idx = _index_json(["a-20260101_htm.xml"])
+    client = _FakeClient({"index.json": idx,
+                          "a-20260101_htm.xml": b"<xbrl>toolong</xbrl>"})
+    assert fs._fetch_instance(client, 1, "0000000000-00-000003") is None
+
+
+def test_fetch_instance_zip_oversized_member_returns_none(monkeypatch):
+    monkeypatch.setattr(fs, "MAX_INSTANCE_BYTES", 4)
+    buf = io.BytesIO()
+    with zipfile.ZipFile(buf, "w") as zf:
+        zf.writestr("a-20260101.htm", "<html>big ixbrl doc</html>")
+    idx = _index_json(["a-xbrl.zip"])
+    client = _FakeClient({"index.json": idx, "a-xbrl.zip": buf.getvalue()})
+    assert fs._fetch_instance(client, 1, "0000000000-00-000004") is None
+
+
+def test_fetch_instance_corrupt_member_raises_segments_error():
+    # 成员 deflate 数据损坏走 zlib.error（非 BadZipFile）：必须归一为
+    # SegmentsError，否则逃出结构性跳过路径、整个请求 500
+    buf = io.BytesIO()
+    with zipfile.ZipFile(buf, "w", compression=zipfile.ZIP_DEFLATED) as zf:
+        zf.writestr("a-20260101.xml", "<xbrl>" + "data " * 200 + "</xbrl>")
+    raw = bytearray(buf.getvalue())
+    off = 30 + len("a-20260101.xml") + 4  # 本地文件头(30) + 文件名 + 进 payload
+    raw[off] ^= 0xFF
+    idx = _index_json(["a-xbrl.zip"])
+    client = _FakeClient({"index.json": idx, "a-xbrl.zip": bytes(raw)})
+    with pytest.raises(SegmentsError):
+        _fetch_instance(client, 1, "0000000000-00-000005")
+
+
+def test_build_segments_all_skipped_raises_true_cause(monkeypatch):
+    # 全军覆没不许静默返回空结果：会被服务端缓存 6h 且 404 文案把
+    # 取数故障说成「公司未披露分部数据」
+    monkeypatch.setattr(fs, "_list_filings", lambda c, k, cut: [
+        {"acc": "a1", "filed": "2026-08-26", "report": "2026-07-26"},
+        {"acc": "a2", "filed": "2026-05-20", "report": "2026-04-26"}])
+    monkeypatch.setattr(fs, "_sweep_stale_cache", lambda: None)
+    monkeypatch.setattr(fs, "_collect_versions", lambda c, k, p: (
+        {}, {}, {}, [("a1", "申报 a1 里找不到 XBRL instance"),
+                     ("a2", "申报 a2 里找不到 XBRL instance")]))
+    with pytest.raises(SegmentsError, match="全部取不到"):
+        fs.build_segments("XXXX", "t@e.st", cik=1)
