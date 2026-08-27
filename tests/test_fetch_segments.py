@@ -225,3 +225,90 @@ def test_collect_versions_transient_still_raises(monkeypatch):
     monkeypatch.setattr(fs, "_parse_filing_cached", fake_parse)
     with pytest.raises(SegmentsError):
         fs._collect_versions(None, 1, [{"acc": "x", "filed": "2026-01-01"}])
+
+
+# ---- iXBRL（收缩目录申报的唯一形态）解析 ----
+from valuation.fetch_segments import _parse_instance
+
+_IXBRL_DOC = b"""<?xml version="1.0" encoding="utf-8"?>
+<html xmlns="http://www.w3.org/1999/xhtml"
+      xmlns:ix="http://www.xbrl.org/2013/inlineXBRL"
+      xmlns:xbrli="http://www.xbrl.org/2003/instance"
+      xmlns:xbrldi="http://xbrl.org/2006/xbrldi"
+      xmlns:us-gaap="http://fasb.org/us-gaap/2026">
+<body>
+<div style="display:none">
+  <xbrli:context id="c-total">
+    <xbrli:period><xbrli:startDate>2026-04-27</xbrli:startDate>
+    <xbrli:endDate>2026-07-26</xbrli:endDate></xbrli:period>
+  </xbrli:context>
+  <xbrli:context id="c-segA">
+    <xbrli:entity><xbrli:segment>
+      <xbrldi:explicitMember dimension="us-gaap:StatementBusinessSegmentsAxis"
+        >nvda:ComputeMember</xbrldi:explicitMember>
+    </xbrli:segment></xbrli:entity>
+    <xbrli:period><xbrli:startDate>2026-04-27</xbrli:startDate>
+    <xbrli:endDate>2026-07-26</xbrli:endDate></xbrli:period>
+  </xbrli:context>
+  <xbrli:context id="c-conc">
+    <xbrli:entity><xbrli:segment>
+      <xbrldi:explicitMember dimension="us-gaap:ConcentrationRiskByBenchmarkAxis"
+        >us-gaap:RevenueBenchmarkMember</xbrldi:explicitMember>
+    </xbrli:segment></xbrli:entity>
+    <xbrli:period><xbrli:startDate>2026-04-27</xbrli:startDate>
+    <xbrli:endDate>2026-07-26</xbrli:endDate></xbrli:period>
+  </xbrli:context>
+</div>
+<p>Revenue was $<ix:nonFraction name="us-gaap:Revenues" contextRef="c-total"
+   scale="6" format="ixt:num-dot-decimal" unitRef="usd">96,221</ix:nonFraction>
+   million; Compute segment $<ix:nonFraction name="us-gaap:Revenues"
+   contextRef="c-segA" scale="6" format="ixt:num-dot-decimal"
+   unitRef="usd">88,299</ix:nonFraction> million.
+   Repeat on cover: <ix:nonFraction name="us-gaap:Revenues" contextRef="c-total"
+   scale="6" format="ixt:num-dot-decimal" unitRef="usd">96,221</ix:nonFraction>.
+   One customer was <ix:nonFraction name="us-gaap:ConcentrationRiskPercentage1"
+   contextRef="c-conc" scale="-2" unitRef="pure">16</ix:nonFraction>%
+   of revenue. Offset item: <ix:nonFraction name="us-gaap:Revenues"
+   contextRef="c-bad" scale="6">1</ix:nonFraction>
+</p>
+</body></html>"""
+
+
+def test_parse_instance_ixbrl():
+    out = _parse_instance(_IXBRL_DOC)
+    key = ("2026-04-27", "2026-07-26")
+    assert out["periods"][key]["total"] == 96_221e6
+    assert out["periods"][key]["axes"]["segment"]["ComputeMember"] == 88_299e6
+    assert len(out["concentration"]) == 1
+    conc = out["concentration"][0]
+    assert abs(conc["value"] - 0.16) < 1e-9
+    assert conc["dims"]["ConcentrationRiskByBenchmarkAxis"] == \
+        "RevenueBenchmarkMember"
+
+
+def test_ix_number_sign_and_zero():
+    import xml.etree.ElementTree as ET
+    from valuation.fetch_segments import _ix_number
+    el = ET.fromstring(
+        '<n xmlns:x="x" sign="-" scale="3" format="ixt:num-dot-decimal">1,5</n>')
+    el.text = "1,500"
+    assert _ix_number(el) == -1_500_000
+    zero = ET.fromstring('<n format="ixt:fixed-zero">anything</n>')
+    assert _ix_number(zero) == 0.0
+    exotic = ET.fromstring('<n format="ixt:num-comma-decimal">1.234,5</n>')
+    assert _ix_number(exotic) is None
+
+
+def test_fetch_instance_zip_ixbrl_primary_doc():
+    # 现代收缩目录实况：zip 里没有提取件，只有 iXBRL 主文档 + linkbase
+    buf = io.BytesIO()
+    with zipfile.ZipFile(buf, "w") as zf:
+        zf.writestr("nvda-20260726.htm", "<html>primary</html>")
+        zf.writestr("nvda-20260726_lab.xml", "<lab/>")
+        zf.writestr("nvda2027q2ex311.htm", "<html>exhibit</html>")
+    idx = _index_json(["0001045810-26-000075.txt",
+                       "0001045810-26-000075-xbrl.zip"])
+    client = _FakeClient({"index.json": idx,
+                          "0001045810-26-000075-xbrl.zip": buf.getvalue()})
+    assert _fetch_instance(
+        client, 1045810, "0001045810-26-000075") == b"<html>primary</html>"
