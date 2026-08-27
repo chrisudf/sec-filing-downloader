@@ -21,6 +21,7 @@ companyfacts/frames 这类免费 JSON API 会剥掉全部维度数据，分部�
   窗口不够时要继续翻 filings.files 分页
 - 每份申报解析结果不可变，按 accession 落盘缓存（原子写入，损坏自愈）
 """
+import io
 import json
 import os
 import re
@@ -29,6 +30,7 @@ import tempfile
 import threading
 import time
 import xml.etree.ElementTree as ET
+import zipfile
 from datetime import date, timedelta
 from itertools import combinations
 from pathlib import Path
@@ -114,19 +116,48 @@ def _iso(text: str) -> str:
     return text.strip()[:10]
 
 
-def _find_instance(client: httpx.Client, cik: int, acc: str) -> str:
+def _instance_names(names: list) -> list:
+    """从文件名列表里挑 XBRL instance：现代申报为 EDGAR 提取件 *_htm.xml，
+    2019 年前的申报没有提取件，退回原始 instance（排除 linkbase 四件套）。"""
+    cands = [n for n in names if n.endswith("_htm.xml")]
+    if not cands:
+        cands = [n for n in names
+                 if re.search(r"-\d{8}\.xml$", n)
+                 and not re.search(r"(_cal|_def|_lab|_pre)\.xml$", n)]
+    return cands
+
+
+def _fetch_instance(client: httpx.Client, cik: int, acc: str) -> bytes | None:
+    """定位并下载申报的 XBRL instance；超过 MAX_INSTANCE_BYTES 返回 None。
+
+    EDGAR 正在滚动把已披露申报的目录收缩成四个文件（index 两件 + 母版
+    txt + -xbrl.zip）：刚披露的申报和被迁移的老申报都取不到单独的
+    *_htm.xml（NVDA 2026-08-26 / 2024-11-20、AVGO 2026-06 实测），
+    instance 只存在于 -xbrl.zip 里——必须解包兜底，否则分部卡
+    恰好在财报日当天必挂。"""
     acc_nodash = acc.replace("-", "")
     base = f"https://www.sec.gov/Archives/edgar/data/{cik}/{acc_nodash}"
     idx = _get(client, f"{base}/index.json").json()
     names = [it["name"] for it in idx["directory"]["item"]]
-    cands = [n for n in names if n.endswith("_htm.xml")]
-    if not cands:  # 2019 年前的申报没有 EDGAR 提取件，用原始 instance
-        cands = [n for n in names
-                 if re.search(r"-\d{8}\.xml$", n)
-                 and not re.search(r"(_cal|_def|_lab|_pre)\.xml$", n)]
-    if not cands:
-        raise SegmentsError(f"申报 {acc} 里找不到 XBRL instance")
-    return f"{base}/{sorted(cands)[0]}"
+    cands = _instance_names(names)
+    if cands:
+        content = _get(client, f"{base}/{sorted(cands)[0]}").content
+        return None if len(content) > MAX_INSTANCE_BYTES else content
+    zips = [n for n in names if n.endswith("-xbrl.zip")]
+    if zips:
+        blob = _get(client, f"{base}/{sorted(zips)[0]}").content
+        try:
+            with zipfile.ZipFile(io.BytesIO(blob)) as zf:
+                inner = _instance_names(zf.namelist())
+                if inner:
+                    name = sorted(inner)[0]
+                    # 解压前按声明尺寸挡 zip 炸弹，与直取路径同一上限
+                    if zf.getinfo(name).file_size > MAX_INSTANCE_BYTES:
+                        return None
+                    return zf.read(name)
+        except zipfile.BadZipFile:
+            raise SegmentsError(f"申报 {acc} 的 -xbrl.zip 损坏") from None
+    raise SegmentsError(f"申报 {acc} 里找不到 XBRL instance")
 
 
 def _parse_instance(xml_bytes: bytes) -> dict:
@@ -289,13 +320,12 @@ def _parse_filing_cached(client: httpx.Client, cik: int, acc: str) -> dict:
             return json.loads(cache.read_text(encoding="utf-8"))
         except (json.JSONDecodeError, OSError):
             cache.unlink(missing_ok=True)
-    url = _find_instance(client, cik, acc)
-    r = _get(client, url)
-    if len(r.content) > MAX_INSTANCE_BYTES:
+    content = _fetch_instance(client, cik, acc)
+    if content is None:  # 超大 instance：跳过解析，与旧行为一致
         parsed = {"periods": {}, "concentration": []}
     else:
         try:
-            parsed = _parse_instance(r.content)
+            parsed = _parse_instance(content)
         except ET.ParseError:
             # 畸形 instance：跳过该申报，不毒化请求
             parsed = {"periods": {}, "concentration": []}

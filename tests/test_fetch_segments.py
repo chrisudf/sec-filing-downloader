@@ -108,3 +108,88 @@ def test_build_axes_kind_split():
 def test_tol_floor():
     assert _tol(100e6) == 2e6  # 小公司容差有 $2M 下限
     assert _tol(1e12) == 5e9
+
+
+# ---- instance 发现：EDGAR 目录收缩后的 -xbrl.zip 兜底 ----
+import io
+import json
+import zipfile
+
+import pytest
+
+from valuation.fetch_segments import (SegmentsError, _fetch_instance,
+                                      _instance_names)
+
+
+class _FakeResp:
+    status_code = 200
+
+    def __init__(self, content: bytes):
+        self.content = content
+
+    def json(self):
+        return json.loads(self.content)
+
+
+class _FakeClient:
+    """按 URL 尾段路由的假 httpx.Client，只覆盖 _get 用到的接口。"""
+
+    def __init__(self, routes: dict):
+        self.routes = routes
+
+    def get(self, url: str):
+        return _FakeResp(self.routes[url.rsplit("/", 1)[-1]])
+
+
+def _index_json(names):
+    return json.dumps(
+        {"directory": {"item": [{"name": n} for n in names]}}).encode()
+
+
+def test_instance_names_prefers_extracted():
+    names = ["nvda-20260726_htm.xml", "nvda-20260726.xsd",
+             "nvda-20260726_cal.xml", "nvda-20260726_lab.xml"]
+    assert _instance_names(names) == ["nvda-20260726_htm.xml"]
+
+
+def test_instance_names_legacy_excludes_linkbases():
+    names = ["nvda-20180429.xml", "nvda-20180429_cal.xml",
+             "nvda-20180429_pre.xml", "nvda-20180429.xsd"]
+    assert _instance_names(names) == ["nvda-20180429.xml"]
+
+
+def test_fetch_instance_direct():
+    idx = _index_json(["nvda-20260426_htm.xml", "other.htm"])
+    client = _FakeClient({"index.json": idx,
+                          "nvda-20260426_htm.xml": b"<xbrl/>"})
+    assert _fetch_instance(client, 1045810, "0001045810-26-000052") == b"<xbrl/>"
+
+
+def test_fetch_instance_zip_fallback():
+    # NVDA 2026-08-26 实况：目录只剩 index/txt/-xbrl.zip 四件，
+    # instance 在 zip 里
+    buf = io.BytesIO()
+    with zipfile.ZipFile(buf, "w") as zf:
+        zf.writestr("nvda-20260726_htm.xml", "<xbrl>zip</xbrl>")
+        zf.writestr("nvda-20260726_lab.xml", "<lab/>")
+    idx = _index_json(["0001045810-26-000075-index.html",
+                       "0001045810-26-000075.txt",
+                       "0001045810-26-000075-xbrl.zip"])
+    client = _FakeClient({"index.json": idx,
+                          "0001045810-26-000075-xbrl.zip": buf.getvalue()})
+    assert _fetch_instance(
+        client, 1045810, "0001045810-26-000075") == b"<xbrl>zip</xbrl>"
+
+
+def test_fetch_instance_missing_raises():
+    idx = _index_json(["0000000000-00-000000.txt"])
+    client = _FakeClient({"index.json": idx})
+    with pytest.raises(SegmentsError):
+        _fetch_instance(client, 1, "0000000000-00-000000")
+
+
+def test_fetch_instance_bad_zip_raises():
+    idx = _index_json(["a-xbrl.zip"])
+    client = _FakeClient({"index.json": idx, "a-xbrl.zip": b"not a zip"})
+    with pytest.raises(SegmentsError):
+        _fetch_instance(client, 1, "0000000000-00-000001")
