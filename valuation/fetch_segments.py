@@ -21,6 +21,7 @@ companyfacts/frames 这类免费 JSON API 会剥掉全部维度数据，分部�
   窗口不够时要继续翻 filings.files 分页
 - 每份申报解析结果不可变，按 accession 落盘缓存（原子写入，损坏自愈）
 """
+import io
 import json
 import os
 import re
@@ -29,6 +30,8 @@ import tempfile
 import threading
 import time
 import xml.etree.ElementTree as ET
+import zipfile
+import zlib
 from datetime import date, timedelta
 from itertools import combinations
 from pathlib import Path
@@ -114,24 +117,126 @@ def _iso(text: str) -> str:
     return text.strip()[:10]
 
 
-def _find_instance(client: httpx.Client, cik: int, acc: str) -> str:
+def _instance_names(names: list) -> list:
+    """从文件名列表里挑 XBRL instance：现代申报为 EDGAR 提取件 *_htm.xml，
+    2019 年前的申报没有提取件，退回原始 instance（排除 linkbase 四件套）。"""
+    cands = [n for n in names if n.endswith("_htm.xml")]
+    if not cands:
+        cands = [n for n in names
+                 if re.search(r"-\d{8}\.xml$", n)
+                 and not re.search(r"(_cal|_def|_lab|_pre)\.xml$", n)]
+    return cands
+
+
+def _fetch_instance(client: httpx.Client, cik: int, acc: str) -> bytes | None:
+    """定位并下载申报的 XBRL instance；超过 MAX_INSTANCE_BYTES 返回 None。
+
+    EDGAR 正在滚动把已披露申报的目录收缩成四个文件（index 两件 + 母版
+    txt + -xbrl.zip）：刚披露的申报和被迁移的老申报都取不到单独的
+    *_htm.xml（NVDA 2026-08-26 / 2024-11-20、AVGO 2026-06 实测），
+    instance 只存在于 -xbrl.zip 里——必须解包兜底，否则分部卡
+    恰好在财报日当天必挂。"""
     acc_nodash = acc.replace("-", "")
     base = f"https://www.sec.gov/Archives/edgar/data/{cik}/{acc_nodash}"
     idx = _get(client, f"{base}/index.json").json()
     names = [it["name"] for it in idx["directory"]["item"]]
-    cands = [n for n in names if n.endswith("_htm.xml")]
-    if not cands:  # 2019 年前的申报没有 EDGAR 提取件，用原始 instance
-        cands = [n for n in names
-                 if re.search(r"-\d{8}\.xml$", n)
-                 and not re.search(r"(_cal|_def|_lab|_pre)\.xml$", n)]
-    if not cands:
-        raise SegmentsError(f"申报 {acc} 里找不到 XBRL instance")
-    return f"{base}/{sorted(cands)[0]}"
+    cands = _instance_names(names)
+    if cands:
+        content = _get(client, f"{base}/{sorted(cands)[0]}").content
+        return None if len(content) > MAX_INSTANCE_BYTES else content
+    zips = [n for n in names if n.endswith("-xbrl.zip")]
+    if zips:
+        blob = _get(client, f"{base}/{sorted(zips)[0]}").content
+        try:
+            with zipfile.ZipFile(io.BytesIO(blob)) as zf:
+                pick = None
+                inner = _instance_names(zf.namelist())
+                if inner:  # 2019 年前的原始 instance .xml 直接在包里
+                    pick = sorted(inner)[0]
+                else:
+                    # 现代申报的原始包里没有提取件（*_htm.xml 是 EDGAR
+                    # 播发时生成的，目录收缩后不复存在）：XBRL 以 iXBRL
+                    # 内嵌在主文档里。主文档命名 <ticker>-YYYYMMDD.htm，
+                    # 匹配不到再退回包里最大的 .htm
+                    htms = [n for n in zf.namelist()
+                            if n.lower().endswith(".htm")]
+                    prim = [n for n in htms if re.search(r"-\d{8}\.htm$", n)]
+                    if prim:
+                        pick = sorted(prim)[0]
+                    elif htms:
+                        pick = max(htms, key=lambda n: zf.getinfo(n).file_size)
+                if pick is not None:
+                    # 解压前按声明尺寸挡 zip 炸弹，与直取路径同一上限
+                    if zf.getinfo(pick).file_size > MAX_INSTANCE_BYTES:
+                        return None
+                    return zf.read(pick)
+        except (zipfile.BadZipFile, zlib.error) as e:
+            # 成员数据损坏走 zlib.error 而非 BadZipFile：不归一会以未处理
+            # 异常逃出结构性跳过路径，整个请求变 500
+            raise SegmentsError(f"申报 {acc} 的 -xbrl.zip 损坏（{e}）") from None
+    raise SegmentsError(f"申报 {acc} 里找不到 XBRL instance")
+
+
+_IX_NS = ("http://www.xbrl.org/2013/inlineXBRL",
+          "http://www.xbrl.org/2008/inlineXBRL")
+_XSI_NIL = "{http://www.w3.org/2001/XMLSchema-instance}nil"
+
+
+def _ix_number(el) -> float | None:
+    """ix:nonFraction -> 数值。文本按 num-dot-decimal 清洗（US 申报的
+    绝对主流），scale 缩放（NVDA 营收 '96,221'×10⁶、集中度 '22'×10⁻²），
+    sign 取负。罕见 format（欧陆千分位等）解析不了就返回 None 跳过该事实。"""
+    if el.get(_XSI_NIL) == "true":
+        return None
+    fmt = (el.get("format") or "").rsplit(":", 1)[-1]
+    txt = "".join(el.itertext()).strip()
+    if fmt == "fixed-zero" or txt in ("", "—", "–", "-"):
+        val = 0.0
+    elif fmt in ("", "num-dot-decimal"):
+        try:
+            val = float(txt.replace(",", "").replace("\xa0", ""))
+        except ValueError:
+            return None
+    else:
+        return None
+    try:
+        val *= 10.0 ** int(el.get("scale") or 0)
+    except ValueError:
+        return None
+    return -val if el.get("sign") == "-" else val
+
+
+def _fact_items(root):
+    """统一两种载体的数值事实遍历，产出 (concept 局部名, contextRef, 值)。
+
+    普通 instance：概念是顶层元素标签，值在 text；
+    iXBRL（XHTML 内嵌，收缩目录申报的唯一形态）：事实是 ix:nonFraction，
+    概念在 @name，值要按 format/scale/sign 还原。同一事实在 iXBRL 里
+    常重复出现（封面+附注），调用方按 contextRef 覆盖去重。"""
+    if _local(root.tag) == "html":
+        for ns in _IX_NS:
+            for el in root.iter(f"{{{ns}}}nonFraction"):
+                cref = el.get("contextRef")
+                if cref is None:
+                    continue
+                val = _ix_number(el)
+                if val is not None:
+                    yield _local(el.get("name", "")), cref, val
+        return
+    for el in root.iter():
+        cref = el.get("contextRef")
+        if cref is None or not el.text or not el.text.strip():
+            continue
+        try:
+            yield _local(el.tag), cref, float(el.text.strip())
+        except ValueError:
+            continue
 
 
 def _parse_instance(xml_bytes: bytes) -> dict:
-    """单份 instance -> {"periods": {(start,end): {"total": v|None,
-    "axes": {axis_key: {member: value}}}}}，只收季度/年度跨度的营收事实。"""
+    """单份 instance（普通 XBRL 或 iXBRL XHTML）-> {"periods":
+    {(start,end): {"total": v|None, "axes": {axis_key: {member: value}}}}}，
+    只收季度/年度跨度的营收事实。"""
     root = ET.fromstring(xml_bytes)
 
     contexts = {}
@@ -160,17 +265,16 @@ def _parse_instance(xml_bytes: bytes) -> dict:
                                    "dims": dims, "typed": typed}
 
     facts = {ln: {} for ln in REVENUE_LOCALNAMES}
-    for el in root.iter():
-        ln = _local(el.tag)
-        if ln not in facts:
+    # (concept, contextRef) -> value：iXBRL 同一事实常重复出现（封面+附注），
+    # 按键覆盖去重；两个集中度 concept 同 context 并存时互不挤占
+    conc_facts: dict = {}
+    for ln, cref, val in _fact_items(root):
+        if cref not in contexts:
             continue
-        cref = el.get("contextRef")
-        if cref is None or cref not in contexts or not el.text or not el.text.strip():
-            continue
-        try:
-            facts[ln][cref] = float(el.text.strip())
-        except ValueError:
-            continue
+        if ln in facts:
+            facts[ln][cref] = val
+        elif ln in CONC_TAGS:
+            conc_facts[(ln, cref)] = val
 
     def span_ok(c: dict) -> bool:
         return 80 <= c["days"] <= 100 or 340 <= c["days"] <= 380
@@ -262,16 +366,9 @@ def _parse_instance(xml_bytes: bytes) -> dict:
     # 分类（类型/基准/交易对手）留给服务端——基准轴必须保留，
     # 「占应收款 46%」标成「占营收 46%」是对标站踩过的错
     concentration = []
-    for el in root.iter():
-        if _local(el.tag) not in CONC_TAGS:
-            continue
-        cref = el.get("contextRef")
-        c = contexts.get(cref)
-        if c is None or c["typed"] or not el.text or not el.text.strip():
-            continue
-        try:
-            val = float(el.text.strip())
-        except ValueError:
+    for (_ln, cref), val in conc_facts.items():
+        c = contexts[cref]
+        if c["typed"]:
             continue
         concentration.append({"start": c["start"], "end": c["end"],
                               "days": c["days"], "value": val,
@@ -289,13 +386,12 @@ def _parse_filing_cached(client: httpx.Client, cik: int, acc: str) -> dict:
             return json.loads(cache.read_text(encoding="utf-8"))
         except (json.JSONDecodeError, OSError):
             cache.unlink(missing_ok=True)
-    url = _find_instance(client, cik, acc)
-    r = _get(client, url)
-    if len(r.content) > MAX_INSTANCE_BYTES:
+    content = _fetch_instance(client, cik, acc)
+    if content is None:  # 超大 instance：跳过解析，与旧行为一致
         parsed = {"periods": {}, "concentration": []}
     else:
         try:
-            parsed = _parse_instance(r.content)
+            parsed = _parse_instance(content)
         except ET.ParseError:
             # 畸形 instance：跳过该申报，不毒化请求
             parsed = {"periods": {}, "concentration": []}
@@ -374,12 +470,23 @@ def _conc_group(entry: dict):
 
 def _collect_versions(client: httpx.Client, cik: int, picked: list[dict]):
     """逐申报收集：每期全部成员版本（比较期会被多份申报覆盖）、
-    无维度总额、集中度分组。"""
+    无维度总额、集中度分组。
+
+    单份申报结构性缺 instance（zip 兜底后仍没有）只跳过该申报并记录，
+    不再击杀整卡——否则其余十几份可解析申报陪葬，卡片只剩一行报错。
+    瞬态失败（限速/维护）必须继续冒泡：吞掉会把空结果焊死进落盘缓存。"""
     versions: dict = {}
     totals: dict = {}
     conc_cells: dict = {}  # _conc_group -> (filed, [entries])
+    skipped: list = []     # [(acc, 原因)]，上浮到 API warning
     for row in picked:
-        parsed = _parse_filing_cached(client, cik, row["acc"])
+        try:
+            parsed = _parse_filing_cached(client, cik, row["acc"])
+        except SegmentsError as e:
+            if e.transient:
+                raise
+            skipped.append((row["acc"], str(e)))
+            continue
         for entry in parsed.get("concentration", []):
             k = _conc_group(entry)
             if k not in conc_cells or row["filed"] > conc_cells[k][0]:
@@ -394,7 +501,7 @@ def _collect_versions(client: httpx.Client, cik: int, picked: list[dict]):
             for axis_key, members in slot.get("axes", {}).items():
                 versions.setdefault((axis_key, s, e), []).append(
                     (row["filed"], members))
-    return versions, totals, conc_cells
+    return versions, totals, conc_cells, skipped
 
 
 def _detect_aliases(versions: dict) -> dict:
@@ -556,14 +663,24 @@ def build_segments(ticker: str, email: str, cik: int | None = None,
                         key=lambda r: r["report"], reverse=True)[:MAX_FILINGS]
 
         _sweep_stale_cache()
-        versions, totals, conc_cells = _collect_versions(client, cik, picked)
+        versions, totals, conc_cells, skipped = _collect_versions(
+            client, cik, picked)
+
+    if skipped and not versions and not totals and not conc_cells:
+        # 全军覆没时必须响亮携带真实原因：静默返回空结果会被服务端缓存
+        # 6 小时，且 404 文案「没有可用的分部营收数据」把取数故障说成
+        # 公司未披露——这正是逐份跳过想避免的假阴性
+        raise SegmentsError(
+            f"{ticker} 的 {len(skipped)} 份申报全部取不到 XBRL instance"
+            f"（如 {skipped[0][1]}）")
 
     aliases = _detect_aliases(versions)
     cells = _pick_cells(versions, aliases)
     axes = _build_axes(cells, totals)
     _derive_q4(axes)
     return {"ticker": ticker, "cik": cik, "axes": axes,
-            "concentration": _dedupe_concentration(conc_cells)}
+            "concentration": _dedupe_concentration(conc_cells),
+            "skipped": skipped}
 
 
 def main() -> None:
@@ -575,6 +692,9 @@ def main() -> None:
         raise SystemExit(str(e))
     with open(out_path, "w", encoding="utf-8") as f:
         json.dump(out, f, ensure_ascii=False, indent=1)
+    # 与 API/前端 warning 同等的降级可见性：CLI 不能静默丢申报
+    for acc, reason in out.get("skipped") or []:
+        print(f"⚠ 跳过 {acc}: {reason}", file=sys.stderr)
     for axis_key, data in out["axes"].items():
         q, a = data["quarterly"], data["annual"]
         print(f"{axis_key}: 季度 {len(q)} 期 / 年度 {len(a)} 期")

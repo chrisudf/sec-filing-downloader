@@ -142,3 +142,76 @@ def test_shares_no_q4_derivation():
         ("2025-01-01", "2025-12-31", 14.8e9, "f"))}
     _, q = assemble_series(facts, "shares_diluted")
     assert "2025-12-31" not in q  # 不推导，宁缺勿错
+
+
+# ---- 推导 Q4 EPS 的拆股口径守卫 ----
+from valuation.fetch_facts import _guard_derived_q4_eps
+
+
+def _eps_out(eps_q4, ni_q4, sh_fy):
+    return {
+        "eps_diluted_quarterly": {"2024-01-28": eps_q4},
+        "eps_diluted_annual": {"2024-01-28": 1.19},
+        "net_income_quarterly": {"2024-01-28": ni_q4},
+        "shares_diluted_annual": {"2024-01-28": sh_fy},
+    }
+
+
+def test_q4_eps_guard_drops_split_mix():
+    # NVDA FY24 实况：推导 -0.25 vs 隐含 12.286B/24.89B=+0.49，符号翻转
+    out = _eps_out(-0.25, 12.286e9, 24.89e9)
+    _guard_derived_q4_eps(out)
+    assert "2024-01-28" not in out["eps_diluted_quarterly"]
+
+
+def test_q4_eps_guard_keeps_consistent():
+    # NVDA FY26 实况：推导 1.76 vs 隐含 42.96B/24.5B=1.754，偏差 0.3%
+    out = _eps_out(1.76, 42.96e9, 24.5e9)
+    _guard_derived_q4_eps(out)
+    assert out["eps_diluted_quarterly"]["2024-01-28"] == 1.76
+
+
+def test_q4_eps_guard_small_abs_diff_exempt():
+    # 银行优先股股利类口径差：隐含 0.05 vs 报 0.02，绝对差 3 美分豁免
+    out = _eps_out(0.02, 0.05e9, 1e9)
+    _guard_derived_q4_eps(out)
+    assert out["eps_diluted_quarterly"]["2024-01-28"] == 0.02
+
+
+def test_q4_eps_guard_non_fye_untouched():
+    # 非财年末季不在守卫范围（推导只发生在财年末）
+    out = {"eps_diluted_quarterly": {"2023-10-29": -9.99},
+           "eps_diluted_annual": {"2024-01-28": 1.19},
+           "net_income_quarterly": {"2023-10-29": 9.243e9},
+           "shares_diluted_annual": {"2024-01-28": 24.89e9}}
+    _guard_derived_q4_eps(out)
+    assert out["eps_diluted_quarterly"]["2023-10-29"] == -9.99
+
+
+def test_q4_eps_guard_missing_inputs_noop():
+    out = _eps_out(-0.25, None, 24.89e9)
+    _guard_derived_q4_eps(out)
+    assert out["eps_diluted_quarterly"]["2024-01-28"] == -0.25
+
+
+def test_q4_eps_guard_same_sign_large_deviation():
+    # 同号但偏差 68%（2.0 vs 隐含 1.19）：35% 相对偏差闸必须抓住——
+    # 只靠符号翻转闸抓不到（阈值哨兵：把 0.35 改大此用例必挂）
+    out = _eps_out(2.0, 29.6e9, 24.89e9)  # 隐含 1.19
+    _guard_derived_q4_eps(out)
+    assert "2024-01-28" not in out["eps_diluted_quarterly"]
+
+
+def test_q4_eps_guard_below_threshold_kept():
+    # 同号偏差 ~26%（1.50 vs 隐含 1.19）< 35%：正常口径差保留
+    out = _eps_out(1.50, 29.6e9, 24.89e9)
+    _guard_derived_q4_eps(out)
+    assert out["eps_diluted_quarterly"]["2024-01-28"] == 1.50
+
+
+def test_q4_eps_guard_wired_into_build_facts():
+    # 接线哨兵：守卫必须在 build_facts 主流程里被调用——
+    # 单元用例只测纯函数，删掉调用行整套仍绿（评审 mutation 实测）
+    import inspect
+    from valuation.fetch_facts import build_facts
+    assert "_guard_derived_q4_eps(out)" in inspect.getsource(build_facts)
