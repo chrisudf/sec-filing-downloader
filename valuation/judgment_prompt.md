@@ -58,12 +58,20 @@
    把结果写进 `post_period_capital_events`（确认无事件就写 `[]`），并让 net_cash 反映最终值。
    实测：INTC 2026-08-30，8/18 完成的 $20B 增发股数已计、$19.7B 现金未计，净债务少算 4.2% 市值，
    该偏差又把 bear 推出 P/FCF 界外触发假红旗，连锁破坏了 margins 情景排序。
-4. **周期股**（内存/油气/航运等）：bear 的完整下行段建模在 **DCF margins 路径**里
+4. **other_income**：年化的**正常化**利息与其他收益，**必须剔除一次性**。
+   参考口径 = TTM(利息收入 − 利息支出 + 其他非经营)，但那一行常混着一次性：
+   AMZN 的 other_nonop TTM 是 **+$80,425M**（Anthropic/OpenAI 私募股权向上重估），
+   INTC 的 $13,619M 托管股按市值重估同样落在 10-Q 的『Interest and other, net』里。
+   直接采纳原始行会把 EPS 抬出天际——引擎会把你给的数与原始行对照并打旗，
+   差额本身不是错，但 other_income_note 要能解释差在哪。
+   高负债标的另注意：利息支出可能被资本化利息压低（INTC H1'26 资本化 $542M），
+   厂建完就会跳出来。
+5. **周期股**（内存/油气/航运等）：bear 的完整下行段建模在 **DCF margins 路径**里
    （谷底 + 修复段）；倍数腿交给上面的联动规则——低盈利再配低倍数会被拒绝，
    除非声明永久受损
-5. 每条假设在 rationale 里写依据，notes 里写 3-4 条关键判断（一次性项目、风险、前瞻信号），
+6. 每条假设在 rationale 里写依据，notes 里写 3-4 条关键判断（一次性项目、风险、前瞻信号），
    都要注明出处（如"10-Q MD&A"）
-6. **SECTIONS 分区**：channel="risk" 的摘录来自恶化关键词（减值/重组/持续经营等），
+7. **SECTIONS 分区**：channel="risk" 的摘录来自恶化关键词（减值/重组/持续经营等），
    多为风险因素章节的**假设性模板披露或会计机制说明**——只有当其中出现**已发生的
    具体金额/事件**时才构成基本面恶化证据；不得仅因风险因素样板文压低情景假设
 
@@ -86,6 +94,9 @@
   //   自相矛盾报出来。AAPL 实测：fwd_shares 减了 155M 股，net_cash 一分没扣，ppce 写 []。
   "adj_ni": <TTM调整后净利 $M>, "adj_note": "<调整口径>",
   "other_income": <年化其他收益 $M,正常化>,
+  "other_income_note": "<必填：从财报哪一行取（通常『Interest and other, net』或等价行）、
+    剔了哪些一次性、如何年化。FACTS 已给 interest_income / interest_expense_nonop /
+    other_nonop / equity_inv_gain / fx_gain 的年度+季度序列，推导要落在这些数上>",
   "seg1": "<主分部名>", "seg2": "<次分部名或—>", "seg1_share": <0-1>,
   "scenarios": {
     "bear": {"g": <前瞻期(NTM,见元数据)营收增速vs TTM,小数>,

@@ -128,8 +128,12 @@ def _validate_judgment(d: dict, mode: str = "standard",
     # fwd_label 已移出判断层（2026-08-06）：它可由 report_end 纯日期推导，属服务器
     # 注入的事实（见 fwd_window 的 docstring）。仍在此必填会让"要求不要输出"与
     # "缺字段就重试"互相打架，每次运行必然两轮 retry 后失败。
+    # other_income_note 与 net_cash_note/adj_note 同级（2026-08-31）：此前
+    # other_income 是 need 里**唯一**不用交推导的事实类字段，于是它成了唯一
+    # 没有锚的数——AMZN 同日、同财报、同输入的两次运行，其他假设全部靠连续性
+    # 机制逐字沿用，唯独它从 1500 漂到 1000（-33%），把 base 推了 0.15%。
     need = ("fwd_shares", "net_cash", "net_cash_note", "adj_ni", "adj_note",
-            "other_income", "seg1", "seg2", "seg1_share",
+            "other_income", "other_income_note", "seg1", "seg2", "seg1_share",
             "scenarios", "rationale", "notes")
     for k in need:
         if k not in d:
@@ -138,6 +142,12 @@ def _validate_judgment(d: dict, mode: str = "standard",
         raise ValueError("fwd_shares 必须为正数（百万股）")
     if not isinstance(d["other_income"], (int, float)):
         raise ValueError("other_income 必须是数字（$M）")
+    if not str(d.get("other_income_note") or "").strip():
+        raise ValueError(
+            "other_income_note 必填：写清从财报哪一行取（通常是『Interest and "
+            "other, net』或等价行）、剔除了哪些一次性项目、如何年化。"
+            "FACTS 里已给 interest_income / interest_expense_nonop / other_nonop / "
+            "equity_inv_gain / fx_gain 的年度+季度序列，推导要落在这些数上")
     if not 0 <= d["seg1_share"] <= 1:
         raise ValueError("seg1_share 必须在 0-1")
     # 期后资本事件（可选，2026-08-31）：报告期末之后发生的增发/回购/并购/分拆。
