@@ -18,11 +18,13 @@ from app.valuation_service import _validate_judgment
 _ENG = Path(__file__).resolve().parent.parent / "valuation" / "engine.py"
 _SRC = _ENG.read_text(encoding="utf-8")
 _SEG = [ast.get_source_segment(_SRC, n) for n in ast.parse(_SRC).body
-        if isinstance(n, ast.FunctionDef) and n.name == "vintage_warnings"]
-assert len(_SEG) == 1, _SEG
+        if isinstance(n, ast.FunctionDef)
+        and n.name in ("vintage_warnings", "band_lag_warnings")]
+assert len(_SEG) == 2, _SEG
 _NS = {}
-exec(_SEG[0], _NS)
+exec(chr(10).join(_SEG), _NS)
 vintage_warnings = _NS["vintage_warnings"]
+band_lag_warnings = _NS["band_lag_warnings"]
 
 
 def _mk(**over):
@@ -265,3 +267,62 @@ def test_at_most_one_warning():
                     (_cfg(shares=14715.0, fwd_shares=14560.0), _vt(age=65)),
                     (_cfg(post_period_capital_events=[EVENT]), _vt(age=64))]:
         assert len(vintage_warnings(cfg, vt)) <= 1
+
+
+# =====================================================================
+# band_lag_warnings —— PE 带子的滞后提示
+# 已实现 NTM PE 的分母必须等未来 12 个月真的发生，滞后约一年是**口径下限**，
+# 不是数据缺失（2026-08-31 实测 AMZN 395 天 / KO 404 / AAPL 305）。
+# =====================================================================
+
+_TN = {"pctiles": {"50": 32.59}, "gap_since_main_band": {
+    "span": {"start": "2025-08-01", "end": "2026-07-30"}, "days": 250, "p50": 32.57}}
+
+
+@pytest.mark.parametrize("lag", [None, 0, 200, 270])
+def test_band_lag_silent_when_short(lag):
+    """阈值 270，等于不触发（严格大于）。"""
+    assert band_lag_warnings({"trailing_nolag": _TN}, {"end": "x", "lag_days": lag}, 32.3) == []
+
+
+def test_band_lag_silent_without_span():
+    assert band_lag_warnings({}, None, 32.3) == []
+
+
+def test_band_lag_fires_and_is_yellow():
+    """AMZN 实测形态：滞后 395 天、现价 32.3x 落在带内第 82 百分位——
+    此前只有跌出 P10/P90 才提示，带内一声不吭。"""
+    (lv, msg), = band_lag_warnings(
+        {"trailing_nolag": _TN}, {"end": "2025-07-31", "lag_days": 395}, 32.3)
+    assert lv == "yellow"
+    assert "2025-07-31" in msg and "395 天" in msg
+    assert "32.3x" in msg
+    assert "不是数据缺失" in msg          # 明说这不是 bug，别去"修"它
+    assert "最近一年的倍数完全不在这个分布里" in msg
+
+
+def test_band_lag_quotes_blind_window():
+    (_, msg), = band_lag_warnings(
+        {"trailing_nolag": _TN}, {"end": "2025-07-31", "lag_days": 395}, 32.3)
+    assert "2025-08-01~2026-07-30" in msg and "250 天" in msg
+    assert "32.6x" in msg                              # 盲区 trailing P50
+    assert "不可直接相减" in msg                        # 口径差必须写明
+
+
+def test_band_lag_without_nolag_reference():
+    """没有无滞后对照时只报滞后本身，不硬凑一个数。"""
+    (_, msg), = band_lag_warnings({}, {"end": "2025-07-31", "lag_days": 395}, 32.3)
+    assert "395 天" in msg and "盲区" not in msg
+
+
+def test_band_lag_handles_missing_now_pe():
+    (_, msg), = band_lag_warnings({}, {"end": "2025-07-31", "lag_days": 395}, None)
+    assert "带内分位是" in msg          # 不渲染 "（现价 Nonex）"
+
+
+@pytest.mark.parametrize("band,span,now", [
+    ({"trailing_nolag": _TN}, {"end": "2025-07-31", "lag_days": 395}, 32.3),
+    ({}, {"end": "2025-07-31", "lag_days": 999}, None),
+])
+def test_band_lag_never_red(band, span, now):
+    assert all(lv == "yellow" for lv, _ in band_lag_warnings(band, span, now))

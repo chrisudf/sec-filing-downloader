@@ -141,6 +141,41 @@ def vintage_warnings(cfg, vintage):
                           if declared else
                           "期后资本事件未声明，请核对增发/回购/并购/分拆/分红后填写")]]
 
+def band_lag_warnings(band, span, now_pe, min_lag=270):
+    """PE 带子滞后的时效提示 -> [[level, msg], ...]。
+
+    已实现 NTM PE 的分母是**未来 12 个月真的发生的 EPS**，必须等它发生：
+    最后可算日 ≈ 最新已披露季末 − 365，所以 ntm 口径的滞后天然在一年上下
+    （2026-08-31 实测 AMZN 395 天、KO 404、AAPL 305）。**这不是 bug，改不掉。**
+
+    但读者拿到的是"现价隐含 32.3x 落在带内第 82 百分位"这种看起来很确定的
+    结论，而带子恰好看不见最近一年。此前只有现价跌出 P10/P90 时才提示去看
+    无滞后对照，落在带内（最常见的情形）反而一声不吭——AMZN 2026-08-30 那份
+    报告整篇只有一条"方法离散度"黄旗，395 天只出现在交易区间正文里。
+
+    纯函数，便于按 test_pure 的 ast 抽取手法直接单测。
+    """
+    sp = span or {}
+    lag = sp.get("lag_days")
+    if not lag or lag <= min_lag:
+        return []
+    tn = (band or {}).get("trailing_nolag") or {}
+    gap = tn.get("gap_since_main_band") or {}
+    pos = f"（现价 {now_pe:.1f}x）" if now_pe else ""
+    msg = (f"交易区间的带子止于 {sp.get('end', '?')}（滞后 {lag} 天）——"
+           "已实现 NTM PE 要等未来 12 个月的盈利真的发生，滞后约一年是口径本身的"
+           "下限、不是数据缺失。含义：**最近一年的倍数完全不在这个分布里**，"
+           f"带内分位{pos}是拿一年前的分布给今天定位。")
+    if gap.get("p50"):
+        p50s = {str(k): v for k, v in (tn.get("pctiles") or {}).items()}.get("50")
+        g_sp = gap.get("span") or {}
+        msg += (f" 盲区 {g_sp.get('start', '?')}~{g_sp.get('end', '?')}"
+                f"（{gap.get('days', '?')} 天）的 trailing P50 为 {gap['p50']:.1f}x")
+        if p50s:
+            msg += f"，同期无滞后 trailing 带 P50 {float(p50s):.1f}x"
+        msg += "（trailing 分母是过去 12 个月，与主带差一个增长率，不可直接相减）"
+    return [["yellow", msg]]
+
 VINTAGE = _vintage(manifest, cfg["date"])
 # PENDING_10Q（业绩 8-K 已出、10-Q 未交）：本次运行的判断层已被强制按新闻稿滚动
 # TTM（ttm_revenue_override），估的是 8-K 覆盖的那个季度——vintage 归档键若仍用
@@ -640,6 +675,7 @@ if (not _base_pe_nm and not _band.get("thin_coverage")
     # 此时目标价的涨幅几乎全部押在"倍数回到中枢"，而带子恰好看不见最近一年
     # 究竟发生了什么（滞后 span.lag_days 天）。
     _trw = out["trading_range"]
+    out["scenarios"]["base"]["warnings"] += band_lag_warnings(_band, _trw.get("span"), _now_pe)
     if _now_pe and (_now_pe < _tr_pe["10"] or _now_pe > _tr_pe["90"]):
         _side = "跌出下沿 P10" if _now_pe < _tr_pe["10"] else "冲破上沿 P90"
         _sp = _trw.get("span") or {}
