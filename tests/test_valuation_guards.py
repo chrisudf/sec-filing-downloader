@@ -4,11 +4,25 @@
 回归对象是 INTC 2026-08-30 那次真实运行：net_cash 停在旧报告期 → bear 的 P/FCF
 红旗是假的 → gate 打回后判断层上修 bear.margins 越过 base → 自相矛盾的假设发货。
 """
+import ast
 import copy
+from pathlib import Path
 
 import pytest
 
 from app.valuation_service import _validate_judgment
+
+# ---- 按 test_pure.py 的手法，从生产源码逐字抽出 vintage_warnings 再 exec。
+# engine.py 是模块级脚本（import 即执行、要 sys.argv），不能直接 import；
+# 抽函数保证测的是生产代码本体，不是副本。
+_ENG = Path(__file__).resolve().parent.parent / "valuation" / "engine.py"
+_SRC = _ENG.read_text(encoding="utf-8")
+_SEG = [ast.get_source_segment(_SRC, n) for n in ast.parse(_SRC).body
+        if isinstance(n, ast.FunctionDef) and n.name == "vintage_warnings"]
+assert len(_SEG) == 1, _SEG
+_NS = {}
+exec(_SEG[0], _NS)
+vintage_warnings = _NS["vintage_warnings"]
 
 
 def _mk(**over):
@@ -100,3 +114,154 @@ def test_ppce_valid_shapes(val):
 def test_ppce_invalid_shapes(bad, msg):
     with pytest.raises(ValueError, match=msg):
         _validate_judgment(_mk(post_period_capital_events=bad), "standard")
+
+
+# =====================================================================
+# fix#2 / fix#3'：vintage_warnings —— 报告期口径 vs 当前值的时点一致性
+# =====================================================================
+
+def _cfg(shares=1000.0, fwd_shares=1000.0, net_cash=5000.0, mcap=100000.0, **kw):
+    c = dict(shares=shares, fwd_shares=fwd_shares, net_cash=net_cash, mcap=mcap)
+    c.update(kw)
+    return c
+
+
+def _vt(age=60, end="2026-06-27"):
+    return {"report_end": end, "filed": "2026-07-24", "age_days": age}
+
+
+EVENT = {"date": "2026-08-18", "kind": "增发", "amount_musd": 19700.0, "note": "8-K"}
+
+
+# ---- 不该响的情形 ----
+
+@pytest.mark.parametrize("age", [None, 0, 45])
+def test_fresh_or_unknown_age_silent(age):
+    """龄 <=45 或未知 -> 不出声。阈值是 >45，45 本身不触发。"""
+    assert vintage_warnings(_cfg(), _vt(age=age)) == []
+
+
+def test_missing_vintage_silent():
+    assert vintage_warnings(_cfg(), {}) == []
+    assert vintage_warnings(_cfg(), None) == []
+
+
+# ---- 声明了事件：列出来，不再唠叨 ----
+
+def test_declared_event_listed_with_mcap_share():
+    (lv, msg), = vintage_warnings(
+        _cfg(net_cash=-1100.0, mcap=475500.0, post_period_capital_events=[EVENT]), _vt(age=64))
+    assert lv == "yellow"
+    assert "期后资本事件已声明" in msg and "+19,700M" in msg
+    assert "4.1%" in msg or "4.2%" in msg          # 19700/475500
+    assert "2026-08-18 增发" in msg
+
+
+def test_declared_event_wins_over_fresh_age():
+    """事件优先于龄：即使报告很新，声明了就该列出来。"""
+    out = vintage_warnings(_cfg(post_period_capital_events=[EVENT]), _vt(age=3))
+    assert len(out) == 1 and "期后资本事件已声明" in out[0][1]
+
+
+def test_declared_event_zero_mcap_no_zerodiv():
+    out = vintage_warnings(_cfg(mcap=0, post_period_capital_events=[EVENT]), _vt(age=64))
+    assert len(out) == 1 and "占市值" not in out[0][1]
+
+
+def test_declared_events_netted():
+    """多笔事件取净额：增发 +200 与回购 −50 净 +150。"""
+    evs = [dict(EVENT, amount_musd=200.0),
+           dict(EVENT, kind="回购", amount_musd=-50.0)]
+    (_, msg), = vintage_warnings(_cfg(post_period_capital_events=evs), _vt(age=64))
+    assert "净 +150M" in msg
+
+
+# ---- 股数/现金自相矛盾：可机械证明的那条 ----
+
+def test_buyback_modeled_but_cash_not_flags_overvaluation():
+    """AAPL 实测形态：股数侧减了 155M（建模回购），net_cash 停在报告期没扣。"""
+    (lv, msg), = vintage_warnings(
+        _cfg(shares=14715.0, fwd_shares=14560.0, net_cash=62173.0,
+             post_period_capital_events=[]), _vt(age=65))
+    assert lv == "yellow"
+    assert "时点不一致" in msg and "已建模净回购" in msg
+    assert "系统性**高估**" in msg
+    assert "声明为空，与股数侧的假设矛盾" in msg
+
+
+def test_issuance_modeled_but_cash_not_flags_undervaluation():
+    """INTC 实测形态：fwd_shares 含增发新股，net_cash 未含增发现金。"""
+    (lv, msg), = vintage_warnings(
+        _cfg(shares=5104.0, fwd_shares=5300.0, net_cash=-20000.0), _vt(age=64))
+    assert lv == "yellow"
+    assert "已建模净增发" in msg and "系统性**低估**" in msg
+    assert "请在 post_period_capital_events 里声明" in msg
+
+
+def test_empty_declaration_does_not_silence_inconsistency():
+    """声明 [] 不是静默开关 —— 这正是第一版设计的洞（AAPL 抓到）。"""
+    c = _cfg(shares=14715.0, fwd_shares=14560.0, post_period_capital_events=[])
+    assert vintage_warnings(c, _vt(age=65)) != []
+
+
+@pytest.mark.parametrize("fwd,fires", [
+    (1000.0, False),   # 无差
+    (995.0, False),    # 差 0.5%，阈值是**严格大于**，不触发
+    (994.9, True),     # 刚过阈值
+    (1005.1, True),    # 增发方向同样过阈值
+])
+def test_share_delta_threshold(fwd, fires):
+    (_, msg), = vintage_warnings(_cfg(fwd_shares=fwd), _vt(age=60))
+    assert ("时点不一致" in msg) is fires
+
+
+def test_zero_shares_no_zerodiv():
+    out = vintage_warnings(_cfg(shares=0.0, fwd_shares=100.0), _vt(age=60))
+    assert len(out) == 1 and "时点不一致" not in out[0][1]
+
+
+# ---- 分红盲区：股数不动也要提示（KO 抓到） ----
+
+def test_dividend_blindspot_declared_empty_still_warns():
+    """KO 实测形态：股数只降 0.21%（不触发机械检查），但分红持续流出。"""
+    (lv, msg), = vintage_warnings(
+        _cfg(shares=4314.0, fwd_shares=4305.0, net_cash=-29500.0,
+             post_period_capital_events=[]), _vt(age=59, end="2026-07-03"))
+    assert lv == "yellow"
+    assert "报告期末已 59 天" in msg
+    assert "分红不改股数" in msg and "机械检查看不见它" in msg
+
+
+def test_undeclared_asks_to_declare():
+    (_, msg), = vintage_warnings(_cfg(), _vt(age=60))
+    assert "期后资本事件未声明" in msg and "分红" in msg
+
+
+@pytest.mark.parametrize("age,severe", [(60, False), (100, False), (101, True)])
+def test_severe_staleness_wording(age, severe):
+    (_, msg), = vintage_warnings(_cfg(), _vt(age=age))
+    assert ("严重滞后" in msg) is severe
+
+
+# ---- 最关键的不变量 ----
+
+@pytest.mark.parametrize("cfg,vt", [
+    (_cfg(), _vt(age=60)),
+    (_cfg(), _vt(age=400)),
+    (_cfg(shares=14715.0, fwd_shares=14560.0), _vt(age=65)),
+    (_cfg(shares=5104.0, fwd_shares=5300.0), _vt(age=64)),
+    (_cfg(post_period_capital_events=[EVENT]), _vt(age=64)),
+    (_cfg(post_period_capital_events=[]), _vt(age=59)),
+])
+def test_never_red(cfg, vt):
+    """绝不能是 red：red 会把这条打回判断层，而它是数据事实不是假设——
+    判断层能"修"它的唯一途径就是扭曲假设，那正是本护栏要防的那条级联的成因。"""
+    assert all(lv == "yellow" for lv, _ in vintage_warnings(cfg, vt))
+
+
+def test_at_most_one_warning():
+    """每次最多出一条，避免红旗区被同一件事刷屏。"""
+    for cfg, vt in [(_cfg(), _vt(age=60)),
+                    (_cfg(shares=14715.0, fwd_shares=14560.0), _vt(age=65)),
+                    (_cfg(post_period_capital_events=[EVENT]), _vt(age=64))]:
+        assert len(vintage_warnings(cfg, vt)) <= 1
