@@ -107,12 +107,39 @@ def vintage_warnings(cfg, vintage, dividends_quarterly=None):
     end = vt.get("report_end", "?")
 
     if ppce:
-        net = sum(float(e.get("amount_musd") or 0) for e in ppce)
-        desc = "；".join(
-            f"{e.get('date', '?')} {e.get('kind', '?')} {float(e.get('amount_musd') or 0):+,.0f}M"
-            for e in ppce)
-        return [["yellow", f"期后资本事件已声明（净 {net:+,.0f}M"
-                           + (f"，占市值 {abs(net) / mcap:.1%}" if mcap else "") + f"）：{desc}。"
+        # amount_musd 是**现金流向**，不等于对 net_cash（现金−负债）的影响：
+        # 发债现金 +25,000 而债务同增，净现金影响是 0。首版把两者混为一谈，
+        # AMZN 2026-08-31 实测印出"净 +3,700M"（= 25,000 − 21,300），
+        # 而真实的 net_cash 变化是 −21,300（判断层自己算对了，是警告在裸求和）。
+        # 所以净额只认判断层显式给的 net_cash_impact_musd；缺了就不假装能算，
+        # 明说这是现金流向合计。——"这笔钱对净现金影响多少"本身就是判断，
+        # 不该由引擎按 kind 去猜（同 post_period_capital_events 的原始裁决）。
+        def _amt(e):
+            return float(e.get("amount_musd") or 0)
+
+        def _impact(e):
+            v = e.get("net_cash_impact_musd")
+            return float(v) if isinstance(v, (int, float)) else None
+
+        missing = [e for e in ppce if _impact(e) is None]
+        parts = []
+        for e in ppce:
+            seg = f"{e.get('date', '?')} {e.get('kind', '?')} {_amt(e):+,.0f}M"
+            imp = _impact(e)
+            # 只在两者不一致时并列，避免每条都拖一个重复数字
+            if imp is not None and round(imp) != round(_amt(e)):
+                seg += f"（净现金 {imp:+,.0f}M）"
+            parts.append(seg)
+        desc = "；".join(parts)
+        if missing:
+            head = (f"现金流向合计 {sum(_amt(e) for e in ppce):+,.0f}M"
+                    f"——{len(missing)}/{len(ppce)} 笔未给 net_cash_impact_musd，"
+                    "**不等于净现金影响**（发债即现金增、债务同增、净现金不变）")
+        else:
+            net = sum(_impact(e) for e in ppce)
+            head = (f"对净现金影响 {net:+,.0f}M"
+                    + (f"，占市值 {abs(net) / mcap:.1%}" if mcap else ""))
+        return [["yellow", f"期后资本事件已声明（{head}）：{desc}。"
                            f"请确认 net_cash={cfg['net_cash']:,.0f}M 已把它们算进去——"
                            "引擎不自动调整，net_cash 的最终值由判断层负责"]]
     if age is None or age <= 45:

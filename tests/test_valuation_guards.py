@@ -157,12 +157,24 @@ def test_missing_vintage_silent():
 # ---- 声明了事件：列出来，不再唠叨 ----
 
 def test_declared_event_listed_with_mcap_share():
+    """给了 net_cash_impact_musd 才敢报"对净现金影响"与市值占比——
+    增发的现金流向与净现金影响相同（$19.7B 进来、不增负债）。"""
+    ev = [dict(EVENT, net_cash_impact_musd=19700.0)]
     (lv, msg), = vintage_warnings(
-        _cfg(net_cash=-1100.0, mcap=475500.0, post_period_capital_events=[EVENT]), _vt(age=64))
+        _cfg(net_cash=-1100.0, mcap=475500.0, post_period_capital_events=ev), _vt(age=64))
     assert lv == "yellow"
     assert "期后资本事件已声明" in msg and "+19,700M" in msg
+    assert "对净现金影响" in msg
     assert "4.1%" in msg or "4.2%" in msg          # 19700/475500
     assert "2026-08-18 增发" in msg
+
+
+def test_declared_event_without_impact_has_no_mcap_share():
+    """缺字段时连市值占比都不给——占市值多少本来就是净现金口径的问题。"""
+    (_, msg), = vintage_warnings(
+        _cfg(net_cash=-1100.0, mcap=475500.0, post_period_capital_events=[EVENT]),
+        _vt(age=64))
+    assert "现金流向合计" in msg and "占市值" not in msg
 
 
 def test_declared_event_wins_over_fresh_age():
@@ -177,11 +189,11 @@ def test_declared_event_zero_mcap_no_zerodiv():
 
 
 def test_declared_events_netted():
-    """多笔事件取净额：增发 +200 与回购 −50 净 +150。"""
-    evs = [dict(EVENT, amount_musd=200.0),
-           dict(EVENT, kind="回购", amount_musd=-50.0)]
+    """多笔取净额：增发 +200 与回购 −50，两者现金流向=净现金影响，合计 +150。"""
+    evs = [dict(EVENT, amount_musd=200.0, net_cash_impact_musd=200.0),
+           dict(EVENT, kind="回购", amount_musd=-50.0, net_cash_impact_musd=-50.0)]
     (_, msg), = vintage_warnings(_cfg(post_period_capital_events=evs), _vt(age=64))
-    assert "净 +150M" in msg
+    assert "对净现金影响 +150M" in msg
 
 
 # ---- 股数/现金自相矛盾：可机械证明的那条 ----
@@ -622,3 +634,69 @@ def test_margins_floor_prefers_current_over_history():
     d = _mk(bear={"margins": [0.01] + [0.02] * 9})
     with pytest.raises(ValueError, match=r"0.4×当前 TTM FCF 利润率"):
         _validate_judgment(d, "standard", fcf_margin=0.10, hist_fcf_margin=0.02)
+
+
+# =====================================================================
+# ppce 净额口径：amount_musd 是现金流向，net_cash_impact_musd 才是对
+# net_cash(现金−负债) 的影响。AMZN 2026-08-31 实测：发债现金 +25,000、债务同增、
+# 净现金 0；首版裸求和印出"净 +3,700M"，而真实变化是 -21,300。
+# =====================================================================
+
+DEBT = {"date": "2026-07-01", "kind": "发债", "amount_musd": 25000.0, "note": "10-Q"}
+BUY = {"date": "2026-07-01", "kind": "并购", "amount_musd": -21300.0, "note": "10-Q"}
+
+
+def test_ppce_without_impact_field_says_cashflow_not_netcash():
+    """缺字段时不装能算：把合计标成现金流向，并点名发债这个反例。"""
+    (_, msg), = vintage_warnings(
+        _cfg(post_period_capital_events=[DEBT, BUY]), _vt(age=62))
+    assert "现金流向合计 +3,700M" in msg
+    assert "2/2 笔未给 net_cash_impact_musd" in msg
+    assert "不等于净现金影响" in msg
+    assert "对净现金影响" not in msg          # 不许冒充净现金
+
+
+def test_ppce_with_impact_field_reports_real_netcash_delta():
+    """AMZN 真实形态：发债净现金 0、并购 -21,300 -> 合计 -21,300，
+    与 net_cash 从 -9,236 调到 -30,536 完全吻合。"""
+    ev = [dict(DEBT, net_cash_impact_musd=0.0),
+          dict(BUY, net_cash_impact_musd=-21300.0)]
+    (_, msg), = vintage_warnings(
+        _cfg(net_cash=-30536.0, mcap=2900000.0,
+             post_period_capital_events=ev), _vt(age=62))
+    assert "对净现金影响 -21,300M" in msg
+    assert "现金流向合计" not in msg
+
+
+def test_ppce_shows_both_only_when_they_differ():
+    """一致的那条不拖重复数字，避免每行都挂个括号。"""
+    ev = [dict(DEBT, net_cash_impact_musd=0.0),
+          dict(BUY, net_cash_impact_musd=-21300.0)]
+    (_, msg), = vintage_warnings(_cfg(post_period_capital_events=ev), _vt(age=62))
+    assert "+25,000M（净现金 +0M）" in msg      # 发债：两者不同 -> 并列
+    assert "-21,300M（净现金" not in msg        # 并购：两者相同 -> 不并列
+
+
+def test_ppce_partial_impact_field_is_not_summed():
+    """只给了一半就不能当净现金合计用——半可信比不可信更危险。"""
+    ev = [dict(DEBT, net_cash_impact_musd=0.0), BUY]
+    (_, msg), = vintage_warnings(_cfg(post_period_capital_events=ev), _vt(age=62))
+    assert "1/2 笔未给" in msg and "现金流向合计" in msg
+
+
+def test_ppce_impact_zero_is_not_treated_as_missing():
+    """0 是合法的净现金影响（发债的正确答案），不能被当成"没给"。"""
+    ev = [dict(DEBT, net_cash_impact_musd=0.0)]
+    (_, msg), = vintage_warnings(_cfg(post_period_capital_events=ev), _vt(age=62))
+    assert "对净现金影响 +0M" in msg and "未给" not in msg
+
+
+def test_ppce_impact_must_be_numeric():
+    ev = [dict(DEBT, net_cash_impact_musd="中性")]
+    with pytest.raises(ValueError, match=r"net_cash_impact_musd 必须是数字"):
+        _validate_judgment(_mk(post_period_capital_events=ev), "standard")
+
+
+def test_ppce_impact_is_optional():
+    """既有 config 没有这个字段，不能因此全挂。"""
+    _validate_judgment(_mk(post_period_capital_events=[DEBT, BUY]), "standard")
