@@ -110,7 +110,8 @@ def _check_rev_override(d: dict) -> None:
 def _validate_judgment(d: dict, mode: str = "standard",
                        rev0: float | None = None,
                        fcf_margin: float | None = None,
-                       band: dict | None = None) -> None:
+                       band: dict | None = None,
+                       hist_fcf_margin: float | None = None) -> None:
     """LLM 输出的硬校验：结构、边界、margins 长度。不合格直接拒绝重试。
 
     v2（semantics_version=2, 2026-07-22）新增：
@@ -300,14 +301,23 @@ def _validate_judgment(d: dict, mode: str = "standard",
                     raise ValueError(
                         f"bull 双重计数：情景盈利已较 base 扩张至 {r_bull:.0%}，{key} 又 "
                         f"> 1.4×base——景气顶点市场收敛倍数而非扩张。请下调 bull.{key}")
+    # 锚的选择（2026-08-31）：capex 周期股的当期 FCF 可以为负（AMZN TTM −1.5%），
+    # 原写法 `fcf_margin > 0.02` 不成立就**整条规则跳过**——而 FCF 为负恰恰是 DCF
+    # 最不可靠的时候，护栏在最需要它的时候关掉了。负/近零时退到历史年度中位数
+    # （AMZN 八个财年中位 5.4%），两者都不可用才真正放行。
+    anchor, anchor_src = None, ""
     if fcf_margin and fcf_margin > 0.02:
-        floor = 0.4 * fcf_margin
+        anchor, anchor_src = fcf_margin, "当前 TTM FCF 利润率"
+    elif hist_fcf_margin and hist_fcf_margin > 0.02:
+        anchor, anchor_src = hist_fcf_margin, "历史年度 FCF 利润率中位"
+    if anchor:
+        floor = 0.4 * anchor
         for n in ("bear", "base", "bull"):
             s = d["scenarios"][n]
             if min(s["margins"]) < floor and not _exempt(s):
                 raise ValueError(
-                    f"{n}.margins 谷底 {min(s['margins']):.0%} < 0.4×当前 TTM FCF 利润率"
-                    f"({fcf_margin:.0%})——比腰斩更深的常态化路径属于永久受损假设，"
+                    f"{n}.margins 谷底 {min(s['margins']):.0%} < 0.4×{anchor_src}"
+                    f"({anchor:.0%})——比腰斩更深的常态化路径属于永久受损假设，"
                     "请抬高谷底或设 permanent_impairment=true + impairment_note")
 
 
@@ -948,6 +958,19 @@ async def _pipeline(job: dict, ticker: str, email: str) -> None:
     fcfm = None
     if mode == "standard":
         fcfm = (ttm["cfo"]["value"] - ttm["capex"]["value"]) / ttm["revenue"]["value"]
+    # 负/近零 TTM FCF 时 margins 谷底护栏的备用锚：历史年度 FCF 利润率中位。
+    # 与 engine.hist_fcf_margins 同口径（年度 CFO−capex / 营收），此处只取中位数。
+    hist_fcfm = None
+    _hm = []
+    for k in sorted(facts.get("revenue_annual") or {}):
+        _r = (facts.get("revenue_annual") or {}).get(k)
+        _c = (facts.get("cfo_annual") or {}).get(k)
+        _x = (facts.get("capex_annual") or {}).get(k)
+        if all(isinstance(v, (int, float)) for v in (_r, _c, _x)) and _r:
+            _hm.append((_c - _x) / _r)
+    if _hm:
+        _hm = sorted(_hm[-10:])
+        hist_fcfm = _hm[len(_hm) // 2]
     judgment = None
     last_err = ""
     last_raw = ""
@@ -965,7 +988,8 @@ async def _pipeline(job: dict, ticker: str, email: str) -> None:
             judgment = _parse_json(raw)
             _validate_judgment(judgment, mode,
                                rev0=float(judgment.get("ttm_revenue_override") or rev0_m),
-                               fcf_margin=fcfm, band=facts.get("pe_band"))
+                               fcf_margin=fcfm, band=facts.get("pe_band"),
+                               hist_fcf_margin=hist_fcfm)
             # 陈旧 XBRL（外国发行人 6-K 无季度框架）下，没有原文重锚的 TTM 会让
             # 全部情景锚在多年前的营收基准上——硬性要求判断层给 override。
             # PENDING_10Q（业绩 8-K 已出、10-Q 未交）同理：不重锚等于用上季度
@@ -1056,7 +1080,8 @@ async def _pipeline(job: dict, ticker: str, email: str) -> None:
             revised = _parse_json(await _claude(retry_p))
             _validate_judgment(revised, mode,
                                rev0=float(revised.get("ttm_revenue_override") or rev0_m),
-                               fcf_margin=fcfm, band=facts.get("pe_band"))
+                               fcf_margin=fcfm, band=facts.get("pe_band"),
+                               hist_fcf_margin=hist_fcfm)
             # 陈旧 XBRL / PENDING_10Q 的强制 override 在复审通道同样成立——revised
             # 整体替换 judgment，若复审输出丢掉 override，全部情景会锚回旧营收基准
             if ((stale_days > 550 or pending_8k)

@@ -20,13 +20,17 @@ _SRC = _ENG.read_text(encoding="utf-8")
 _SEG = [ast.get_source_segment(_SRC, n) for n in ast.parse(_SRC).body
         if isinstance(n, ast.FunctionDef)
         and n.name in ("vintage_warnings", "band_lag_warnings",
-                       "other_income_crosscheck")]
-assert len(_SEG) == 3, _SEG
+                       "other_income_crosscheck", "hist_fcf_margins",
+                       "terminal_margin_warnings", "terminal_sensitivity")]
+assert len(_SEG) == 6, _SEG
 _NS = {}
 exec(chr(10).join(_SEG), _NS)
 vintage_warnings = _NS["vintage_warnings"]
 band_lag_warnings = _NS["band_lag_warnings"]
 other_income_crosscheck = _NS["other_income_crosscheck"]
+hist_fcf_margins = _NS["hist_fcf_margins"]
+terminal_margin_warnings = _NS["terminal_margin_warnings"]
+terminal_sensitivity = _NS["terminal_sensitivity"]
 
 
 def _mk(**over):
@@ -508,3 +512,113 @@ def test_other_income_note_required():
 def test_other_income_note_accepted():
     _validate_judgment(_mk(other_income_note="10-Q Interest and other, net，剔除 X"),
                        "standard")
+
+
+# =====================================================================
+# DCF 终值护栏 —— 起因见 AMZN：TTM FCF 为负时，四道 DCF 护栏里两道自动失效
+#   dcf_equity_over_ttm_fcf  -> 算不出，整条跳过
+#   margins 谷底 >= 0.4xTTM   -> fcf_margin > 0.02 不成立，整条跳过
+# 而 FCF 为负恰恰是 DCF 最不可靠的时候。
+# =====================================================================
+
+AMZN_HIST = [("2016-12-31", .069), ("2017-12-31", .036), ("2018-12-31", .074),
+             ("2019-12-31", .077), ("2020-12-31", .067), ("2021-12-31", -.031),
+             ("2022-12-31", -.033), ("2023-12-31", .056), ("2024-12-31", .052),
+             ("2025-12-31", .011)]
+
+
+def _scen(bear=.06, base=.09, bull=.12):
+    return {n: {"margins": [0.0] * 9 + [m]}
+            for n, m in (("bear", bear), ("base", base), ("bull", bull))}
+
+
+def test_hist_fcf_margins_intersects_three_series():
+    f = {"revenue_annual": {"2024-12-31": 100.0, "2025-12-31": 200.0},
+         "cfo_annual": {"2024-12-31": 30.0, "2025-12-31": 50.0},
+         "capex_annual": {"2024-12-31": 10.0}}          # 2025 缺 capex
+    assert hist_fcf_margins(f) == [("2024-12-31", 0.2)]
+
+
+def test_hist_fcf_margins_empty_when_no_data():
+    assert hist_fcf_margins({}) == []
+    assert hist_fcf_margins(None) == []
+
+
+def test_terminal_margin_flags_above_recent_peak():
+    """AMZN 实测：base 终值 9% > 近十年峰值 7.7%。"""
+    out = terminal_margin_warnings(AMZN_HIST, _scen())
+    names = [m for _, m in out]
+    assert len(out) == 2                                   # base 与 bull，bear 6% 不响
+    assert "base 终值 FCF 利润率 9%" in names[0] and "8%" in names[0]
+    assert "bull 终值 FCF 利润率 12%" in names[1] and "1.56 倍" in names[1]
+    assert all(lv == "yellow" for lv, _ in out)
+
+
+def test_terminal_margin_window_excludes_old_regime():
+    """全 19 年含 2009 的 11.9%（营收 $24B、AWS 未成型、capex 极轻的另一家公司），
+    拿它当 2036 年的锚会让 base 9% 静默通过 —— 必须只看近十年。"""
+    old = [("2009-12-31", .119)] + AMZN_HIST
+    assert len(terminal_margin_warnings(old, _scen(), window=10)) == 2
+    assert terminal_margin_warnings(old, _scen(), window=99) == []   # 用全历史就漏报
+
+
+def test_terminal_margin_tolerance_kills_rounding_false_positive():
+    """AAPL 实测：bear 0.2800 vs 峰值 0.2799 会渲染成 "28% 高于 28%"。
+    四舍五入造出的假阳性比漏报更伤信任。"""
+    hist = [("20%02d-12-31" % i, .2799) for i in range(10)]
+    assert terminal_margin_warnings(hist, _scen(bear=.28, base=.28, bull=.28)) == []
+    out = terminal_margin_warnings(hist, _scen(bear=.28, base=.31, bull=.33))
+    assert len(out) == 2
+
+
+def test_terminal_margin_silent_without_history():
+    assert terminal_margin_warnings([], _scen()) == []
+
+
+def test_terminal_sensitivity_fires_above_gate():
+    """AMZN 实测：终值占 EV 74%，终值 9%±2pp -> 每股 133/161/189。"""
+    m = [0.0] * 9 + [0.09]
+
+    def f(mm):
+        # 敏感性必须**只动第 10 年**：整条路径一起缩放，测的就不是"终值那一个
+        # 数字值多少钱"了。假 dcf_fn 若只看 mm[-1] 分辨不出这个区别（变异
+        # 「只动第10年改成整条缩放」曾因此逃掉），所以在这里把前九年钉死。
+        assert list(mm[:-1]) == m[:-1], "前九年不得改动"
+        return {0.07: 133.0, 0.09: 161.0, 0.11: 189.0}[round(mm[-1], 2)]
+
+    (lv, msg), = terminal_sensitivity(f, 0.74, m, 161.0)
+    assert lv == "yellow"
+    assert "74%" in msg and "133 / 161 / 189" in msg and "±17%" in msg
+
+
+@pytest.mark.parametrize("share", [None, 0.5, 0.65])
+def test_terminal_sensitivity_silent_below_gate(share):
+    """阈值 65%，等于不触发（严格大于）。不动 tv_pv_share 原有的 75% 红旗线——
+    三档 72-74% 不是漏网，是 wacc-tg=6% 下终值倍数 16.7x 的数学必然。"""
+    m = [0.0] * 9 + [0.09]
+    assert terminal_sensitivity(lambda mm: 100.0, share, m, 161.0) == []
+
+
+def test_terminal_sensitivity_silent_without_base_ps():
+    m = [0.0] * 9 + [0.09]
+    assert terminal_sensitivity(lambda mm: 100.0, 0.9, m, None) == []
+    assert terminal_sensitivity(lambda mm: None, 0.9, m, 161.0) == []
+
+
+# ---- margins 谷底护栏：负 FCF 时退到历史中位，而不是整条跳过 ----
+
+def test_margins_floor_falls_back_to_history_when_fcf_negative():
+    """AMZN 形态：TTM FCF 率 -1.5% -> 原写法 `fcf_margin > 0.02` 不成立就整条
+    跳过。退到历史中位 5.4% 后，0.4x = 2.2% 的谷底门槛重新生效。"""
+    # bear 路径必须仍然逐年 <= base（否则先被情景排序拦下，测不到谷底护栏）
+    d = _mk(bear={"margins": [-0.10] + [0.02] * 9})
+    _validate_judgment(d, "standard", fcf_margin=-0.015)          # 无历史 -> 放行
+    with pytest.raises(ValueError, match=r"0.4×历史年度 FCF 利润率中位"):
+        _validate_judgment(d, "standard", fcf_margin=-0.015, hist_fcf_margin=0.054)
+
+
+def test_margins_floor_prefers_current_over_history():
+    """当期 FCF 率可用时以它为准，历史只是备用锚。"""
+    d = _mk(bear={"margins": [0.01] + [0.02] * 9})
+    with pytest.raises(ValueError, match=r"0.4×当前 TTM FCF 利润率"):
+        _validate_judgment(d, "standard", fcf_margin=0.10, hist_fcf_margin=0.02)
