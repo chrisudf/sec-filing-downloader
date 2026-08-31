@@ -75,7 +75,7 @@ def _vintage(manifest_text, run_date):
         return {}
 
 
-def vintage_warnings(cfg, vintage):
+def vintage_warnings(cfg, vintage, dividends_quarterly=None):
     """报告期口径 与 当前值 混用的时点一致性护栏 -> [[level, msg], ...]。
 
     net_cash 与整张资产负债表停在 report_end，而 fwd_shares / price 是当前值。
@@ -89,6 +89,13 @@ def vintage_warnings(cfg, vintage):
 
     **一律 yellow，绝不 red**：red 会把这条打回判断层，而它是*数据事实*不是假设，
     判断层能"修"它的唯一途径就是扭曲假设——那正是上面那条级联的成因。
+
+    dividends_quarterly：facts 里的季度分红序列。分红是股数差检查唯一的盲区
+    （分红不改股数），所以近四季有没有分红决定文案分叉——对不分红的标的
+    （AMZN 实测该序列为空、INTC 2024-08 起停发）再提"请确认分红流出"是噪音。
+    判据放在函数内而不是调用点，接线才一起被测到（此前调用点恒传 True
+    的变异逃过了全部用例）。措辞用"未见分红记录"而非"无分红"：这是证据不是
+    事实断言——抽取真出洞时不该由这条替它打包票。
 
     纯函数（不读全局、不写 out），便于按 test_pure 的 ast 抽取手法直接单测。
     """
@@ -133,13 +140,22 @@ def vintage_warnings(cfg, vintage):
     # 机械检查对纯分红股完全失明。KO 2026-08-31 实测：股数只降 0.21%（低于阈值，
     # 不触发），但季度分红 $2.28B、龄 59 天 ≈ $1.5B 已流出 net_cash=-29,500M 却没扣，
     # 占净负债 5%。所以这条不设静默开关。
+    _dq = dividends_quarterly or {}
+    _pays_div = any(v for _, v in sorted(_dq.items())[-4:])
+    if not declared:
+        tail_msg = "期后资本事件未声明，请核对增发/回购/并购/分拆/分红后填写"
+    elif _pays_div:
+        tail_msg = ("期后资本事件已声明为无——但分红不改股数，"
+                    "机械检查看不见它，请自行确认分红流出是否重大")
+    else:
+        # 两条可自动排除的路径都排除了：股数差不显著（无重大回购/增发）、
+        # 该标的不分红。剩下的只有并购/分拆/发债偿债——它们既不进股数也不进
+        # 分红，只能靠人看。说清楚"还剩什么"，比笼统提醒更有用。
+        tail_msg = ("期后资本事件已声明为无，且近四季未见分红记录——"
+                    "股数与分红两条路径均已排除，仅剩并购/分拆/发债偿债需人工确认")
     return [["yellow", f"报告期末已 {age} 天"
                        + ("（>100 天，严重滞后）" if age > 100 else "")
-                       + f"，net_cash={cfg['net_cash']:,.0f}M 仍是 {end} 口径；"
-                       + ("期后资本事件已声明为无——但分红不改股数，"
-                          "机械检查看不见它，请自行确认分红流出是否重大"
-                          if declared else
-                          "期后资本事件未声明，请核对增发/回购/并购/分拆/分红后填写")]]
+                       + f"，net_cash={cfg['net_cash']:,.0f}M 仍是 {end} 口径；" + tail_msg]]
 
 def band_lag_warnings(band, span, now_pe, min_lag=270):
     """PE 带子滞后的时效提示 -> [[level, msg], ...]。
@@ -582,7 +598,8 @@ if abs(_dev) > 0.35:
         ["yellow", f"base 综合较现价偏离 {_dev:+.0%}（>±35%）——请核对 base 假设"
                    "或在注记中显式说明为何与市场定价分歧"])
 
-out["scenarios"]["base"]["warnings"] += vintage_warnings(cfg, VINTAGE)
+out["scenarios"]["base"]["warnings"] += vintage_warnings(
+    cfg, VINTAGE, facts.get("dividends_quarterly"))
 
 # ---- 价值交易区间：历史已实现 NTM PE 分位 × base 前瞻 EPS ----
 # 与三情景互为对照：情景是「基本面情景各自的公允价」（bear=EPS↓×PE↓ 双压），

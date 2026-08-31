@@ -224,11 +224,54 @@ def test_zero_shares_no_zerodiv():
 
 # ---- 分红盲区：股数不动也要提示（KO 抓到） ----
 
+def test_no_dividend_payer_gets_accurate_wording():
+    """AMZN 实测：不分红、股数差 +0.43%（低于阈值）。两条可自动排除的路径都
+    排除了，再提"请确认分红流出"是噪音——改为说清楚还剩什么需要人看。"""
+    (_, msg), = vintage_warnings(
+        _cfg(shares=10903.0, fwd_shares=10950.0, net_cash=-9236.0,
+             post_period_capital_events=[]), _vt(age=62), {})
+    assert "未见分红记录" in msg
+    assert "仅剩并购/分拆/发债偿债需人工确认" in msg
+    assert "请自行确认分红流出" not in msg
+
+
+DIVQ = {"2025-09-30": 2.2e9, "2025-12-31": 2.3e9,
+        "2026-03-31": 2.3e9, "2026-06-30": 2.4e9}
+
+
+def test_dividend_payer_gets_blindspot_reminder():
+    (_, msg), = vintage_warnings(_cfg(post_period_capital_events=[]), _vt(age=60), DIVQ)
+    assert "分红不改股数" in msg
+
+
+def test_only_last_four_quarters_count():
+    """INTC 形态：有 70 期历史分红，但 2024-08 起停发 —— 看近四季，不看有没有过。"""
+    stopped = {"2023-12-31": 5e8, "2024-03-31": 5e8,
+               "2025-09-30": 0.0, "2025-12-31": 0.0,
+               "2026-03-31": 0.0, "2026-06-30": 0.0}
+    (_, msg), = vintage_warnings(_cfg(post_period_capital_events=[]), _vt(age=60), stopped)
+    assert "未见分红记录" in msg
+
+
+def test_missing_dividend_series_is_not_a_payer_claim():
+    """序列缺失时措辞是"未见记录"而非"无分红"——证据不是事实断言。"""
+    for d in (None, {}):
+        (_, msg), = vintage_warnings(_cfg(post_period_capital_events=[]), _vt(age=60), d)
+        assert "未见分红记录" in msg and "无分红" not in msg
+
+
+def test_dividends_irrelevant_when_undeclared():
+    """未声明时无论分不分红都要求去核对——那条路径还没走过。"""
+    for d in (DIVQ, {}, None):
+        (_, msg), = vintage_warnings(_cfg(), _vt(age=60), d)
+        assert "期后资本事件未声明" in msg
+
+
 def test_dividend_blindspot_declared_empty_still_warns():
     """KO 实测形态：股数只降 0.21%（不触发机械检查），但分红持续流出。"""
     (lv, msg), = vintage_warnings(
         _cfg(shares=4314.0, fwd_shares=4305.0, net_cash=-29500.0,
-             post_period_capital_events=[]), _vt(age=59, end="2026-07-03"))
+             post_period_capital_events=[]), _vt(age=59, end="2026-07-03"), DIVQ)
     assert lv == "yellow"
     assert "报告期末已 59 天" in msg
     assert "分红不改股数" in msg and "机械检查看不见它" in msg
