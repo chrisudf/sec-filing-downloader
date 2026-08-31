@@ -215,3 +215,68 @@ def test_q4_eps_guard_wired_into_build_facts():
     import inspect
     from valuation.fetch_facts import build_facts
     assert "_guard_derived_q4_eps(out)" in inspect.getsource(build_facts)
+
+
+# =====================================================================
+# dividends 的 PaymentsOfOrdinaryDividends 回退（2026-08-31）
+# 实测：PFE **只**标这个标签，主列表两个全空 -> 分红整列 None（0/12 季）。
+# =====================================================================
+
+def test_dividends_fallback_tag_declared():
+    """契约：回退标签走 fill（只补缺），不进主列表——它与主列表口径可能不同
+    （普通股 vs 含优先股，MO 2007 两者差 2 倍），平级合并会让『同期取 filed
+    最新』在两个口径间随机跳。"""
+    assert SPEC["dividends"]["tags"] == ["PaymentsOfDividends",
+                                         "PaymentsOfDividendsCommonStock"]
+    assert SPEC["dividends"]["fill"] == ["PaymentsOfOrdinaryDividends"]
+    assert SPEC["dividends"]["ytd_flow"] is True
+
+
+def test_dividends_fill_covers_empty_main_tags():
+    """PFE 形态：主列表两个标签一条数据都没有，全靠回退标签。"""
+    facts = {"PaymentsOfOrdinaryDividends": F(
+        ("2026-01-01", "2026-03-29", 2445e6, "2026-05-01"))}
+    _, q = assemble_series(facts, "dividends")
+    assert q == {"2026-03-29": 2445e6}
+
+
+def test_dividends_fill_ytd_differencing():
+    """回退标签只有 YTD 帧时也要差分——现金流科目的 10-Q 本来就是财年累计。
+    PFE 的离散季帧只有 18 期，靠差分才补到 72 期、拿到最新季。"""
+    facts = {"PaymentsOfOrdinaryDividends": F(
+        ("2026-01-01", "2026-03-29", 2445e6, "2026-05-01"),
+        ("2026-01-01", "2026-06-28", 4896e6, "2026-08-01"))}
+    _, q = assemble_series(facts, "dividends")
+    assert q["2026-03-29"] == 2445e6
+    assert round(q["2026-06-28"]) == round(4896e6 - 2445e6)   # = 2451e6
+
+
+def test_dividends_no_cross_tag_ytd_differencing():
+    """GOOGL 形态：Q1 只在主标签下、H1 只在回退标签下。跨标签相减得到的是
+    两个口径的差额而不是当季金额 —— 宁可缺一期，不要一个看起来合理的错数。"""
+    facts = {"PaymentsOfDividends": F(
+                 ("2026-01-01", "2026-03-31", 2542e6, "2026-04-30")),
+             "PaymentsOfOrdinaryDividends": F(
+                 ("2026-01-01", "2026-06-30", 5231e6, "2026-07-23"))}
+    _, q = assemble_series(facts, "dividends")
+    assert q == {"2026-03-31": 2542e6}, "不得跨标签差分出 2026-06-30"
+
+
+def test_dividends_fill_never_overwrites():
+    """主列表已有值的期一律不动，回退标签给出不同数也不许覆盖。"""
+    facts = {"PaymentsOfDividends": F(
+                 ("2026-01-01", "2026-03-31", 100e6, "2026-04-30")),
+             "PaymentsOfOrdinaryDividends": F(
+                 ("2026-01-01", "2026-03-31", 999e6, "2026-07-23"))}
+    _, q = assemble_series(facts, "dividends")
+    assert q == {"2026-03-31": 100e6}
+
+
+def test_fill_ytd_differencing_only_for_ytd_flow_items():
+    """非现金流科目（ytd_flow=False）的 fill 不做差分：net_income 的
+    ProfitLoss 回退是离散期口径，差分会算出垃圾。"""
+    assert SPEC["net_income"]["ytd_flow"] is False
+    facts = {"ProfitLoss": F(("2026-01-01", "2026-03-31", 10e6, "2026-04-30"),
+                             ("2026-01-01", "2026-06-30", 25e6, "2026-07-30"))}
+    _, q = assemble_series(facts, "net_income")
+    assert "2026-06-30" not in q or q["2026-06-30"] == 25e6

@@ -75,6 +75,132 @@ def _vintage(manifest_text, run_date):
         return {}
 
 
+def vintage_warnings(cfg, vintage, dividends_quarterly=None):
+    """报告期口径 与 当前值 混用的时点一致性护栏 -> [[level, msg], ...]。
+
+    net_cash 与整张资产负债表停在 report_end，而 fwd_shares / price 是当前值。
+    报告期后的增发/回购/并购/分拆只进股数和股价，不进 net_cash——两个时点混用，
+    龄越大偏差越大，方向随事件而反：
+      增发 = 股数↑已计、现金↑未计 -> 系统性**低估**
+      回购 = 股数↓已计、现金↓未计 -> 系统性**高估**
+    实测（INTC 2026-08-30，龄 64 天）：8/18 完成的 $20B 增发，210.5M 股已进
+    fwd_shares，$19.7B 现金没进 net_cash，净债务少算 4.2% 市值；该偏差又把 bear
+    推出 P/FCF 界外触发假红旗，判断层为消红旗上修 bear.margins，越过 base 破坏排序。
+
+    **一律 yellow，绝不 red**：red 会把这条打回判断层，而它是*数据事实*不是假设，
+    判断层能"修"它的唯一途径就是扭曲假设——那正是上面那条级联的成因。
+
+    dividends_quarterly：facts 里的季度分红序列。分红是股数差检查唯一的盲区
+    （分红不改股数），所以近四季有没有分红决定文案分叉——对不分红的标的
+    （AMZN 实测该序列为空、INTC 2024-08 起停发）再提"请确认分红流出"是噪音。
+    判据放在函数内而不是调用点，接线才一起被测到（此前调用点恒传 True
+    的变异逃过了全部用例）。措辞用"未见分红记录"而非"无分红"：这是证据不是
+    事实断言——抽取真出洞时不该由这条替它打包票。
+
+    纯函数（不读全局、不写 out），便于按 test_pure 的 ast 抽取手法直接单测。
+    """
+    vt = vintage or {}
+    age = vt.get("age_days")
+    declared = "post_period_capital_events" in cfg
+    ppce = cfg.get("post_period_capital_events") or []
+    mcap = cfg.get("mcap") or 0
+    end = vt.get("report_end", "?")
+
+    if ppce:
+        net = sum(float(e.get("amount_musd") or 0) for e in ppce)
+        desc = "；".join(
+            f"{e.get('date', '?')} {e.get('kind', '?')} {float(e.get('amount_musd') or 0):+,.0f}M"
+            for e in ppce)
+        return [["yellow", f"期后资本事件已声明（净 {net:+,.0f}M"
+                           + (f"，占市值 {abs(net) / mcap:.1%}" if mcap else "") + f"）：{desc}。"
+                           f"请确认 net_cash={cfg['net_cash']:,.0f}M 已把它们算进去——"
+                           "引擎不自动调整，net_cash 的最终值由判断层负责"]]
+    if age is None or age <= 45:
+        return []
+
+    # 声明 [] 不足以静默：AAPL 2026-08-31 实测——判断层把 fwd_shares 从 14,715 减到
+    # 14,560（明确建模了净回购），net_cash 却停在报告期 +62,173M 一分没扣，然后写 []
+    # 把警告关掉。10-Q 摆着九个月回购 $62,094M + 分红 $11,778M（约 $24.6B/季）。
+    # 所以不听声明，改看**可机械证明的自相矛盾**：股数侧建模了回购/增发，
+    # 现金侧却用报告期口径——同一件事只记了一半。
+    d = cfg["shares"] - cfg["fwd_shares"]      # >0 净回购，<0 净增发
+    if cfg["shares"] and abs(d) / cfg["shares"] > 0.005:
+        what = "净回购" if d > 0 else "净增发"
+        direction = ("现金流出未从 net_cash 扣除 → 系统性**高估**" if d > 0
+                     else "现金流入未计入 net_cash → 系统性**低估**")
+        tail_msg = ("post_period_capital_events 声明为空，与股数侧的假设矛盾，请复核"
+                    if declared else
+                    "请在 post_period_capital_events 里声明并让 net_cash 反映最终值")
+        return [["yellow", f"时点不一致：fwd_shares {cfg['fwd_shares']:,.0f}M 较报告期股数 "
+                           f"{cfg['shares']:,.0f}M 差 {abs(d):,.0f}M（{abs(d) / cfg['shares']:.1%}，"
+                           f"已建模{what}），但 net_cash={cfg['net_cash']:,.0f}M 仍是 "
+                           f"{end} 口径（龄 {age} 天）——{direction}。" + tail_msg]]
+
+    # 股数差不显著只排除了增发/大额回购，**排不掉分红**——分红不改股数，上面那条
+    # 机械检查对纯分红股完全失明。KO 2026-08-31 实测：股数只降 0.21%（低于阈值，
+    # 不触发），但季度分红 $2.28B、龄 59 天 ≈ $1.5B 已流出 net_cash=-29,500M 却没扣，
+    # 占净负债 5%。所以这条不设静默开关。
+    _dq = dividends_quarterly or {}
+    _pays_div = any(v for _, v in sorted(_dq.items())[-4:])
+    if not declared:
+        tail_msg = "期后资本事件未声明，请核对增发/回购/并购/分拆/分红后填写"
+    elif _pays_div:
+        tail_msg = ("期后资本事件已声明为无——但分红不改股数，"
+                    "机械检查看不见它，请自行确认分红流出是否重大")
+    else:
+        # 两条可自动排除的路径都排除了：股数差不显著（无重大回购/增发）、
+        # 该标的不分红。剩下的只有并购/分拆/发债偿债——它们既不进股数也不进
+        # 分红，只能靠人看。说清楚"还剩什么"，比笼统提醒更有用。
+        tail_msg = ("期后资本事件已声明为无，且近四季未见分红记录——"
+                    "股数与分红两条路径均已排除，仅剩并购/分拆/发债偿债需人工确认")
+    return [["yellow", f"报告期末已 {age} 天"
+                       + ("（>100 天，严重滞后）" if age > 100 else "")
+                       + f"，net_cash={cfg['net_cash']:,.0f}M 仍是 {end} 口径；" + tail_msg]]
+
+def band_lag_warnings(band, span, now_pe, min_lag=270):
+    """PE 带子滞后的时效提示 -> [[level, msg], ...]。
+
+    已实现 NTM PE 的分母是**未来 12 个月真的发生的 EPS**，必须等它发生：
+    最后可算日 ≈ 最新已披露季末 − 365，所以 ntm 口径的滞后天然在一年上下
+    （2026-08-31 实测 AMZN 395 天、KO 404、AAPL 305）。**这不是 bug，改不掉。**
+
+    但读者拿到的是"现价隐含 32.3x 落在带内第 82 百分位"这种看起来很确定的
+    结论，而带子恰好看不见最近一年。此前只有现价跌出 P10/P90 时才提示去看
+    无滞后对照，落在带内（最常见的情形）反而一声不吭——AMZN 2026-08-30 那份
+    报告整篇只有一条"方法离散度"黄旗，395 天只出现在交易区间正文里。
+
+    引哪个数：**盲区的 trailing 中位 + 现价 trailing**。第一版引的是
+    gap_since_main_band.p50 与 trailing_nolag.pctiles[50]，但这两个窗口几乎
+    完全重合（AMZN 实测 2025-08-01~2026-07-30 vs 2025-07-30~2026-07-30），
+    等于拿一段时间跟它自己比，读者只会更困惑。现价 trailing 才是新信息。
+
+    纯函数，便于按 test_pure 的 ast 抽取手法直接单测。
+    """
+    sp = span or {}
+    lag = sp.get("lag_days")
+    if not lag or lag <= min_lag:
+        return []
+    tn = (band or {}).get("trailing_nolag") or {}
+    gap = tn.get("gap_since_main_band") or {}
+    def _num(x):
+        # NaN 守卫：KO/AAPL 实测 trailing_nolag.current 为 NaN，
+        # 直接格式化会渲染出 "现价 nanx"。NaN != NaN 是唯一可靠判据。
+        return x if isinstance(x, (int, float)) and x == x else None
+
+    pos = f"（现价 {now_pe:.1f}x）" if _num(now_pe) else ""
+    msg = (f"带子止于 {sp.get('end', '?')}（滞后 {lag} 天）：已实现 NTM PE 要等未来 12 "
+           "个月盈利落地才算得出，滞后约一年是口径下限、非数据缺失。"
+           f"**最近一年不在这个分布里**，带内分位{pos}是拿一年前的分布定位今天。")
+    if _num(gap.get("p50")):
+        g_sp = gap.get("span") or {}
+        now_tr = _num(tn.get("current"))
+        msg += (f"最近一年改看无滞后的 trailing："
+                f"盲区 {g_sp.get('start', '?')[:7]}~{g_sp.get('end', '?')[:7]} 中位 "
+                f"{gap['p50']:.1f}x"
+                + (f"、现价 {now_tr:.1f}x" if now_tr else "")
+                + "（分母是过去 12 个月，与分位差一个增长率，不可直接比）。")
+    return [["yellow", msg]]
+
 VINTAGE = _vintage(manifest, cfg["date"])
 # PENDING_10Q（业绩 8-K 已出、10-Q 未交）：本次运行的判断层已被强制按新闻稿滚动
 # TTM（ttm_revenue_override），估的是 8-K 覆盖的那个季度——vintage 归档键若仍用
@@ -481,64 +607,8 @@ if abs(_dev) > 0.35:
         ["yellow", f"base 综合较现价偏离 {_dev:+.0%}（>±35%）——请核对 base 假设"
                    "或在注记中显式说明为何与市场定价分歧"])
 
-# ---- 数据时效护栏（2026-08-31）----
-# net_cash 与整张资产负债表停在 report_end，而 fwd_shares / price 是当前值。
-# 报告期后的增发、回购、并购、分拆只进股数和股价，不进 net_cash——两个时点混用，
-# 龄越大偏差越大，方向随事件而反：
-#   增发 = 股数↑已计、现金↑未计 → 系统性**低估**
-#   回购 = 股数↓已计、现金↓未计 → 系统性**高估**
-# 实测（INTC 2026-08-30，龄 64 天）：8/18 完成的 $20B 增发，210.5M 股已进 fwd_shares，
-# $19.7B 现金没进 net_cash，净债务少算 4.2% 市值；该偏差又把 bear 推出 P/FCF 界外
-# 触发假红旗，判断层为消红旗上修 bear.margins，越过 base 破坏了情景排序。
-#
-# 一律 yellow，**绝不 red**：red 会把这条打回判断层，而它是*数据事实*不是假设，
-# 判断层能"修"它的唯一途径就是扭曲假设——那正是上面那条级联的成因。
-_vt = VINTAGE or {}
-_age = _vt.get("age_days")
-_declared = "post_period_capital_events" in cfg
-_ppce = cfg.get("post_period_capital_events") or []
-_mcap = cfg.get("mcap") or 0
-if _ppce:
-    _net = sum(float(e.get("amount_musd") or 0) for e in _ppce)
-    _desc = "；".join(
-        f"{e.get('date', '?')} {e.get('kind', '?')} {float(e.get('amount_musd') or 0):+,.0f}M"
-        for e in _ppce)
-    out["scenarios"]["base"]["warnings"].append(
-        ["yellow", f"期后资本事件已声明（净 {_net:+,.0f}M"
-                   + (f"，占市值 {abs(_net) / _mcap:.1%}" if _mcap else "") + f"）：{_desc}。"
-                   f"请确认 net_cash={cfg['net_cash']:,.0f}M 已把它们算进去——"
-                   "引擎不自动调整，net_cash 的最终值由判断层负责"])
-elif _age is not None and _age > 45:
-    # 声明 [] 不足以静默：AAPL 2026-08-31 实测——判断层把 fwd_shares 从 14,715 减到
-    # 14,560（明确建模了净回购），net_cash 却停在报告期 +62,173M 一分没扣，然后写 []
-    # 把警告关掉。10-Q 摆着九个月回购 $62,094M + 分红 $11,778M（约 $24.6B/季）。
-    # 所以这里不听声明，改看**可机械证明的自相矛盾**：股数侧建模了回购/增发，
-    # 现金侧却用报告期口径 —— 同一件事只记了一半。
-    _d = cfg["shares"] - cfg["fwd_shares"]      # >0 净回购，<0 净增发
-    if cfg["shares"] and abs(_d) / cfg["shares"] > 0.005:
-        _w = "净回购" if _d > 0 else "净增发"
-        _dir = "现金流出未从 net_cash 扣除 → 系统性**高估**" if _d > 0 else                "现金流入未计入 net_cash → 系统性**低估**"
-        out["scenarios"]["base"]["warnings"].append(
-            ["yellow", f"时点不一致：fwd_shares {cfg['fwd_shares']:,.0f}M 较报告期股数 "
-                       f"{cfg['shares']:,.0f}M 差 {abs(_d):,.0f}M（{abs(_d) / cfg['shares']:.1%}，"
-                       f"已建模{_w}），但 net_cash={cfg['net_cash']:,.0f}M 仍是 "
-                       f"{_vt.get('report_end', '?')} 口径（龄 {_age} 天）——{_dir}。"
-                       + ("post_period_capital_events 声明为空，与股数侧的假设矛盾，请复核"
-                          if _declared else
-                          "请在 post_period_capital_events 里声明并让 net_cash 反映最终值")])
-    else:
-        # 声明为空也照样提示：股数差不显著只排除了增发/大额回购，**排不掉分红**——
-        # 分红不改股数，上面那条机械检查对纯分红股完全失明。KO 2026-08-31 实测：
-        # 股数只降 0.21%（低于阈值，不触发），但季度分红 $2.28B、龄 59 天 ≈ $1.5B
-        # 已流出 net_cash=-29,500M 却没扣，占净负债 5%。所以这条不设静默开关。
-        out["scenarios"]["base"]["warnings"].append(
-            ["yellow", f"报告期末已 {_age} 天"
-                       + ("（>100 天，严重滞后）" if _age > 100 else "")
-                       + f"，net_cash={cfg['net_cash']:,.0f}M 仍是 {_vt.get('report_end', '?')} 口径；"
-                       + ("期后资本事件已声明为无——但分红不改股数，"
-                          "机械检查看不见它，请自行确认分红流出是否重大"
-                          if _declared else
-                          "期后资本事件未声明，请核对增发/回购/并购/分拆/分红后填写")])
+out["scenarios"]["base"]["warnings"] += vintage_warnings(
+    cfg, VINTAGE, facts.get("dividends_quarterly"))
 
 # ---- 价值交易区间：历史已实现 NTM PE 分位 × base 前瞻 EPS ----
 # 与三情景互为对照：情景是「基本面情景各自的公允价」（bear=EPS↓×PE↓ 双压），
@@ -631,6 +701,7 @@ if (not _base_pe_nm and not _band.get("thin_coverage")
     # 此时目标价的涨幅几乎全部押在"倍数回到中枢"，而带子恰好看不见最近一年
     # 究竟发生了什么（滞后 span.lag_days 天）。
     _trw = out["trading_range"]
+    out["scenarios"]["base"]["warnings"] += band_lag_warnings(_band, _trw.get("span"), _now_pe)
     if _now_pe and (_now_pe < _tr_pe["10"] or _now_pe > _tr_pe["90"]):
         _side = "跌出下沿 P10" if _now_pe < _tr_pe["10"] else "冲破上沿 P90"
         _sp = _trw.get("span") or {}
