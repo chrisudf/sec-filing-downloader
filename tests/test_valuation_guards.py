@@ -318,7 +318,7 @@ def test_at_most_one_warning():
 # 不是数据缺失（2026-08-31 实测 AMZN 395 天 / KO 404 / AAPL 305）。
 # =====================================================================
 
-_TN = {"pctiles": {"50": 32.59}, "gap_since_main_band": {
+_TN = {"pctiles": {"50": 32.59}, "current": 28.13, "gap_since_main_band": {
     "span": {"start": "2025-08-01", "end": "2026-07-30"}, "days": 250, "p50": 32.57}}
 
 
@@ -340,16 +340,16 @@ def test_band_lag_fires_and_is_yellow():
     assert lv == "yellow"
     assert "2025-07-31" in msg and "395 天" in msg
     assert "32.3x" in msg
-    assert "不是数据缺失" in msg          # 明说这不是 bug，别去"修"它
-    assert "最近一年的倍数完全不在这个分布里" in msg
+    assert "非数据缺失" in msg            # 明说这不是 bug，别去"修"它
+    assert "最近一年不在这个分布里" in msg
 
 
 def test_band_lag_quotes_blind_window():
     (_, msg), = band_lag_warnings(
         {"trailing_nolag": _TN}, {"end": "2025-07-31", "lag_days": 395}, 32.3)
-    assert "2025-08-01~2026-07-30" in msg and "250 天" in msg
-    assert "32.6x" in msg                              # 盲区 trailing P50
-    assert "不可直接相减" in msg                        # 口径差必须写明
+    assert "2025-08~2026-07" in msg                    # 盲区窗口（截到月）
+    assert "32.6x" in msg and "28.1x" in msg           # 盲区中位 + 现价 trailing
+    assert "不可直接比" in msg                          # 口径差必须写明
 
 
 def test_band_lag_without_nolag_reference():
@@ -361,6 +361,28 @@ def test_band_lag_without_nolag_reference():
 def test_band_lag_handles_missing_now_pe():
     (_, msg), = band_lag_warnings({}, {"end": "2025-07-31", "lag_days": 395}, None)
     assert "带内分位是" in msg          # 不渲染 "（现价 Nonex）"
+
+
+def test_band_lag_nan_current_not_rendered():
+    """KO/AAPL 实测 trailing_nolag.current 为 NaN——直接格式化会渲染出 "现价 nanx"。"""
+    nan = float("nan")
+    (_, msg), = band_lag_warnings(
+        {"trailing_nolag": dict(_TN, current=nan)},
+        {"end": "2025-07-23", "lag_days": 404}, 28.0)
+    assert "nan" not in msg
+    assert "32.6x" in msg and "现价 28.0x" in msg      # 盲区中位仍在，带内分位仍在
+
+
+def test_band_lag_nan_now_pe_not_rendered():
+    (_, msg), = band_lag_warnings({}, {"end": "x", "lag_days": 400}, float("nan"))
+    assert "nan" not in msg and "带内分位是" in msg
+
+
+def test_band_lag_nan_gap_p50_skips_block():
+    (_, msg), = band_lag_warnings(
+        {"trailing_nolag": {"gap_since_main_band": {"p50": float("nan")}}},
+        {"end": "x", "lag_days": 400}, 30.0)
+    assert "nan" not in msg and "盲区" not in msg
 
 
 @pytest.mark.parametrize("band,span,now", [

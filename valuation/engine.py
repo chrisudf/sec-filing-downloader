@@ -169,6 +169,11 @@ def band_lag_warnings(band, span, now_pe, min_lag=270):
     无滞后对照，落在带内（最常见的情形）反而一声不吭——AMZN 2026-08-30 那份
     报告整篇只有一条"方法离散度"黄旗，395 天只出现在交易区间正文里。
 
+    引哪个数：**盲区的 trailing 中位 + 现价 trailing**。第一版引的是
+    gap_since_main_band.p50 与 trailing_nolag.pctiles[50]，但这两个窗口几乎
+    完全重合（AMZN 实测 2025-08-01~2026-07-30 vs 2025-07-30~2026-07-30），
+    等于拿一段时间跟它自己比，读者只会更困惑。现价 trailing 才是新信息。
+
     纯函数，便于按 test_pure 的 ast 抽取手法直接单测。
     """
     sp = span or {}
@@ -177,19 +182,23 @@ def band_lag_warnings(band, span, now_pe, min_lag=270):
         return []
     tn = (band or {}).get("trailing_nolag") or {}
     gap = tn.get("gap_since_main_band") or {}
-    pos = f"（现价 {now_pe:.1f}x）" if now_pe else ""
-    msg = (f"交易区间的带子止于 {sp.get('end', '?')}（滞后 {lag} 天）——"
-           "已实现 NTM PE 要等未来 12 个月的盈利真的发生，滞后约一年是口径本身的"
-           "下限、不是数据缺失。含义：**最近一年的倍数完全不在这个分布里**，"
-           f"带内分位{pos}是拿一年前的分布给今天定位。")
-    if gap.get("p50"):
-        p50s = {str(k): v for k, v in (tn.get("pctiles") or {}).items()}.get("50")
+    def _num(x):
+        # NaN 守卫：KO/AAPL 实测 trailing_nolag.current 为 NaN，
+        # 直接格式化会渲染出 "现价 nanx"。NaN != NaN 是唯一可靠判据。
+        return x if isinstance(x, (int, float)) and x == x else None
+
+    pos = f"（现价 {now_pe:.1f}x）" if _num(now_pe) else ""
+    msg = (f"带子止于 {sp.get('end', '?')}（滞后 {lag} 天）：已实现 NTM PE 要等未来 12 "
+           "个月盈利落地才算得出，滞后约一年是口径下限、非数据缺失。"
+           f"**最近一年不在这个分布里**，带内分位{pos}是拿一年前的分布定位今天。")
+    if _num(gap.get("p50")):
         g_sp = gap.get("span") or {}
-        msg += (f" 盲区 {g_sp.get('start', '?')}~{g_sp.get('end', '?')}"
-                f"（{gap.get('days', '?')} 天）的 trailing P50 为 {gap['p50']:.1f}x")
-        if p50s:
-            msg += f"，同期无滞后 trailing 带 P50 {float(p50s):.1f}x"
-        msg += "（trailing 分母是过去 12 个月，与主带差一个增长率，不可直接相减）"
+        now_tr = _num(tn.get("current"))
+        msg += (f"最近一年改看无滞后的 trailing："
+                f"盲区 {g_sp.get('start', '?')[:7]}~{g_sp.get('end', '?')[:7]} 中位 "
+                f"{gap['p50']:.1f}x"
+                + (f"、现价 {now_tr:.1f}x" if now_tr else "")
+                + "（分母是过去 12 个月，与分位差一个增长率，不可直接比）。")
     return [["yellow", msg]]
 
 VINTAGE = _vintage(manifest, cfg["date"])
