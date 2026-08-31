@@ -87,8 +87,14 @@ SPEC = {
                     "PaymentsToAcquireProductiveAssets"], y=True),
     # 股东回报与股权激励（图表端；现金流量表科目，10-Q 为累计口径）
     "buyback": _item(["PaymentsForRepurchaseOfCommonStock"], y=True),
+    # PaymentsOfOrdinaryDividends 走 fill（只补缺不覆盖）：PFE **只**用这个标签，
+    # 主列表两个全空 -> 分红整列为 None；GOOGL 2026-06-30 也只出现在它下面
+    # （此前的期用 PaymentsOfDividends），不补就缺最新一季。
+    # 不进主列表的原因：它与 PaymentsOfDividends/...CommonStock 在少数重叠期
+    # 口径不同（普通股 vs 含优先股，MO 2007 两者差 2 倍），平级合并会让
+    # "同期取 filed 最新"在两个口径间随机跳；fill 保证已有值的期一律不动。
     "dividends": _item(["PaymentsOfDividends", "PaymentsOfDividendsCommonStock"],
-                       y=True),
+                       y=True, fill=["PaymentsOfOrdinaryDividends"]),
     # 股权激励（现金流量表加回项）：卖方 non-GAAP EPS 多半是剔了 SBC 的口径，
     # 而 SBC 是真实成本（稀释已体现在稀释股数里，费用还被剔一次）。取来供判断层
     # 做「SBC 调整后 PE」对照——AMZN/META 这类占净利两位数百分比。后两个候选
@@ -323,6 +329,17 @@ def assemble_series(facts: dict, name: str, spec=None, units=USD_UNITS,
             annual.setdefault(k, v)
         for k, v in pick(facts, [fill_tag], "quarterly", units=units, fx=fx).items():
             quarterly.setdefault(k, v)
+        # 现金流科目的 10-Q 是 YTD 累计口径：回退标签若只标 YTD 帧，
+        # 不差分就一期也补不进来（PFE 的 PaymentsOfOrdinaryDividends 即如此，
+        # 离散季帧只有 18 期、差分后补到 72 期含最新季）。
+        # **只在该标签自己的 YTD 序列内部差分，绝不与主列表跨标签相减**：
+        # 主列表与回退标签口径可能不同（普通股 vs 含优先股），跨标签做减法
+        # 得到的是两个口径的差额而不是当季金额。GOOGL 2026-06-30 正属此情形
+        # （H1 只在 OrdinaryDividends 下、Q1 只在 PaymentsOfDividends 下），
+        # 故意不补 —— 宁可缺一期，不要一个看起来合理的错数。
+        if item["ytd_flow"]:
+            for k, v in quarterly_from_ytd(facts, [fill_tag], units, fx).items():
+                quarterly.setdefault(k, v)
     for ov_tag in item["override"]:
         annual.update(pick(facts, [ov_tag], "annual", units=units, fx=fx))
         quarterly.update(pick(facts, [ov_tag], "quarterly", units=units, fx=fx))
