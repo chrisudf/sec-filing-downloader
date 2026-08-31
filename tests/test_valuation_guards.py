@@ -19,12 +19,14 @@ _ENG = Path(__file__).resolve().parent.parent / "valuation" / "engine.py"
 _SRC = _ENG.read_text(encoding="utf-8")
 _SEG = [ast.get_source_segment(_SRC, n) for n in ast.parse(_SRC).body
         if isinstance(n, ast.FunctionDef)
-        and n.name in ("vintage_warnings", "band_lag_warnings")]
-assert len(_SEG) == 2, _SEG
+        and n.name in ("vintage_warnings", "band_lag_warnings",
+                       "other_income_crosscheck")]
+assert len(_SEG) == 3, _SEG
 _NS = {}
 exec(chr(10).join(_SEG), _NS)
 vintage_warnings = _NS["vintage_warnings"]
 band_lag_warnings = _NS["band_lag_warnings"]
+other_income_crosscheck = _NS["other_income_crosscheck"]
 
 
 def _mk(**over):
@@ -34,7 +36,7 @@ def _mk(**over):
                     g0=g0, gN=gN, margins=list(margins))
     d = dict(
         fwd_shares=1000.0, net_cash=0.0, net_cash_note="x",
-        adj_ni=100.0, adj_note="x", other_income=0.0,
+        adj_ni=100.0, adj_note="x", other_income=0.0, other_income_note="x",
         seg1="A", seg2="B", seg1_share=0.9,
         rationale={k: "x" for k in ("g", "opm", "pe", "m1", "rl", "wacc", "dcf_margin")},
         notes=["x"],
@@ -391,3 +393,118 @@ def test_band_lag_nan_gap_p50_skips_block():
 ])
 def test_band_lag_never_red(band, span, now):
     assert all(lv == "yellow" for lv, _ in band_lag_warnings(band, span, now))
+
+
+# =====================================================================
+# other_income_crosscheck —— 判断层给的数 vs 财报原始行
+# 起因：AMZN 同日、同财报、同输入的两次运行，其他假设全部靠连续性机制逐字
+# 沿用，唯独 other_income 从 1500 漂到 1000（-33%）—— 它是 need 里唯一
+# 不用交推导的事实类字段。
+# =====================================================================
+
+def _q(**kw):
+    """按 $ 原始单位造季度序列（facts 存原始美元，函数内 /1e6）。"""
+    return {n + "_quarterly": {f"2026-{m:02d}-30": v * 1e6 / 4 for m in (3, 6, 9, 12)}
+            for n, v in kw.items()}
+
+
+def test_oi_silent_when_close():
+    """判断层 1,000 vs 参考 1,000 —— 无差额不出声。"""
+    f = _q(interest_income=1500, interest_expense_nonop=500, other_nonop=0)
+    assert other_income_crosscheck(f, 1000, 8.0, 1000.0) == []
+
+
+def test_oi_flags_amzn_shape():
+    """AMZN 实测：other_nonop TTM +80,425M（私募股权重估）。
+    自动采纳会把 EPS 抬 $7.4/股 —— 这正是"只对照不覆盖"的理由。"""
+    f = _q(interest_income=4660, interest_expense_nonop=3331, other_nonop=80425)
+    (lv, msg), = other_income_crosscheck(f, 1000, 8.22, 10950.0)
+    assert lv == "yellow"
+    assert "-80,754M" in msg and "EPS -7.37" in msg
+    assert "其他非经营" in msg and "80,425" in msg      # 指出差额落在哪一项
+    assert "引擎不自动采纳原始行" in msg
+
+
+def test_oi_flags_ko_shape_and_names_expense_leg():
+    """KO：利息支出 1,642 是权重最大项（绝对值），要被点名。"""
+    f = _q(interest_income=828, interest_expense_nonop=1642, other_nonop=840)
+    (_, msg), = other_income_crosscheck(f, 1500, 3.20, 4305.0)
+    assert "+1,474M" in msg and "利息支出" in msg
+
+
+def test_oi_unavailable_says_so_not_silent():
+    """AAPL 实测：不标 InvestmentIncomeInterest，TTM 凑不齐四季。
+    静默跳过正是 PR #9 Lesson 3 点名的陷阱 —— 必须显式说对照没跑成。"""
+    f = _q(interest_expense_nonop=3933, other_nonop=-382)      # 缺利息收入
+    (lv, msg), = other_income_crosscheck(f, 1000, 9.69, 14560.0)
+    assert lv == "yellow"
+    assert "无法与财报对照" in msg and "利息收入" in msg
+    assert "全靠判断层给数" in msg
+
+
+def test_oi_three_quarters_is_not_ttm():
+    """**三个季度也算凑不齐** —— TTM 必须四季齐，否则 sum 出来的是 9 个月，
+    与 $M 年化口径不可比。三条序列都给三季，才卡得住 `== 4` 这个边界
+    （只让其中一条缺，另两条的 None 会先短路，测不到边界）。"""
+    q3 = {f"2026-{m:02d}-30": 250e6 for m in (3, 6, 9)}
+    f = {n + "_quarterly": dict(q3) for n in
+         ("interest_income", "interest_expense_nonop", "other_nonop")}
+    (_, msg), = other_income_crosscheck(f, 1000, 8.0, 1000.0)
+    assert "无法与财报对照" in msg
+
+
+@pytest.mark.parametrize("gap_musd,fires", [
+    (40, False),     # EPS 0.04 < 绝对门槛 0.05
+    (60, False),     # EPS 0.06 > 绝对门槛，但 < 10% x eps1(8.0)=0.80
+    (900, True),     # EPS 0.90 > 两道门槛
+])
+def test_oi_dual_gate(gap_musd, fires):
+    """两道门槛都要过：绝对 EPS 0.05 + 相对前瞻 EPS 10%。
+    低 EPS 标的不被绝对值刷屏，高 EPS 标的不被小差额刷屏。"""
+    f = _q(interest_income=1000, interest_expense_nonop=0, other_nonop=0)
+    out = other_income_crosscheck(f, 1000 + gap_musd, 8.0, 1000.0)
+    assert bool(out) is fires
+
+
+def test_oi_absolute_gate_protects_low_eps_names():
+    """绝对门槛单独可证：eps1 只有 0.20 时，相对门槛是 0.02——EPS 差 0.04
+    已经越过相对门槛，全靠绝对门槛 0.05 拦住。去掉绝对门槛这条就会响。"""
+    f = _q(interest_income=1000, interest_expense_nonop=0, other_nonop=0)
+    assert other_income_crosscheck(f, 1040, 0.20, 1000.0) == []
+
+
+def test_oi_relative_gate_protects_high_eps_names():
+    """相对门槛单独可证：EPS 差 0.30 远超绝对门槛 0.05，但对 eps1=8.0
+    只占 3.75%，不值得出旗。"""
+    f = _q(interest_income=1000, interest_expense_nonop=0, other_nonop=0)
+    assert other_income_crosscheck(f, 1300, 8.0, 1000.0) == []
+
+
+def test_oi_no_eps1_or_shares_is_silent():
+    """PE 腿 n.m. 时 eps1 可能为 None —— 不能拿它做除数。"""
+    f = _q(interest_income=1000, interest_expense_nonop=0, other_nonop=0)
+    assert other_income_crosscheck(f, 90000, None, 1000.0) == []
+    assert other_income_crosscheck(f, 90000, 8.0, 0) == []
+
+
+def test_oi_never_red():
+    f = _q(interest_income=4660, interest_expense_nonop=3331, other_nonop=80425)
+    for args in ((f, 1000, 8.22, 10950.0), ({}, 1000, 8.0, 1000.0)):
+        assert all(lv == "yellow" for lv, _ in other_income_crosscheck(*args))
+
+
+def test_other_income_note_required():
+    """other_income 此前是 need 里唯一不用交推导的事实类字段 —— 也就是唯一
+    没有锚的数。AMZN 同日两次运行它从 1500 漂到 1000（-33%），其他假设
+    全部靠连续性机制逐字沿用。"""
+    for bad in (None, "", "   "):
+        d = _mk(other_income_note=bad)
+        if bad is None:
+            del d["other_income_note"]
+        with pytest.raises(ValueError, match=r"other_income_note"):
+            _validate_judgment(d, "standard")
+
+
+def test_other_income_note_accepted():
+    _validate_judgment(_mk(other_income_note="10-Q Interest and other, net，剔除 X"),
+                       "standard")

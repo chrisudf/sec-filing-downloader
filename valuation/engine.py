@@ -201,6 +201,58 @@ def band_lag_warnings(band, span, now_pe, min_lag=270):
                 + "（分母是过去 12 个月，与分位差一个增长率，不可直接比）。")
     return [["yellow", msg]]
 
+def other_income_crosscheck(facts, other_income, eps1, fwd_shares,
+                            rel_gate=0.10, abs_eps_gate=0.05):
+    """判断层给的 other_income 与财报原始行的对照 -> [[level, msg], ...]。
+
+    **只做对照，不覆盖**。理由是 AMZN/INTC 两个实测反例：
+      AMZN  other_nonop 的 TTM 是 +$80,425M（Anthropic/OpenAI 私募股权向上重估），
+            参考值 +$81,754M vs 判断层 $1,000M —— 自动采纳会把 EPS 抬 $7.4/股。
+      INTC  $13,619M 托管股重估藏在 10-Q 的「Interest and other, net」里（但没落到
+            这三个 XBRL 标签上），naive 口径同样离谱。
+    「哪些是一次性」需要读原文判断，自动化不了 —— 与 post_period_capital_events
+    同一个裁决（见 PR #9）。所以这里只把差额顶到台面上，让 other_income_note 去解释。
+
+    覆盖不全时**显式说明对照没跑成**，不静默跳过：AAPL 不标
+    InvestmentIncomeInterest，TTM 凑不齐四个季度 —— 那正是 PR #9 Lesson 3
+    点名的静默失效陷阱。
+
+    纯函数（TTM 也在函数内算，接线才一起被测到）。
+    """
+    def _ttm(name):
+        # facts 存原始美元，cfg / ttm_m 一律 $M —— 与 engine 其余处的 /1e6 同源。
+        # 不换算会把 AMZN 的差额印成 "-81,753,999,000M"（首版实测）。
+        q = (facts or {}).get(name + "_quarterly") or {}
+        vals = [v for _, v in sorted(q.items())[-4:] if isinstance(v, (int, float))]
+        return sum(vals) / 1e6 if len(vals) == 4 else None
+
+    ii, ie, on = (_ttm("interest_income"), _ttm("interest_expense_nonop"),
+                  _ttm("other_nonop"))
+    missing = [n for n, v in (("利息收入", ii), ("利息支出", ie), ("其他非经营", on))
+               if v is None]
+    if missing:
+        return [["yellow", f"other_income={other_income:,.0f}M 无法与财报对照："
+                           f"{'/'.join(missing)}的 XBRL 序列凑不齐最近四个季度"
+                           "（标签未收录或期数不足）。该字段全靠判断层给数，"
+                           "请按 other_income_note 的推导自行复核"]]
+    ref = ii - ie + on
+    if not fwd_shares or eps1 is None:
+        return []
+    gap = other_income - ref
+    eps_gap = gap / fwd_shares
+    if abs(eps_gap) < abs_eps_gate or abs(eps_gap) < rel_gate * abs(eps1):
+        return []
+    # 指出差额主要落在哪一项，读者一眼看出被剔掉的是什么
+    parts = {"利息收入": ii, "利息支出": -ie, "其他非经营": on}
+    top = max(parts, key=lambda k: abs(parts[k]))
+    return [["yellow",
+             f"other_income={other_income:,.0f}M 与财报原始行差 {gap:+,.0f}M"
+             f"（≈ EPS {eps_gap:+.2f}，占前瞻 EPS {abs(eps_gap) / abs(eps1):.0%}）："
+             f"TTM 利息收入 {ii:,.0f} − 利息支出 {ie:,.0f} + 其他非经营 {on:,.0f} "
+             f"= {ref:,.0f}M，其中「{top}」{parts[top]:+,.0f}M 权重最大。"
+             "差额来自一次性项目属正常——引擎不自动采纳原始行（股权重估/衍生品"
+             "重估/减值常混在这一行里），但 other_income_note 必须能解释它"]]
+
 VINTAGE = _vintage(manifest, cfg["date"])
 # PENDING_10Q（业绩 8-K 已出、10-Q 未交）：本次运行的判断层已被强制按新闻稿滚动
 # TTM（ttm_revenue_override），估的是 8-K 覆盖的那个季度——vintage 归档键若仍用
@@ -609,6 +661,8 @@ if abs(_dev) > 0.35:
 
 out["scenarios"]["base"]["warnings"] += vintage_warnings(
     cfg, VINTAGE, facts.get("dividends_quarterly"))
+out["scenarios"]["base"]["warnings"] += other_income_crosscheck(
+    facts, cfg["other_income"], out["scenarios"]["base"]["eps1"], cfg["fwd_shares"])
 
 # ---- 价值交易区间：历史已实现 NTM PE 分位 × base 前瞻 EPS ----
 # 与三情景互为对照：情景是「基本面情景各自的公允价」（bear=EPS↓×PE↓ 双压），
