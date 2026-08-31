@@ -38,6 +38,7 @@
 | `NTM 盈利为负，目标 PE 必须写 0` | — | `_validate_judgment` | 不该调，见「未盈利标的」 |
 | `NTM 营业利润为负，m1/m2 必须写 0` | — | `_validate_judgment` | 同上（EV/EBIT 对负 EBIT 无意义） |
 | `情景排序：X 必须 bear <= base <= bull` | g/opm/pe/m1/m2 | `_validate_judgment` | **不该调**。倒挂基本等于判断层写串了情景 |
+| `情景排序：margins 第 N 年必须 bear <= base <= bull` | margins 逐年（2026-08-31 补） | `_validate_judgment` | **不该调**。典型成因：bear 谷底被『>= 0.4×TTM FCF 利润率』顶上来后越过 base——正确修法是抬高 base/bull 路径，不是让 bear 越过 base。INTC 2026-08-30 实测：net_cash 陈旧 → bear 假红旗 → gate 打回后判断层上修 bear.margins 到 base 之上，v2 只排序标量所以静默通过 |
 | `bear 双重计数` | 触发条件：bear 盈利 < base 的 **80%** 且 pe/m1/m2 < base 的 **0.6 倍** | `_validate_judgment` | 这是压漂移的主力规则。真觉得误伤，优先用 `permanent_impairment=true` + `impairment_note`（要给财报原文出处）豁免单个情景，而不是放宽 0.6 |
 | `bull 双重计数` | bull 盈利 > base 的 **125%** 且 pe/m1/m2 > base 的 **1.4 倍** | `_validate_judgment` | 同上；bull 没有豁免通道（景气顶点倍数收敛是稳健假设） |
 | `margins 谷底 < 0.4×TTM FCF率` | 0.4 倍；仅当 TTM FCF 率 > 2% 时启用 | `_validate_judgment` | 比腰斩更深的常态化路径属于永久受损，同一豁免通道 |

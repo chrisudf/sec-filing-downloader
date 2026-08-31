@@ -140,6 +140,24 @@ def _validate_judgment(d: dict, mode: str = "standard",
         raise ValueError("other_income 必须是数字（$M）")
     if not 0 <= d["seg1_share"] <= 1:
         raise ValueError("seg1_share 必须在 0-1")
+    # 期后资本事件（可选，2026-08-31）：报告期末之后发生的增发/回购/并购/分拆。
+    # 引擎**不**用它自动调 net_cash——那需要 buyback/dividends 的 XBRL 抽取可靠，
+    # 而实测 META/GOOG 的 buyback、PFE 的 dividends 存在整季空值，自动化会在最
+    # 需要它的标的上静默失效。这里只做"声明并留痕"：写了就在红旗区列出并要求
+    # 确认 net_cash 已含；龄 >45 天又没写，红旗区提示去核对。
+    ppce = d.get("post_period_capital_events")
+    if ppce is not None:
+        if not isinstance(ppce, list):
+            raise ValueError("post_period_capital_events 必须是数组（确认无事件则写 []）")
+        for i, e in enumerate(ppce):
+            if not isinstance(e, dict) or not {"date", "kind", "amount_musd", "note"} <= set(e):
+                raise ValueError(
+                    f"post_period_capital_events[{i}] 须含 date/kind/amount_musd/note"
+                    "（amount_musd：现金流入为正、流出为负，单位 $M）")
+            if not isinstance(e["amount_musd"], (int, float)):
+                raise ValueError(f"post_period_capital_events[{i}].amount_musd 必须是数字（$M）")
+            if not str(e.get("note") or "").strip():
+                raise ValueError(f"post_period_capital_events[{i}].note 必填（原文出处）")
     # build_report.py 直接取这些 rationale 键，缺了会在花完 LLM 调用后才崩，这里提前拒绝
     if not isinstance(d["rationale"], dict):
         raise ValueError("rationale 必须是对象")
@@ -234,6 +252,18 @@ def _validate_judgment(d: dict, mode: str = "standard",
     for k in ("g", "opm", "pe", "m1", "m2"):
         if not sb[k] <= ss[k] <= su[k]:
             raise ValueError(f"情景排序：{k} 必须 bear <= base <= bull")
+    # margins 是 DCF 腿的**全部**输入，与标量参数同权重，但 v2 只排序了标量。
+    # 实测坑（INTC 2026-08-30）：net_cash 停在 10-Q 旧时点 → bear 的 P/FCF 红旗是假的
+    # → 判断层为消红旗把 bear.margins 从 2%→7% 上修成 4%→11%，越过了 base 的 3%→14%，
+    # 前四年 bear >= base。gate 复审只看 red 红旗、不重跑排序，自相矛盾的假设直接进报告。
+    # 长度已在上方强制为 10，zip 不会静默截断。
+    for _t, (_mb, _ms, _mu) in enumerate(zip(sb["margins"], ss["margins"], su["margins"]), 1):
+        if not _mb <= _ms <= _mu:
+            raise ValueError(
+                f"情景排序：margins 第 {_t} 年必须 bear <= base <= bull"
+                f"（现为 {_mb:.0%} / {_ms:.0%} / {_mu:.0%}）。"
+                "若 bear 谷底是被『>= 0.4×TTM FCF 利润率』的下限顶上来的，"
+                "正确修法是抬高 base/bull 的路径，不是让 bear 越过 base")
 
     def _exempt(s):
         return (s.get("permanent_impairment") is True
