@@ -253,6 +253,88 @@ def other_income_crosscheck(facts, other_income, eps1, fwd_shares,
              "差额来自一次性项目属正常——引擎不自动采纳原始行（股权重估/衍生品"
              "重估/减值常混在这一行里），但 other_income_note 必须能解释它"]]
 
+def hist_fcf_margins(facts):
+    """历年 FCF 利润率（年度 CFO−capex / 营收）-> [(财年末, 利润率), ...] 按年排序。
+
+    capex 周期股的当期 FCF 可以为负（AMZN TTM −1.5%），拿它当锚会让所有基于
+    "当前 FCF 率"的护栏直接失效——而 FCF 为负恰恰是 DCF 最不可靠的时候。
+    历史序列是这类标的唯一还能用的锚。
+    """
+    out = []
+    facts = facts or {}          # 测试抓到：facts=None 时原写法 AttributeError
+    rev = facts.get("revenue_annual") or {}
+    cfo = facts.get("cfo_annual") or {}
+    cap = facts.get("capex_annual") or {}
+    for k in sorted(rev):
+        r, c, x = rev.get(k), cfo.get(k), cap.get(k)
+        if all(isinstance(v, (int, float)) for v in (r, c, x)) and r:
+            out.append((k, (c - x) / r))
+    return out
+
+
+def terminal_margin_warnings(hist, scenarios, gate=1.0, window=10, tol=0.005):
+    """终值 FCF 利润率 vs 该公司自己的历史最好年份 -> [[level, msg], ...]。
+
+    终值那一个数字决定 DCF 的大头（AMZN 实测终值折现占 EV 74%），却是整份
+    假设里最不受约束的：引擎原有的三道 DCF 护栏——第10年营收倍数（阈值 8x）、
+    终值占比（>75%）、P/FCF 界外——都管不到它。
+    AMZN base 终值 9% > 历史八年最高 7.7%、bull 12% = 峰值 1.56 倍，
+    此前一声不吭。**超越自己的历史峰值不是错，但要交待理由。**
+    """
+    if not hist:
+        return []
+    # 只取近 window 个财年：全历史会混进另一个 regime 的公司。AMZN 全 19 年
+    # 峰值是 2009 的 11.9%——那时它营收 $24B、AWS 还没成型、capex 极轻，
+    # 拿它当 2036 年终值的基准没有意义（近 10 年峰值 7.7%，才是可比的锚）。
+    # 与 pe_band 的"近 3 年子窗避开 2021 regime"是同一个思路。
+    recent = hist[-window:]
+    peak = max(m for _, m in recent)
+    med = sorted(m for _, m in recent)[len(recent) // 2]
+    out = []
+    for name in ("bear", "base", "bull"):
+        sc = (scenarios or {}).get(name) or {}
+        m = (sc.get("margins") or [None])[-1]
+        # tol 是绝对容差（0.5pp）：没有它，AAPL bear 的 0.2800 vs 峰值 0.2799
+        # 会渲染成"28% 高于 28%"——四舍五入造出的假阳性比漏报更伤信任。
+        if (not isinstance(m, (int, float)) or peak <= 0
+                or m <= gate * peak + tol):
+            continue
+        # 差距在 1pp 以内时给一位小数，避免两个数看起来一样
+        _p = "%.1f%%" % (m * 100) if m - peak < 0.01 else "%.0f%%" % (m * 100)
+        _k = "%.1f%%" % (peak * 100) if m - peak < 0.01 else "%.0f%%" % (peak * 100)
+        out.append(["yellow",
+                    f"{name} 终值 FCF 利润率 {_p} 高于该公司近 {len(recent)} 个财年"
+                    f"的最好年份 {_k}（{recent[0][0][:4]}~{recent[-1][0][:4]}，"
+                    f"中位 {med:.0%}）"
+                    + (f"，为峰值的 {m / peak:.2f} 倍" if m > 1.2 * peak else "")
+                    + "——终值那一个数字撑起 DCF 的大头，超越自身历史峰值需要在 "
+                      "rationale.dcf_margin 里给出依据"])
+    return out
+
+
+def terminal_sensitivity(dcf_fn, tv_pv_share, margins, base_ps, delta=0.02, gate=0.65):
+    """终值占比过高时，把"终值那一个数字值多少钱"显性化 -> [[level, msg], ...]。
+
+    不动 tv_pv_share 的 75% 红旗线：三档都落在 72-74% 不是漏网，是
+    wacc−tg=6% 下终值倍数 16.7x 的数学必然，调阈值会对所有标的刷屏。
+    该做的是让读者看见这 74% 建立在哪一个数上——AMZN 实测只把第 10 年
+    从 9% 改到 6%（前九年一动不动），DCF/股 161.4 -> 118.6，**-27%**。
+    """
+    if not tv_pv_share or tv_pv_share <= gate or not base_ps:
+        return []
+    lo, hi = list(margins), list(margins)
+    lo[-1] = margins[-1] - delta
+    hi[-1] = margins[-1] + delta
+    ps_lo, ps_hi = dcf_fn(lo), dcf_fn(hi)
+    if ps_lo is None or ps_hi is None:
+        return []
+    return [["yellow",
+             f"终值折现占 EV {tv_pv_share:.0%}（>{gate:.0%}）——DCF 的大头压在第 10 年"
+             f"那一个 FCF 利润率上。敏感性：终值 {margins[-1]:.0%} ±{delta:.0%} "
+             f"→ 每股 {ps_lo:.0f} / {base_ps:.0f} / {ps_hi:.0f}"
+             f"（±{max(abs(ps_hi - base_ps), abs(base_ps - ps_lo)) / abs(base_ps):.0%}）。"
+             "读 DCF 腿之前先确认这个数有依据"]]
+
 VINTAGE = _vintage(manifest, cfg["date"])
 # PENDING_10Q（业绩 8-K 已出、10-Q 未交）：本次运行的判断层已被强制按新闻稿滚动
 # TTM（ttm_revenue_override），估的是 8-K 覆盖的那个季度——vintage 归档键若仍用
@@ -596,6 +678,22 @@ for name, s in cfg["scenarios"].items():
         if not 5 <= p_fcf <= 90:
             warnings.append(["red", f"DCF 隐含股权价值为 TTM FCF 的 {p_fcf:.1f} 倍"
                                     "（界外 [5,90]）——路径假设与当前现金流量级脱节"])
+    else:
+        # capex 周期股（AMZN TTM FCF −1.5%）走到这里：P/FCF 无意义，此前**整条
+        # 护栏静默跳过**——而 FCF 为负恰是 DCF 最不可靠的时候。不静默，改用 OCF
+        # 当备用锚（AMZN TTM OCF/营收 20.8%，正且稳）并说明本护栏未生效。
+        # 不给 OCF 设硬区间：跨行业的 P/OCF 合理带无法一刀切，给数不判罚。
+        _ocf = ttm_m.get("cfo")
+        _p_ocf = (dcf_eq / _ocf) if isinstance(_ocf, (int, float)) and _ocf > 0 else None
+        if _p_ocf is not None:
+            ddiag["dcf_equity_over_ttm_ocf"] = round(_p_ocf, 1)
+        # 三档各出一条完整解释太吵（AMZN 实测刷了三遍同样的话）——压成一句：
+        # 事实 + 本档的备用锚数字。为什么要紧由 base 的终值敏感性那条承担。
+        warnings.append(["yellow",
+                         f"TTM FCF {fcf_base:,.0f}M 非正（营收占比 {fcf_base / rev0:.1%}），"
+                         "『DCF权益/TTM FCF』护栏未生效"
+                         + (f"；改用 OCF 锚 = {_p_ocf:.1f}x" if _p_ocf is not None
+                            else "；TTM OCF 亦非正，无备用锚")])
     if cfg["adj_ni"] > 0:
         p_ni = blend * cfg["shares"] / cfg["adj_ni"]
         ddiag["blend_p_adjni"] = round(p_ni, 1)
@@ -663,6 +761,19 @@ out["scenarios"]["base"]["warnings"] += vintage_warnings(
     cfg, VINTAGE, facts.get("dividends_quarterly"))
 out["scenarios"]["base"]["warnings"] += other_income_crosscheck(
     facts, cfg["other_income"], out["scenarios"]["base"]["eps1"], cfg["fwd_shares"])
+
+# ---- DCF 终值护栏（2026-08-31）：终值那一个数字撑起 DCF 的大头，却是整份
+# 假设里最不受约束的——原有三道护栏（第10年营收 >8x / 终值占比 >75% /
+# P/FCF 界外）都管不到它。AMZN 实测 base 终值 9% 高于历史八年峰值 7.7%、
+# 终值占 EV 74%（差 1pp 没触发红旗），三档全部一声不吭。
+_hist_fcf = hist_fcf_margins(facts)
+out["scenarios"]["base"]["warnings"] += terminal_margin_warnings(_hist_fcf, cfg["scenarios"])
+_bcfg, _bout = cfg["scenarios"]["base"], out["scenarios"]["base"]
+out["scenarios"]["base"]["warnings"] += terminal_sensitivity(
+    lambda m: dcf(rev0, _bcfg["g0"], _bcfg["gN"], m, _bcfg["wacc"], _bcfg["tg"],
+                  cfg["net_cash"], cfg["fwd_shares"])[0],
+    (_bout.get("diagnostics") or {}).get("tv_pv_share"),
+    _bcfg["margins"], _bout.get("dcf_ps"))
 
 # ---- 价值交易区间：历史已实现 NTM PE 分位 × base 前瞻 EPS ----
 # 与三情景互为对照：情景是「基本面情景各自的公允价」（bear=EPS↓×PE↓ 双压），
