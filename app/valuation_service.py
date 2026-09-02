@@ -101,10 +101,21 @@ def _check_rev_override(d: dict) -> None:
     financials 提前 return 直接跳过——共用一个函数是为了不再漂移。"""
     if "ttm_revenue_override" not in d:
         return
-    if not isinstance(d["ttm_revenue_override"], (int, float)) or d["ttm_revenue_override"] <= 0:
+    if not _isnum(d["ttm_revenue_override"]) or d["ttm_revenue_override"] <= 0:
         raise ValueError("ttm_revenue_override 必须是正数（$M）")
     if not d.get("ttm_revenue_note"):
         raise ValueError("提供 ttm_revenue_override 时必须附 ttm_revenue_note（出处）")
+
+
+def _isnum(x):
+    """数字判据：**排除 bool**。
+
+    Python 里 `bool` 是 `int` 的子类，所以 `_isnum(True)` 为真——
+    JSON 里写 `"net_cash_impact_musd": true` 会悄悄通过校验、`float(True)` 变成
+    1.0、再被渲染成 "+1M"。校验器、引擎的金额/序列判断本来全踩这个洞
+    （Copilot 在 PR #14 上点出两处，实际有 17 处，其中数处早于本轮）。
+    """
+    return isinstance(x, (int, float)) and not isinstance(x, bool)
 
 
 def _validate_judgment(d: dict, mode: str = "standard",
@@ -139,9 +150,9 @@ def _validate_judgment(d: dict, mode: str = "standard",
     for k in need:
         if k not in d:
             raise ValueError(f"缺少字段 {k}")
-    if not isinstance(d["fwd_shares"], (int, float)) or d["fwd_shares"] <= 0:
+    if not _isnum(d["fwd_shares"]) or d["fwd_shares"] <= 0:
         raise ValueError("fwd_shares 必须为正数（百万股）")
-    if not isinstance(d["other_income"], (int, float)):
+    if not _isnum(d["other_income"]):
         raise ValueError("other_income 必须是数字（$M）")
     if not str(d.get("other_income_note") or "").strip():
         raise ValueError(
@@ -165,13 +176,13 @@ def _validate_judgment(d: dict, mode: str = "standard",
                 raise ValueError(
                     f"post_period_capital_events[{i}] 须含 date/kind/amount_musd/note"
                     "（amount_musd：现金流入为正、流出为负，单位 $M）")
-            if not isinstance(e["amount_musd"], (int, float)):
+            if not _isnum(e["amount_musd"]):
                 raise ValueError(f"post_period_capital_events[{i}].amount_musd 必须是数字（$M）")
             # net_cash_impact_musd 可选但强烈建议：amount_musd 是现金流向，
             # 对 net_cash（现金−负债）的影响未必相同——发债现金 +X、债务 +X、
             # 净现金 0。缺了引擎不会替你猜，只会把合计标成"现金流向、非净现金影响"。
             if ("net_cash_impact_musd" in e
-                    and not isinstance(e["net_cash_impact_musd"], (int, float))):
+                    and not _isnum(e["net_cash_impact_musd"])):
                 raise ValueError(
                     f"post_period_capital_events[{i}].net_cash_impact_musd 必须是数字（$M）"
                     "——该笔对 net_cash(现金−负债) 的影响，与 amount_musd(现金流向) 未必相同")
@@ -218,7 +229,7 @@ def _validate_judgment(d: dict, mode: str = "standard",
         m_cap = max(0.65, min(0.9, 1.2 * fcf_margin)) if (fcf_margin and fcf_margin > 0) else 0.65
         # 上界含等号，与 prompt / TUNING.md 的 (-0.3, cap] 一致：模型给恰好等于上界
         # 的值（如 0.65）不该被误拒触发无谓 retry
-        if not all(isinstance(m, (int, float)) and -0.3 < m <= m_cap for m in s["margins"]):
+        if not all(_isnum(m) and -0.3 < m <= m_cap for m in s["margins"]):
             raise ValueError(f"{sc}.margins 必须是 (-0.3, {m_cap:.2f}] 内的数字（FCF 利润率）")
         if not 0.05 <= s["wacc"] <= 0.2:
             raise ValueError(f"{sc}.wacc 越界")
@@ -339,9 +350,9 @@ def _validate_judgment_financials(d: dict) -> None:
     # 顶层数值校验（与 standard 一致）：engine financials 分支直接 ni1/fwd_shares、
     # adj_ni/shares——fwd_shares 若为 "100"（字符串）会 TypeError、为 0 会 ZeroDivisionError，
     # 在花完 LLM 调用后才在引擎阶段崩，这里提前拒绝
-    if not isinstance(d["fwd_shares"], (int, float)) or d["fwd_shares"] <= 0:
+    if not _isnum(d["fwd_shares"]) or d["fwd_shares"] <= 0:
         raise ValueError("fwd_shares 必须为正数（百万股）")
-    if not isinstance(d["adj_ni"], (int, float)):
+    if not _isnum(d["adj_ni"]):
         raise ValueError("adj_ni 必须是数字（$M）")
     if not isinstance(d["rationale"], dict):
         raise ValueError("rationale 必须是对象")
@@ -356,7 +367,7 @@ def _validate_judgment_financials(d: dict) -> None:
             raise ValueError(f"缺少情景 {sc}")
         s = d["scenarios"][sc]
         for k in ("g", "nm", "pe", "ptbv", "wacc", "tg"):
-            if k not in s or not isinstance(s[k], (int, float)):
+            if k not in s or not _isnum(s[k]):
                 raise ValueError(f"{sc} 缺少数值字段 {k}")
         if not -0.5 < s["g"] < 1.5:
             raise ValueError(f"{sc}.g 越界")
@@ -446,7 +457,7 @@ def _auth_state() -> dict:
     if not oauth.get("accessToken") and not oauth.get("refreshToken"):
         return {"ok": False, "reason": "凭证已被清空（accessToken/refreshToken 均为空）"}
     exp = oauth.get("refreshTokenExpiresAt")
-    if isinstance(exp, (int, float)) and exp and exp / 1000 < time.time():
+    if _isnum(exp) and exp and exp / 1000 < time.time():
         return {"ok": False, "reason": "refresh token 已过期"}
     return {"ok": True, "reason": "凭证在位"}
 
@@ -974,7 +985,7 @@ async def _pipeline(job: dict, ticker: str, email: str) -> None:
         _r = (facts.get("revenue_annual") or {}).get(k)
         _c = (facts.get("cfo_annual") or {}).get(k)
         _x = (facts.get("capex_annual") or {}).get(k)
-        if all(isinstance(v, (int, float)) for v in (_r, _c, _x)) and _r:
+        if all(_isnum(v) for v in (_r, _c, _x)) and _r:
             _hm.append((_c - _x) / _r)
     if _hm:
         _hm = sorted(_hm[-10:])

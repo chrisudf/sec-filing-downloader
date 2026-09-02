@@ -19,12 +19,15 @@ _ENG = Path(__file__).resolve().parent.parent / "valuation" / "engine.py"
 _SRC = _ENG.read_text(encoding="utf-8")
 _SEG = [ast.get_source_segment(_SRC, n) for n in ast.parse(_SRC).body
         if isinstance(n, ast.FunctionDef)
-        and n.name in ("vintage_warnings", "band_lag_warnings",
+        and n.name in ("_isnum", "vintage_warnings", "band_lag_warnings",
                        "other_income_crosscheck", "hist_fcf_margins",
                        "terminal_margin_warnings", "terminal_sensitivity")]
-assert len(_SEG) == 6, _SEG
+# _isnum 是这些函数共用的模块级谓词（排除 bool），必须一起抽——
+# 否则 exec 出来的命名空间里没有它，全部 NameError
+assert len(_SEG) == 7, _SEG
 _NS = {}
 exec(chr(10).join(_SEG), _NS)
+_isnum = _NS["_isnum"]
 vintage_warnings = _NS["vintage_warnings"]
 band_lag_warnings = _NS["band_lag_warnings"]
 other_income_crosscheck = _NS["other_income_crosscheck"]
@@ -700,3 +703,87 @@ def test_ppce_impact_must_be_numeric():
 def test_ppce_impact_is_optional():
     """既有 config 没有这个字段，不能因此全挂。"""
     _validate_judgment(_mk(post_period_capital_events=[DEBT, BUY]), "standard")
+
+
+# =====================================================================
+# bool 不是数字（Copilot 在 PR #14 上点出，实际波及 17 处，数处早于本轮）
+# Python 里 bool 是 int 的子类 -> isinstance(True, (int, float)) 为真，
+# JSON 写 true 会悄悄通过校验、float(True)=1.0、渲染成 "+1M"。
+# =====================================================================
+
+@pytest.mark.parametrize("v", [True, False])
+def test_isnum_rejects_bool(v):
+    assert _isnum(v) is False
+
+
+@pytest.mark.parametrize("v", [0, 1, -1, 0.0, 1.5, -21300.0])
+def test_isnum_accepts_real_numbers(v):
+    assert _isnum(v) is True
+
+
+@pytest.mark.parametrize("v", [None, "1", "true", [], {}])
+def test_isnum_rejects_non_numbers(v):
+    assert _isnum(v) is False
+
+
+@pytest.mark.parametrize("field", ["amount_musd", "net_cash_impact_musd"])
+def test_ppce_bool_amount_rejected(field):
+    """JSON 里的 true 不能当成 1.0M 混进金额。"""
+    ev = [dict(EVENT, **{field: True})]
+    with pytest.raises(ValueError, match=field):
+        _validate_judgment(_mk(post_period_capital_events=ev), "standard")
+
+
+def test_other_income_bool_rejected():
+    with pytest.raises(ValueError, match="other_income 必须是数字"):
+        _validate_judgment(_mk(other_income=True), "standard")
+
+
+def test_fwd_shares_bool_rejected():
+    with pytest.raises(ValueError, match="fwd_shares"):
+        _validate_judgment(_mk(fwd_shares=True), "standard")
+
+
+@pytest.mark.parametrize("v", [True, False])
+def test_margins_bool_rejected(v):
+    """必须用 False 才隔离得出类型检查：True=1 会被区间上限（1 <= m_cap 不成立）
+    顺手拦下，而 **False=0 落在合法区间内**，没有类型检查就会变成 0% 的 FCF
+    利润率溜进 DCF 路径。变异「margins 不查类型」首轮就是被 True 掩盖而逃掉的。"""
+    d = _mk(bear={"margins": [v] + [0.02] * 9})
+    with pytest.raises(ValueError, match="margins"):
+        _validate_judgment(d, "standard")
+
+
+def test_ppce_bool_impact_not_summed_as_one():
+    """即使绕过校验（旧 config 直接喂引擎），引擎侧也不能把 True 当 +1M。"""
+    ev = [dict(EVENT, net_cash_impact_musd=True)]
+    (_, msg), = vintage_warnings(_cfg(post_period_capital_events=ev), _vt(age=62))
+    assert "现金流向合计" in msg          # True 被视为"没给"，退回现金流向口径
+    assert "+1M" not in msg
+
+
+def test_band_lag_bool_current_not_rendered():
+    (_, msg), = band_lag_warnings(
+        {"trailing_nolag": dict(_TN, current=True)},
+        {"end": "2025-07-31", "lag_days": 400}, 32.3)
+    assert "现价 +1" not in msg and "现价 1.0x" not in msg
+
+
+def test_crosscheck_bool_series_treated_as_missing():
+    """facts 里某季被写成 true 时，宁可报"凑不齐四季"也不能算进 TTM。"""
+    f = _q(interest_income=1000, interest_expense_nonop=0, other_nonop=0)
+    f["interest_income_quarterly"]["2026-06-30"] = True
+    (_, msg), = other_income_crosscheck(f, 90000, 8.0, 1000.0)
+    assert "无法与财报对照" in msg
+
+
+def test_hist_fcf_margins_skips_bool_years():
+    f = {"revenue_annual": {"2024-12-31": 100.0, "2025-12-31": 200.0},
+         "cfo_annual": {"2024-12-31": 30.0, "2025-12-31": True},
+         "capex_annual": {"2024-12-31": 10.0, "2025-12-31": 50.0}}
+    assert hist_fcf_margins(f) == [("2024-12-31", 0.2)]
+
+
+def test_terminal_margin_bool_terminal_ignored():
+    hist = [("20%02d-12-31" % i, 0.05) for i in range(10)]
+    assert terminal_margin_warnings(hist, {"base": {"margins": [0.0] * 9 + [True]}}) == []
