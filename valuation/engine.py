@@ -31,6 +31,24 @@ MODE = cfg.get("mode", facts.get("mode", "standard"))
 #   standard: VALUATION_BLEND_W_PE / _DCF / _SOTP；financials: _PE / _PTBV
 # 权重随 valuation.json（blend_weights）进 Excel 综合公式与 compare/trend——
 # 改权重 = 改口径，跨运行对比必须可见，不允许只活在环境变量里。
+def _isnum(x):
+    """数字判据：**排除 bool**。
+
+        isinstance(True, (int, float))  ->  True    # Python 里 bool 是 int 的子类
+        _isnum(True)                    ->  False   # 本函数存在的全部理由
+
+    不排除的后果：JSON 里写 `"net_cash_impact_musd": true` 会悄悄通过校验、
+    `float(True)` 变成 1.0、再被渲染成 "+1M"。校验器与引擎的金额/序列判断
+    本来全踩这个洞（Copilot 在 PR #14 上点出两处，全仓实有 17 处，数处早于本轮）。
+
+    ⚠️ 这段 docstring 自己被误伤过：批量把 `isinstance(..., (int, float))` 换成
+    `_isnum(...)` 的正则扫全文件，把这里作为**反例**引用的 isinstance 也改了，
+    于是解释变成了字面相反的意思（Copilot 在 PR #15 上点出）。
+    改这类东西时正则不要扫注释和文档串。
+    """
+    return isinstance(x, (int, float)) and not isinstance(x, bool)
+
+
 def _env_w(name):
     # nan/inf 必须挡在这里：float("nan") 不抛异常，max(nan, 0.0) 也照样返回 nan，
     # 于是 _wsum 变 nan、blend 变 nan，一路写进 valuation.json 并让 Excel 收到
@@ -119,7 +137,7 @@ def vintage_warnings(cfg, vintage, dividends_quarterly=None):
 
         def _impact(e):
             v = e.get("net_cash_impact_musd")
-            return float(v) if isinstance(v, (int, float)) else None
+            return float(v) if _isnum(v) else None
 
         missing = [e for e in ppce if _impact(e) is None]
         parts = []
@@ -212,7 +230,7 @@ def band_lag_warnings(band, span, now_pe, min_lag=270):
     def _num(x):
         # NaN 守卫：KO/AAPL 实测 trailing_nolag.current 为 NaN，
         # 直接格式化会渲染出 "现价 nanx"。NaN != NaN 是唯一可靠判据。
-        return x if isinstance(x, (int, float)) and x == x else None
+        return x if _isnum(x) and x == x else None
 
     pos = f"（现价 {now_pe:.1f}x）" if _num(now_pe) else ""
     msg = (f"带子止于 {sp.get('end', '?')}（滞后 {lag} 天）：已实现 NTM PE 要等未来 12 "
@@ -250,7 +268,7 @@ def other_income_crosscheck(facts, other_income, eps1, fwd_shares,
         # facts 存原始美元，cfg / ttm_m 一律 $M —— 与 engine 其余处的 /1e6 同源。
         # 不换算会把 AMZN 的差额印成 "-81,753,999,000M"（首版实测）。
         q = (facts or {}).get(name + "_quarterly") or {}
-        vals = [v for _, v in sorted(q.items())[-4:] if isinstance(v, (int, float))]
+        vals = [v for _, v in sorted(q.items())[-4:] if _isnum(v)]
         return sum(vals) / 1e6 if len(vals) == 4 else None
 
     ii, ie, on = (_ttm("interest_income"), _ttm("interest_expense_nonop"),
@@ -294,7 +312,7 @@ def hist_fcf_margins(facts):
     cap = facts.get("capex_annual") or {}
     for k in sorted(rev):
         r, c, x = rev.get(k), cfo.get(k), cap.get(k)
-        if all(isinstance(v, (int, float)) for v in (r, c, x)) and r:
+        if all(_isnum(v) for v in (r, c, x)) and r:
             out.append((k, (c - x) / r))
     return out
 
@@ -323,7 +341,7 @@ def terminal_margin_warnings(hist, scenarios, gate=1.0, window=10, tol=0.005):
         m = (sc.get("margins") or [None])[-1]
         # tol 是绝对容差（0.5pp）：没有它，AAPL bear 的 0.2800 vs 峰值 0.2799
         # 会渲染成"28% 高于 28%"——四舍五入造出的假阳性比漏报更伤信任。
-        if (not isinstance(m, (int, float)) or peak <= 0
+        if (not _isnum(m) or peak <= 0
                 or m <= gate * peak + tol):
             continue
         # 差距在 1pp 以内时给一位小数，避免两个数看起来一样
@@ -711,7 +729,7 @@ for name, s in cfg["scenarios"].items():
         # 当备用锚（AMZN TTM OCF/营收 20.8%，正且稳）并说明本护栏未生效。
         # 不给 OCF 设硬区间：跨行业的 P/OCF 合理带无法一刀切，给数不判罚。
         _ocf = ttm_m.get("cfo")
-        _p_ocf = (dcf_eq / _ocf) if isinstance(_ocf, (int, float)) and _ocf > 0 else None
+        _p_ocf = (dcf_eq / _ocf) if _isnum(_ocf) and _ocf > 0 else None
         if _p_ocf is not None:
             ddiag["dcf_equity_over_ttm_ocf"] = round(_p_ocf, 1)
         # 三档各出一条完整解释太吵（AMZN 实测刷了三遍同样的话）——压成一句：
