@@ -110,10 +110,17 @@ def _check_rev_override(d: dict) -> None:
 def _isnum(x):
     """数字判据：**排除 bool**。
 
-    Python 里 `bool` 是 `int` 的子类，所以 `_isnum(True)` 为真——
-    JSON 里写 `"net_cash_impact_musd": true` 会悄悄通过校验、`float(True)` 变成
-    1.0、再被渲染成 "+1M"。校验器、引擎的金额/序列判断本来全踩这个洞
-    （Copilot 在 PR #14 上点出两处，实际有 17 处，其中数处早于本轮）。
+        isinstance(True, (int, float))  ->  True    # Python 里 bool 是 int 的子类
+        _isnum(True)                    ->  False   # 本函数存在的全部理由
+
+    不排除的后果：JSON 里写 `"net_cash_impact_musd": true` 会悄悄通过校验、
+    `float(True)` 变成 1.0、再被渲染成 "+1M"。校验器与引擎的金额/序列判断
+    本来全踩这个洞（Copilot 在 PR #14 上点出两处，全仓实有 17 处，数处早于本轮）。
+
+    ⚠️ 这段 docstring 自己被误伤过：批量把 `isinstance(..., (int, float))` 换成
+    `_isnum(...)` 的正则扫全文件，把这里作为**反例**引用的 isinstance 也改了，
+    于是解释变成了字面相反的意思（Copilot 在 PR #15 上点出）。
+    改这类东西时正则不要扫注释和文档串。
     """
     return isinstance(x, (int, float)) and not isinstance(x, bool)
 

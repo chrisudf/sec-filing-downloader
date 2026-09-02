@@ -726,6 +726,20 @@ def test_isnum_rejects_non_numbers(v):
     assert _isnum(v) is False
 
 
+def test_isnum_docstring_matches_implementation():
+    """把文档和实现钉在一起。
+
+    这段 docstring 是全仓唯一解释 bool-is-int 这个坑的地方，而它**已经被悄悄
+    改坏过一次**：批量替换 isinstance -> _isnum 的正则扫全文件，把文档里作为
+    反例引用的 isinstance 也改了，于是"所以 isinstance(True,...) 为真"变成
+    "所以 _isnum(True) 为真"——字面相反，且不影响任何测试（Copilot 在 PR #15
+    上点出）。注释被改错不会让代码红，只能靠这种断言。"""
+    doc = _isnum.__doc__ or ""
+    assert "`_isnum(True)` 为真" not in doc, "文档声称 _isnum(True) 为真，与实现相反"
+    assert "_isnum(True)" in doc and "False" in doc, "文档应显式写出 _isnum(True) -> False"
+    assert _isnum(True) is False
+
+
 @pytest.mark.parametrize("field", ["amount_musd", "net_cash_impact_musd"])
 def test_ppce_bool_amount_rejected(field):
     """JSON 里的 true 不能当成 1.0M 混进金额。"""
