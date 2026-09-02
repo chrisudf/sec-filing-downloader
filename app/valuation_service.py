@@ -167,6 +167,14 @@ def _validate_judgment(d: dict, mode: str = "standard",
                     "（amount_musd：现金流入为正、流出为负，单位 $M）")
             if not isinstance(e["amount_musd"], (int, float)):
                 raise ValueError(f"post_period_capital_events[{i}].amount_musd 必须是数字（$M）")
+            # net_cash_impact_musd 可选但强烈建议：amount_musd 是现金流向，
+            # 对 net_cash（现金−负债）的影响未必相同——发债现金 +X、债务 +X、
+            # 净现金 0。缺了引擎不会替你猜，只会把合计标成"现金流向、非净现金影响"。
+            if ("net_cash_impact_musd" in e
+                    and not isinstance(e["net_cash_impact_musd"], (int, float))):
+                raise ValueError(
+                    f"post_period_capital_events[{i}].net_cash_impact_musd 必须是数字（$M）"
+                    "——该笔对 net_cash(现金−负债) 的影响，与 amount_musd(现金流向) 未必相同")
             if not str(e.get("note") or "").strip():
                 raise ValueError(f"post_period_capital_events[{i}].note 必填（原文出处）")
     # build_report.py 直接取这些 rationale 键，缺了会在花完 LLM 调用后才崩，这里提前拒绝
