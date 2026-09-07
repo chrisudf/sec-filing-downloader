@@ -30,7 +30,7 @@
 | `m1/m2 需在 [0, 60]` | [0, 60]；**仅对 NTM 营业利润为正的情景生效** | `_validate_judgment` | 同上；m2=0 表示"无次分部"，是合法值 |
 | `g/g0 需在 (-0.35, 0.9)` | (-0.35, 0.9) | `_validate_judgment` | 极端复苏年（低基数反弹 >90%）会撞上限——先确认不是把一次性因素当成常态 |
 | `gN 需在 (0, 0.12]` | (0, 0.12] | `_validate_judgment` | **终年增速必须为正**是刻意的：衰退终态应该建模进 margins 路径，不是负 gN（负 gN 会让 DCF 十年段自相矛盾）。不建议放松 |
-| `margins 必须是 (-0.3, X)` | 下界 -0.3；上界 `max(0.65, min(0.9, 1.2×TTM FCF率))` 动态，**TTM FCF 率 <= 0 时固定 0.65** | `_validate_judgment` | 上界已随标的自适应（特许权类高 FCF 率公司不会被"维持现状"路径卡住）。撞上界说明假设的 FCF 率比当前还高 20%+，要有依据。烧钱标的的 `> 0` 判断不可去：RKLB TTM FCF 率 -48% 时按 1.2 倍算出的上界是 **-0.58**，与下界 -0.3 组成空区间，任何输出都过不了（2026-08-11 修） |
+| `margins 必须是 (-0.3, X)` | 下界 -0.3；上界 `max(0.65, min(0.9, 1.2×锚))` 动态——锚默认当前 TTM FCF 率；ttm_revenue_override 偏离 XBRL TTM 营收 >10% 时（0019 口径闸）**与谷底同步改锚历史年度 FCF 利润率中位**（2026-09-07，此前上界静默塌回 0.65，高 FCF 率票连「维持现状」都被拒）；**TTM FCF 率 <= 0 时固定 0.65**；拒绝文案点名上界锚 | `_validate_judgment` | 上界已随标的自适应（特许权类高 FCF 率公司不会被"维持现状"路径卡住）。撞上界说明假设的 FCF 率比当前还高 20%+，要有依据。烧钱标的的 `> 0` 判断不可去：RKLB TTM FCF 率 -48% 时按 1.2 倍算出的上界是 **-0.58**，与下界 -0.3 组成空区间，任何输出都过不了（2026-08-11 修） |
 | `wacc 越界` | [0.05, 0.2] | `_validate_judgment` | 高利率环境或高风险标的可放宽上限 |
 | `wacc-tg 需 >= 0.045` | 0.045 | `_validate_judgment` | **不建议放松**，DCF 终值对此极敏感（差值趋零时终值爆炸） |
 | `opm/tax 越界` | opm **(-1.0, 0.95)**、tax [0, 0.5) | `_validate_judgment` | MU 这类周期顶部 OPM 能到 66%，0.95 留了足够余量。下限 2026-08-11 从 0 改为 -1.0，见下方「未盈利标的」 |
@@ -41,7 +41,7 @@
 | `情景排序：margins 第 N 年必须 bear <= base <= bull` | margins 逐年（2026-08-31 补） | `_validate_judgment` | **不该调**。典型成因：bear 谷底被『>= 0.4×TTM FCF 利润率』顶上来后越过 base——正确修法是抬高 base/bull 路径，不是让 bear 越过 base。INTC 2026-08-30 实测：net_cash 陈旧 → bear 假红旗 → gate 打回后判断层上修 bear.margins 到 base 之上，v2 只排序标量所以静默通过 |
 | `bear 双重计数` | 触发条件：bear 盈利 < base 的 **80%** 且 pe/m1/m2 < base 的 **0.6 倍** | `_validate_judgment` | 这是压漂移的主力规则。真觉得误伤，优先用 `permanent_impairment=true` + `impairment_note`（要给财报原文出处）豁免单个情景，而不是放宽 0.6 |
 | `bull 双重计数` | bull 盈利 > base 的 **125%** 且 pe/m1/m2 > base 的 **1.4 倍** | `_validate_judgment` | 同上；bull 没有豁免通道（景气顶点倍数收敛是稳健假设） |
-| `margins 谷底 < 0.4×TTM FCF率` | 0.4 倍；仅当 TTM FCF 率 > 2% 时启用 | `_validate_judgment` | 比腰斩更深的常态化路径属于永久受损，同一豁免通道 |
+| `margins 谷底 < 0.4×…` | 0.4 倍；锚 = 当前 TTM FCF 率（>2% 时）；TTM <=2% 或为负时改锚**历史年度 FCF 利润率中位**（>2% 时，2026-08-31——FCF 为负恰是 DCF 最不可靠的时候，护栏不能反而关掉）；两个锚都 <=2%/缺失才停用 | `_validate_judgment` | 比腰斩更深的常态化路径属于永久受损，同一豁免通道；拒绝文案会写明本次用的是哪个锚（当前 TTM / 历史年度中位） |
 | `fwd_shares 必须为正数` | > 0 | `_validate_judgment` | 不该调 |
 
 **豁免通道**：在单个情景里设 `"permanent_impairment": true` + `"impairment_note": "<财报原文出处>"`，

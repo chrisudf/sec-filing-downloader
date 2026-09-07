@@ -168,6 +168,16 @@ async def company_info(ticker: str, email: str) -> dict:
     }
 
 
+async def recent_filings(ticker: str, email: str) -> list[dict]:
+    """submissions 的 recent 提交清单（form/filingDate/reportDate/items…），
+    不下载任何文档——估值管道的「报告期后 filing 索引」用。recent 覆盖最近
+    约 1000 条，对"报告期（≤1 个季度前）之后"的窗口绰绰有余，不拉分页文件。"""
+    ticker = ticker.strip().upper()
+    async with _client(email) as client:
+        _, subs = await _submissions(client, ticker)
+    return _rows(subs["filings"]["recent"])
+
+
 async def _list_filings(
     client: httpx.AsyncClient, subs: dict, forms: list[str], dstart: date, dend: date
 ) -> list[dict]:

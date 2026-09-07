@@ -12,6 +12,7 @@ import re
 from pathlib import Path
 
 import pytest
+from bs4 import BeautifulSoup
 
 # extract_sections.py 是模块级脚本（import 即读 sys.argv 并写文件），不能直接
 # import——按 test_pure.py 的手法从生产源码逐字抽函数 + 它依赖的模块级常量。
@@ -19,7 +20,8 @@ _SRC = (Path(__file__).resolve().parent.parent / "valuation"
         / "extract_sections.py").read_text(encoding="utf-8")
 _TREE = ast.parse(_SRC)
 _NEEDED = {"KEYWORDS", "KEYWORDS_RISK", "KEYWORDS_SUBSEQ", "CTX_BEFORE", "CTX_AFTER",
-           "MAX_HITS", "MAX_TOTAL", "CTX_AFTER_SUBSEQ", "SUBSEQ_RESERVE", "RISK_RESERVE"}
+           "MAX_HITS", "MAX_TOTAL", "CTX_AFTER_SUBSEQ", "SUBSEQ_RESERVE", "RISK_RESERVE",
+           "FACT_MIN"}
 _SEGS = []
 for _n in _TREE.body:
     if isinstance(_n, ast.Assign) and any(
@@ -28,13 +30,15 @@ for _n in _TREE.body:
     elif isinstance(_n, ast.Assign) and isinstance(_n.targets[0], ast.Tuple) and any(
             isinstance(e, ast.Name) and e.id in _NEEDED for e in _n.targets[0].elts):
         _SEGS.append(ast.get_source_segment(_SRC, _n))
-    elif isinstance(_n, ast.FunctionDef) and _n.name == "collect_hits":
+    elif isinstance(_n, ast.FunctionDef) and _n.name in ("collect_hits", "html_to_text"):
         _SEGS.append(ast.get_source_segment(_SRC, _n))
-_NS = {"re": re}
+_NS = {"re": re, "BeautifulSoup": BeautifulSoup}
 exec("\n".join(_SEGS), _NS)
 collect_hits = _NS["collect_hits"]
+html_to_text = _NS["html_to_text"]
 SUBSEQ_RESERVE, RISK_RESERVE = _NS["SUBSEQ_RESERVE"], _NS["RISK_RESERVE"]
 CTX_AFTER, CTX_AFTER_SUBSEQ = _NS["CTX_AFTER"], _NS["CTX_AFTER_SUBSEQ"]
+MAX_TOTAL, FACT_MIN = _NS["MAX_TOTAL"], _NS["FACT_MIN"]
 
 
 AMZN_REAL = (
@@ -124,3 +128,104 @@ def test_dedup_keeps_distinct_events():
     subs = _channels(hits)["subsequent"]
     joined = " ".join(h["text"] for h in subs)
     assert "21.3 billion" in joined and "25.0 billion" in joined
+
+
+# ---- 多文件预算不变量（运行期复现：7/9/10 文件时 fact=0）----
+
+def _boilerplate_10q():
+    """复现形态：两条 "Subsequent to" 模板文（各 ~1.5k 字符窗口）在前，
+    流动性/税率/减值内容在后。填充各不相同——去重按前 200 字符比对。"""
+    t = ""
+    for i in range(2):
+        t += (" Subsequent to June 30, 2026, boilerplate item %d. " % i
+              + ("S%d" % i) * 700)
+    t += " Cash, cash equivalents, and marketable securities were " + "c" * 1100
+    t += " effective tax rate of 15%. " + "e" * 1100
+    t += " impairment charges were immaterial. " + "r" * 1100
+    return t
+
+
+@pytest.mark.parametrize("nfiles", [2, 7, 9, 10])
+def test_fact_survives_any_file_count(nfiles):
+    """不变量：每个通道的预留在任意文件数下都要兑现。修前 file_total 累计制下
+    subsequent 只被 SUBSEQ_RESERVE 封顶，>=7 文件（per_file<=6428）时两条模板
+    期后文就把 fact 的上限垫掉——流动性/现金通道整个饿死（fact=0）。"""
+    per_file = MAX_TOTAL // nfiles
+    hits, used = collect_hits(_boilerplate_10q(), per_file)
+    ch = _channels(hits)
+    assert "fact" in ch, f"nfiles={nfiles}: fact 通道被 subsequent 吃光"
+    assert "risk" in ch, f"nfiles={nfiles}: risk 通道被饿死"
+    assert used <= per_file
+
+
+def test_subsequent_still_runs_when_budget_allows():
+    """预算充足（2/7 文件）时 subsequent 不受新封顶影响；per_file 太小时
+    它牺牲（0 条是合法输出——期后段落本就可能不存在），fact/risk 优先。"""
+    for nfiles in (2, 7):
+        hits, _ = collect_hits(_boilerplate_10q(), MAX_TOTAL // nfiles)
+        assert "subsequent" in _channels(hits), f"nfiles={nfiles}"
+
+
+# ---- ix:hidden / ix:header 标签汤剥离 ----
+
+_IXBRL_10Q = """<html><body>
+<div style="display:none"><ix:header><ix:hidden>
+<ix:nonNumeric name="dei:AmendmentFlag" contextRef="c1">false</ix:nonNumeric>
+</ix:hidden>
+<ix:resources>
+<xbrli:context id="c1"><xbrli:entity><xbrli:segment>
+<xbrldi:explicitMember dimension="us-gaap:StatementBusinessSegmentsAxis"
+>msft:ShareRepurchaseProgramMember</xbrldi:explicitMember>
+</xbrli:segment></xbrli:entity>
+<xbrli:period><xbrli:startDate>2026-04-01</xbrli:startDate>
+<xbrli:endDate>2026-06-30</xbrli:endDate></xbrli:period>
+</xbrli:context>
+</ix:resources></ix:header></div>
+<p>During the quarter, we repurchased 10.2 million shares under our share
+repurchase program for $4.1 billion. Restructuring charges were immaterial.</p>
+</body></html>"""
+
+
+def test_ix_hidden_and_header_stripped():
+    """实测（GOOG/MSFT/TSLA/TSM）：context 标签汤被 get_text 拍平后污染
+    repurchase/restructuring 通道成纯 context-ref 堆。容器删掉、prose 保留。"""
+    text = html_to_text(_IXBRL_10Q)
+    assert "ShareRepurchaseProgramMember" not in text
+    assert "2026-04-01" not in text and "AmendmentFlag" not in text
+    assert "repurchased 10.2 million shares" in text
+    assert "Restructuring charges" in text
+
+
+def test_excerpt_is_prose_not_context_soup():
+    hits, _ = collect_hits(html_to_text(_IXBRL_10Q), 40_000)
+    rep = [h for h in hits if h["keyword"] == "repurchase"]
+    assert rep, "正文里的 repurchase prose 必须仍被抓到"
+    assert "msft:" not in rep[0]["text"]
+    assert "$4.1 billion" in rep[0]["text"]
+
+
+# ---- 未闭合 ix 容器的吞文护栏（0022 UV2）----
+
+def test_unclosed_ix_hidden_does_not_swallow_document():
+    """未闭合 <ix:hidden>：lxml 的容错解析会把其后**全部正文**嵌进该子树，
+    decompose 连正文一起静默吞掉——SECTIONS 变空还不报错。摘除量过半即回退
+    不摘除（宁要标签汤污染的假命中，不要整份财报消失）。"""
+    prose = "Cash and marketable investments totaled $12.3 billion. " * 40
+    html = f"<html><body><ix:hidden>ctx-junk<div>{prose}</div></body></html>"
+    text = html_to_text(html)
+    assert "marketable investments" in text
+
+
+def test_unclosed_ix_header_does_not_swallow_document():
+    prose = "capital expenditures were $2.1 billion in the quarter. " * 40
+    html = f"<html><body><ix:header>meta<div>{prose}</div></body></html>"
+    assert "capital expenditures" in html_to_text(html)
+
+
+def test_wellformed_ix_hidden_still_stripped():
+    """护栏不动合法路径：闭合的 ix 容器照常摘除，prose 保留。"""
+    prose = "Real prose about the repurchase program. " * 40
+    html = ("<html><body><ix:hidden>msft:Member 2026-04-01</ix:hidden>"
+            f"<div>{prose}</div></body></html>")
+    text = html_to_text(html)
+    assert "msft:Member" not in text and "repurchase program" in text

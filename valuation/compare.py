@@ -25,9 +25,11 @@ if old.get("mode", "standard") != mode:
 _sv_o, _sv_n = old.get("semantics_version", 1), new.get("semantics_version", 1)
 if _sv_o != _sv_n:
     print(f"⚠️  估值语义版本不同（v{_sv_o} → v{_sv_n}）：standard v2（2026-07-22）起有跨情景"
-          "联动约束与 SOTP 降级、v3（2026-08-14）起 base PE 默认锚历史 NTM 带子窗 P50；"
-          "financials v2（2026-08-14）起 base P/TBV 锚历史带——倍数类假设的漂移不可"
-          "直接读作判断层改了主意，综合目标价口径与水平也可能不同\n")
+          "联动约束与 SOTP 降级、v3（2026-08-14）起 base PE 默认锚历史 NTM 带子窗 P50、"
+          "v4（2026-09-06）起服务器注入 FCF 锚表/OI&E 残差行/期后 filing 索引（margins 与 "
+          "other_income 的锚来源改变）；financials v2（2026-08-14）起 base P/TBV 锚历史带、"
+          "fin v3（2026-09-06）起亏损协议（nm<=0 → pe=0，PE 腿退出综合）与跨情景排序"
+          "——倍数类假设的漂移不可直接读作判断层改了主意，综合目标价口径与水平也可能不同\n")
 
 # blend 权重对比：权重是口径不是假设——等权与缺省（老文件无该键）视为等价
 def _wnorm(w):
@@ -44,9 +46,17 @@ if _bw_o != _bw_n:
 # 参与综合的**腿集合**也是口径，而且 _wnorm 恰好把它抹掉了（PR #3 review）：
 # 等权三腿 {pe:1,dcf:1,sotp:1} 与等权两腿 {pe:1,dcf:1} 归一化后都是 {}，于是
 # seg1_share 跨过 0.85 门槛导致 SOTP 进/出综合时，上面那条权重警告一声不响。
-# 腿集合优先取 blend_weights 的键（0056 起只记录"本次可能参与综合"的腿），
-# 老文件无该键时退回 meta.sotp_in_blend 推断，再不行标记为未知（不报假警）。
-def _legs(v):
+# 腿集合按**逐情景**取（0022 C15，向 trend.py:120 看齐）：近零/负利润守卫是
+# 逐情景剔腿的（fin v3 的 bear PE 腿 n.m. 退出、standard 的 COIN 型同构），
+# 顶层 blend_weights 恒为全集——两次 fin v3 运行间 bear.nm 跨过 0/1% 门槛时，
+# bear 综合从两腿均值变 P/TBV 单腿（合成复现 +63.6%），文件级键集看不出任何
+# 变化，口径警告一声不响、底部噪声警报还把它归因成假设漂移。
+# 回退链：scenarios[sc].blend_methods > blend_weights 键（0056 起只记录"本次
+# 可能参与综合"的腿）> meta.sotp_in_blend 推断 > 未知（不报假警）。
+def _legs(v, sc):
+    bm = ((v.get("scenarios") or {}).get(sc) or {}).get("blend_methods")
+    if bm:
+        return frozenset(bm)
     w = v.get("blend_weights")
     if isinstance(w, dict) and w:
         return frozenset(w)
@@ -56,15 +66,16 @@ def _legs(v):
     return frozenset(("pe", "dcf") + (("sotp",) if si else ()))
 
 
-_lg_o, _lg_n = _legs(old), _legs(new)
-if _lg_o and _lg_n and _lg_o != _lg_n:
-    _fmt = lambda s: "/".join(sorted(x.upper() for x in s))    # noqa: E731
-    _si_o = (old.get("meta") or {}).get("sotp_in_blend")
-    _si_n = (new.get("meta") or {}).get("sotp_in_blend")
-    _why = ("（主分部利润占比跨过 85% 门槛，SOTP 降级/恢复）"
-            if _si_o is not None and _si_n is not None and _si_o != _si_n else "")
-    print(f"⚠️  参与综合的方法不同（{_fmt(_lg_o)} → {_fmt(_lg_n)}）{_why}：综合是不同"
-          "条数的均值，③ 里的水平差异先归因口径，不要读作假设修正\n")
+for _sc in ("bear", "base", "bull"):
+    _lg_o, _lg_n = _legs(old, _sc), _legs(new, _sc)
+    if _lg_o and _lg_n and _lg_o != _lg_n:
+        _fmt = lambda s: "/".join(sorted(x.upper() for x in s))    # noqa: E731
+        _si_o = (old.get("meta") or {}).get("sotp_in_blend")
+        _si_n = (new.get("meta") or {}).get("sotp_in_blend")
+        _why = ("（主分部利润占比跨过 85% 门槛，SOTP 降级/恢复）"
+                if _si_o is not None and _si_n is not None and _si_o != _si_n else "")
+        print(f"⚠️  {_sc} 参与综合的方法不同（{_fmt(_lg_o)} → {_fmt(_lg_n)}）{_why}：综合是"
+              "不同条数的均值，③ 里该情景的水平差异先归因口径，不要读作假设修正\n")
 
 # 前瞻窗口对比：NTM 窗口随报告期滚动，跨季对比时不同是正常的（下面会如实打印）；
 # 但**同一报告期**内两次运行窗口不同 = 口径分裂，g/eps1/pe 全部不可直接对比——

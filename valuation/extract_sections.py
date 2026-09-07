@@ -44,6 +44,14 @@ CTX_AFTER_SUBSEQ, SUBSEQ_RESERVE = 1_400, 4_000
 # （AMZN 实测 2 -> 0）。risk 多是模板披露没错，但**静默吃掉一整个通道**和这一系列
 # PR 在修的毛病是同一个。留一小格，让每个通道都有代表。
 RISK_RESERVE = 2_500
+# fact 也要有保底：file_total 是跨通道累计的，subsequent 的上限若只看
+# SUBSEQ_RESERVE，多文件时（>=7 个文件 per_file<=6428）两条 "Subsequent to"
+# 模板文（各 ~1.5k）就把 fact 的上限（per_file - RISK_RESERVE）整个垫掉
+# ——流动性/现金通道被饿死，恰是这套分通道预算要保护的对象（运行期已复现
+# 7/9/10 文件 fact=0）。不变量：**每个通道的预留在任意文件数下都要兑现**
+# ——subsequent 的上限再被 per_file - RISK_RESERVE - FACT_MIN 封顶，
+# per_file 太小时宁可牺牲 subsequent（它本就是可选段落，0 条是合法输出）。
+FACT_MIN = 2_000
 
 
 def collect_hits(text, per_file):
@@ -55,8 +63,12 @@ def collect_hits(text, per_file):
     抽成函数是为了能直接单测——此前整段逻辑写在模块级，改动只能靠跑真财报验证。
     """
     hits, file_total, full = [], 0, False
+    # budget 是对累计 file_total 的封顶：subsequent 除了自己的预留，还必须给
+    # fact（FACT_MIN）和 risk（RISK_RESERVE）留出位置，否则多文件小 per_file
+    # 时后两个通道从数学上就进不来（见 FACT_MIN 处的不变量说明）
     for channel, kws, ctx_after, budget in (
-            ("subsequent", KEYWORDS_SUBSEQ, CTX_AFTER_SUBSEQ, min(SUBSEQ_RESERVE, per_file)),
+            ("subsequent", KEYWORDS_SUBSEQ, CTX_AFTER_SUBSEQ,
+             min(SUBSEQ_RESERVE, max(0, per_file - RISK_RESERVE - FACT_MIN))),
             ("fact", KEYWORDS, CTX_AFTER, max(0, per_file - RISK_RESERVE)),
             ("risk", KEYWORDS_RISK, CTX_AFTER, per_file)):
         for kw in kws:
@@ -85,6 +97,31 @@ def collect_hits(text, per_file):
     return hits, file_total
 
 
+def html_to_text(html):
+    """HTML -> 平文本。先摘除 iXBRL 的 ix:hidden / ix:header 子树再 get_text：
+    里面是 XBRL context/unit/隐藏事实的标签汤，成员名与期间日期会被 get_text
+    拍成 "msft:ShareRepurchaseProgram... 2026-04-01 2026-06-30" 这类文本——
+    实测（GOOG/MSFT/TSLA/TSM）repurchase/restructuring/risk 通道整个被
+    context 引用堆污染成假命中。只删 ix 命名空间的容器，正文 prose 原样保留。
+
+    吞文护栏（0022 UV2）：ix:hidden/ix:header 未闭合时，lxml 的容错解析会把
+    **文档其余全部内容**嵌进该未闭合子树，decompose 连正文一起静默吞掉——
+    判断层拿到的 SECTIONS 是空的还不报错。合法的 ix 容器只是页头一小块元数据，
+    摘除量不可能过半：摘除后文本少于原文一半即回退不摘除（接受标签汤污染假命中
+    的已知代价，好过整份财报消失）。"""
+    soup = BeautifulSoup(html, "lxml")
+    ix = soup.find_all(re.compile(r"^ix:(hidden|header)$", re.I))
+    if not ix:
+        return re.sub(r"\s+", " ", soup.get_text(" ", strip=True))
+    full = soup.get_text(" ", strip=True)
+    for tag in ix:
+        tag.decompose()
+    text = soup.get_text(" ", strip=True)
+    if len(text) < 0.5 * len(full):
+        text = full
+    return re.sub(r"\s+", " ", text)
+
+
 out = {}
 total = 0
 files = sys.argv[2:]
@@ -94,8 +131,7 @@ files = sys.argv[2:]
 per_file = MAX_TOTAL // max(1, len(files))
 for path in files:
     with open(path, encoding="utf-8", errors="ignore") as f:
-        soup = BeautifulSoup(f.read(), "lxml")
-    text = re.sub(r"\s+", " ", soup.get_text(" ", strip=True))
+        text = html_to_text(f.read())
     hits, file_total = collect_hits(text, per_file)
     total += file_total
     out[path.replace("\\", "/").rsplit("/", 1)[-1]] = hits

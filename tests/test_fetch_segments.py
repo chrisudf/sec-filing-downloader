@@ -210,12 +210,13 @@ def test_collect_versions_skips_structural_failure(monkeypatch):
         return parsed_ok
 
     monkeypatch.setattr(fs, "_parse_filing_cached", fake_parse)
-    versions, totals, conc, skipped = fs._collect_versions(
+    versions, totals, conc, skipped, dropped = fs._collect_versions(
         None, 1, [{"acc": "bad-acc", "filed": "2026-08-26"},
                   {"acc": "good-acc", "filed": "2026-05-20"}])
     assert skipped == [("bad-acc", "申报 bad-acc 里找不到 XBRL instance")]
     assert ("segment", "2026-01-01", "2026-03-31") in versions
     assert totals[("2026-01-01", "2026-03-31")][1] == 100e6
+    assert dropped == {}
 
 
 def test_collect_versions_transient_still_raises(monkeypatch):
@@ -368,6 +369,70 @@ def test_build_segments_all_skipped_raises_true_cause(monkeypatch):
     monkeypatch.setattr(fs, "_sweep_stale_cache", lambda: None)
     monkeypatch.setattr(fs, "_collect_versions", lambda c, k, p: (
         {}, {}, {}, [("a1", "申报 a1 里找不到 XBRL instance"),
-                     ("a2", "申报 a2 里找不到 XBRL instance")]))
+                     ("a2", "申报 a2 里找不到 XBRL instance")], {}))
     with pytest.raises(SegmentsError, match="全部取不到"):
+        fs.build_segments("XXXX", "t@e.st", cik=1)
+
+
+# ---- TR1-3 旧名 transform（NVDA 2019-2020 申报的实测形态）----
+
+def test_parse_instance_ixbrl_tr3_names_equal_tr4():
+    # 同一份文档只把 TR4 连字符名换成 TR3 无连字符旧名：解析结果必须逐位相等
+    tr3 = _IXBRL_DOC.replace(b"ixt:num-dot-decimal", b"ixt3:numdotdecimal")
+    out4, out3 = _parse_instance(_IXBRL_DOC), _parse_instance(tr3)
+    assert out3["periods"] == out4["periods"]
+    assert out3["concentration"] == out4["concentration"]
+    assert out3["dropped_transforms"] == {}
+
+
+def test_ix_number_tr_family_names():
+    import xml.etree.ElementTree as ET
+    from valuation.fetch_segments import _ix_number
+    # dot-decimal 族：TR1/TR2-3/TR4 名等价（format 前缀是申报方自选文本）
+    for f in ("ixt:numcommadot", "ixt3:numdotdecimal", "ixt4:num-dot-decimal"):
+        el = ET.fromstring(f'<n format="{f}" scale="6">96,221</n>')
+        assert _ix_number(el) == 96_221e6, f
+    # zero 族
+    for f in ("ixt:numdash", "ixt3:zerodash", "ixt4:fixed-zero"):
+        el = ET.fromstring(f'<n format="{f}">7</n>')
+        assert _ix_number(el) == 0.0, f
+    # TR1 numspacedot：空格千分位
+    el = ET.fromstring('<n format="ixt:numspacedot" scale="3">1 234.5</n>')
+    assert _ix_number(el) == 1_234_500.0
+
+
+def test_ix_number_unknown_transform_traced():
+    import xml.etree.ElementTree as ET
+    from valuation.fetch_segments import _ix_number
+    dropped = {}
+    el = ET.fromstring('<n format="ixt:num-comma-decimal">1.234,5</n>')
+    assert _ix_number(el, dropped) is None
+    assert dropped == {"num-comma-decimal": 1}
+
+
+def test_parse_instance_unknown_transform_counted():
+    # 三个营收事实全被未识别 transform 丢掉：零期 + 计数上浮（不再静默）
+    doc = _IXBRL_DOC.replace(b"ixt:num-dot-decimal", b"ixt:num-comma-decimal")
+    out = _parse_instance(doc)
+    assert out["periods"] == {}
+    assert out["dropped_transforms"] == {"num-comma-decimal": 3}
+
+
+def test_collect_versions_aggregates_dropped(monkeypatch):
+    monkeypatch.setattr(fs, "_parse_filing_cached", lambda c, k, a: {
+        "periods": {}, "concentration": [],
+        "dropped_transforms": {"num-comma-decimal": 2}})
+    *_, dropped = fs._collect_versions(
+        None, 1, [{"acc": "a", "filed": "f1"}, {"acc": "b", "filed": "f2"}])
+    assert dropped == {"num-comma-decimal": 4}
+
+
+def test_build_segments_all_dropped_raises(monkeypatch):
+    # 事实全被未识别 transform 丢掉且无 skip 记录：不许 404 成「公司未披露」
+    monkeypatch.setattr(fs, "_list_filings", lambda c, k, cut: [
+        {"acc": "a1", "filed": "2026-08-26", "report": "2026-07-26"}])
+    monkeypatch.setattr(fs, "_sweep_stale_cache", lambda: None)
+    monkeypatch.setattr(fs, "_collect_versions", lambda c, k, p: (
+        {}, {}, {}, [], {"num-comma-decimal": 40}))
+    with pytest.raises(SegmentsError, match="transform"):
         fs.build_segments("XXXX", "t@e.st", cik=1)

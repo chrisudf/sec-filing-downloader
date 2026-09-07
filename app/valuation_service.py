@@ -39,6 +39,27 @@ PY = sys.executable
 # sonnet 慢，且 v2 一次运行最多 3 次调用（schema retry + 经济复审），放宽到 600s
 CLAUDE_TIMEOUT = 600
 
+
+def _claude_timeout() -> int:
+    """判断层超时秒数：VALUATION_CLAUDE_TIMEOUT（正整数秒）覆盖默认 600。
+
+    垃圾值忽略并告警，不许毒化任务：用 int() 而非 float()——姊妹仓的教训是
+    float('nan') 能通过 float() 转换，把轮询间隔毒成 NaN 引发 boot loop；
+    int() 天然拒绝 'nan'/'inf'/小数字符串，再拦非正数即可。每次调用现读环境，
+    与 VALUATION_JUDGMENT_CMD 同法（改环境无需重启进程）。"""
+    raw = (os.environ.get("VALUATION_CLAUDE_TIMEOUT") or "").strip()
+    if not raw:
+        return CLAUDE_TIMEOUT
+    try:
+        v = int(raw)
+    except ValueError:
+        v = 0
+    if v <= 0:
+        print(f"警告: VALUATION_CLAUDE_TIMEOUT={raw!r} 不是正整数秒，"
+              f"忽略并使用默认 {CLAUDE_TIMEOUT}s", file=sys.stderr)
+        return CLAUDE_TIMEOUT
+    return v
+
 # 判断层登录失效的识别（stderr 文本匹配）。Claude Code 的鉴权错误不走独立退出码，
 # 只能认文案——命中即归类为 auth，前端据此给「登录」按钮而不是一段红字。
 # 认漏的代价只是退回普通错误展示，所以宁可宽一点。
@@ -107,6 +128,45 @@ def _check_rev_override(d: dict) -> None:
         raise ValueError("提供 ttm_revenue_override 时必须附 ttm_revenue_note（出处）")
 
 
+def _fcfm_for_validation(fcfm: float | None, override,
+                         xbrl_rev_m: float | None) -> float | None:
+    """校验用 TTM FCF 利润率的口径闸（0019）。
+
+    ttm_revenue_override 只换营收基准；TTM cfo/capex 仍停在旧 XBRL 窗口。override
+    偏离 XBRL TTM 营收 >10% 时（TSM 实测：旧口径 FCF 率 19.6% vs 真实 25.8%），
+    margins 谷底下限（0.4×当前）与上界（1.2×当前）都锚在过期分母上——把陈旧的
+    「当前」当锚比没有锚更糟。此时返回 None，_validate_judgment 自动落回历史年度
+    FCF 利润率中位锚（prompt 已在 0013 写明该回退）。<=10% 的偏差属正常季度滚动，
+    照用当前 TTM。override 为垃圾值时原样放行——_check_rev_override 会拒绝它，
+    这里不抢校验层的活。"""
+    if fcfm is None or not _isnum(override) or not override or not xbrl_rev_m:
+        return fcfm
+    if abs(override / xbrl_rev_m - 1) > 0.10:
+        return None
+    return fcfm
+
+
+def _hist_fcfm_median(facts: dict) -> float | None:
+    """历史年度 FCF 利润率中位——margins 谷底/上界的备用锚。
+
+    与 engine.hist_fcf_margins 同口径（年度 CFO−capex ÷ 营收），取最近 10 个
+    可算财年的中位。抽成函数（0022 C4）：此前只内联在 _pipeline 里，回归工具
+    check_configs 根本拿不到这个锚——产线按历史中位放行的 config 被工具用陈旧
+    TTM 锚 BLOCK，违反它自己「回归工具比产线严=假警报」的不变量。产线与工具
+    必须共用同一实现。"""
+    hm = []
+    for k in sorted(facts.get("revenue_annual") or {}):
+        r = (facts.get("revenue_annual") or {}).get(k)
+        c = (facts.get("cfo_annual") or {}).get(k)
+        x = (facts.get("capex_annual") or {}).get(k)
+        if all(_isnum(v) for v in (r, c, x)) and r:
+            hm.append((c - x) / r)
+    if not hm:
+        return None
+    hm = sorted(hm[-10:])
+    return hm[len(hm) // 2]
+
+
 def _isnum(x):
     """数字判据：**排除 bool**。
 
@@ -161,14 +221,24 @@ def _validate_judgment(d: dict, mode: str = "standard",
         raise ValueError("fwd_shares 必须为正数（百万股）")
     if not _isnum(d["other_income"]):
         raise ValueError("other_income 必须是数字（$M）")
+    # 类型墙（0014）：need 只保证键存在——net_cash="约 5,000"（字符串）、adj_note=null
+    # 会穿过校验，烧完 LLM 调用后才崩在 engine（dcf 的 net_cash 加法）/build_report
+    # （adj_note[:40] 切片）。financials 分支的 adj_ni _isnum 注释点名的正是这个失败
+    # 模式，standard 一直没补。note 类字段镜像 other_income_note 的非空字符串检查。
+    for _k in ("net_cash", "adj_ni"):
+        if not _isnum(d[_k]):
+            raise ValueError(f"{_k} 必须是数字（$M）")
+    for _k in ("net_cash_note", "adj_note"):
+        if not str(d.get(_k) or "").strip():
+            raise ValueError(f"{_k} 必填且须为非空字符串（口径与出处）")
     if not str(d.get("other_income_note") or "").strip():
         raise ValueError(
             "other_income_note 必填：写清从财报哪一行取（通常是『Interest and "
             "other, net』或等价行）、剔除了哪些一次性项目、如何年化。"
-            "FACTS 里已给 interest_income / interest_expense_nonop / other_nonop / "
-            "equity_inv_gain / fx_gain 的年度+季度序列，推导要落在这些数上")
-    if not 0 <= d["seg1_share"] <= 1:
-        raise ValueError("seg1_share 必须在 0-1")
+            "FACTS 的「OI&E 组件」区已列出本票实际可用的组件序列与逐季 "
+            "税前−营业利润 残差行，推导要落在这些数上（标注不可用的序列不要引用）")
+    if not _isnum(d["seg1_share"]) or not 0 <= d["seg1_share"] <= 1:
+        raise ValueError("seg1_share 必须是 0-1 的数字")
     # 期后资本事件（可选，2026-08-31）：报告期末之后发生的增发/回购/并购/分拆。
     # 引擎**不**用它自动调 net_cash——那需要 buyback/dividends 的 XBRL 抽取可靠，
     # 而实测 META/GOOG 的 buyback、PFE 的 dividends 存在整季空值，自动化会在最
@@ -193,8 +263,19 @@ def _validate_judgment(d: dict, mode: str = "standard",
                 raise ValueError(
                     f"post_period_capital_events[{i}].net_cash_impact_musd 必须是数字（$M）"
                     "——该笔对 net_cash(现金−负债) 的影响，与 amount_musd(现金流向) 未必相同")
+            # reflected_in_net_cash（v4）可选：布尔确认「该笔最终影响已计入 net_cash」。
+            # 有金额的事件全带 true 时引擎把"请确认已计入"黄旗降级为 info 留痕行。
+            # 引擎只认布尔 True——"true"（字符串）会静默不生效，宁可在这里拒绝
+            if ("reflected_in_net_cash" in e
+                    and not isinstance(e["reflected_in_net_cash"], bool)):
+                raise ValueError(
+                    f"post_period_capital_events[{i}].reflected_in_net_cash "
+                    "必须是布尔 true/false（不接受字符串）")
             if not str(e.get("note") or "").strip():
                 raise ValueError(f"post_period_capital_events[{i}].note 必填（原文出处）")
+    # ppce_note（v4）可选：期后事件与 net_cash 的对账说明一句话，引擎附在 info 行后
+    if "ppce_note" in d and not isinstance(d["ppce_note"], str):
+        raise ValueError("ppce_note 必须是字符串（期后事件对账的一句话说明）")
     # build_report.py 直接取这些 rationale 键，缺了会在花完 LLM 调用后才崩，这里提前拒绝
     if not isinstance(d["rationale"], dict):
         raise ValueError("rationale 必须是对象")
@@ -232,12 +313,27 @@ def _validate_judgment(d: dict, mode: str = "standard",
         # 静态上界会连"维持现状"的路径都拒绝，两次 retry 撞同一堵墙后硬失败）。
         # `> 0` 不可省：烧钱标的 TTM FCF 率为负（RKLB 实测 -48%），只判真值会算出
         # m_cap = 1.2 × -0.48 = -0.58，与下界 -0.3 组成**空区间**——任何输出都过不了，
-        # 两次 retry 后必然硬失败，报错文案还写着一个看不出矛盾的"上界"
-        m_cap = max(0.65, min(0.9, 1.2 * fcf_margin)) if (fcf_margin and fcf_margin > 0) else 0.65
+        # 两次 retry 后必然硬失败，报错文案还写着一个看不出矛盾的"上界"。
+        # 0022（评审 C2/C12）：fcf_margin 为 None（0019 的 override >10% 偏差口径闸，
+        # 或回归工具缺 facts）时，上界与谷底下限**一致地**改锚历史年度中位——此前
+        # 只有下限换锚、上界静默塌回 0.65，真实 FCF 率 >0.54 的高利润率票连「维持
+        # 现状」的 margins 都被拒，两次 retry 撞同一堵墙。负 TTM FCF（烧钱标的）
+        # 仍固定 0.65（prompt 契约明写「<=0 固定 0.65」，不在本次换锚范围）。
+        if fcf_margin and fcf_margin > 0:
+            m_anchor, m_anchor_src = fcf_margin, "当前 TTM FCF 利润率"
+        elif fcf_margin is None and hist_fcf_margin and hist_fcf_margin > 0:
+            m_anchor, m_anchor_src = hist_fcf_margin, "历史年度 FCF 利润率中位"
+        else:
+            m_anchor, m_anchor_src = None, ""
+        m_cap = max(0.65, min(0.9, 1.2 * m_anchor)) if m_anchor else 0.65
         # 上界含等号，与 prompt / TUNING.md 的 (-0.3, cap] 一致：模型给恰好等于上界
-        # 的值（如 0.65）不该被误拒触发无谓 retry
+        # 的值（如 0.65）不该被误拒触发无谓 retry。拒绝文案点名本次上界锚在哪
+        # （C12：自愿 override 换锚在 prompt 期不可知，retry 必须从拒绝文案获知）
         if not all(_isnum(m) and -0.3 < m <= m_cap for m in s["margins"]):
-            raise ValueError(f"{sc}.margins 必须是 (-0.3, {m_cap:.2f}] 内的数字（FCF 利润率）")
+            raise ValueError(
+                f"{sc}.margins 必须是 (-0.3, {m_cap:.2f}] 内的数字（FCF 利润率；上界锚="
+                + (f"{m_anchor_src}({m_anchor:.0%})×1.2" if m_anchor else "静态 0.65")
+                + "）")
         if not 0.05 <= s["wacc"] <= 0.2:
             raise ValueError(f"{sc}.wacc 越界")
         if s["wacc"] - s["tg"] < 0.045:
@@ -309,21 +405,39 @@ def _validate_judgment(d: dict, mode: str = "standard",
     if rev0:
         eps = {n: _scenario_eps(d, d["scenarios"][n], rev0)
                for n in ("bear", "base", "bull")}
+
+        def _forced_zero_keys(s):
+            """亏损协议（上方逐情景块）强制写 0 的倍数键——同一判据同一式。
+
+            0022（评审 C3）：0013 的 prompt 明写「营业亏损叠加大额利息收入可以
+            税前为正——此时 m1/m2 仍须写 0，而 pe 照常规边界给」，而反双重计数
+            此前对这个 split 形态照打「请上调 bear.m1」——上调又被「营业利润为负，
+            m1/m2 必须写 0」拒绝，诚实配置无解、两次 retry 烧光后硬失败。被协议
+            钉死为 0 的键不是判断层的假设，剔出双重计数检查。pe 无需在此豁免：
+            pe=0 只在税前为负时强制，而那时情景 EPS 也为负，eps>0 闸已跳过。"""
+            _r1 = rev0 * (1 + s["g"])
+            return {"m1", "m2"} if _r1 * s["opm"] <= 0 else set()
+
         if eps["base"] > 0:
             r_bear, r_bull = eps["bear"] / eps["base"], eps["bull"] / eps["base"]
+            # 比较两侧任一方被强制 0 都跳过：base 被强制 0 时比例检查同样失去意义
+            # （bear 0<0.6×0 恒假无害，但 bull >1.4×0 会把合法的正倍数误判成双重计数）
+            _skip_bear = _forced_zero_keys(sb) | _forced_zero_keys(ss)
+            _skip_bull = _forced_zero_keys(su) | _forced_zero_keys(ss)
             # m2 仅在真双分部（次分部倍数非 0）时参与——它在 seg1_share<0.85 时
             # 承担近半 SOTP 权重，同样是独立采样漂移通道
             for key in (("pe", "m1", "m2") if sb.get("m2", 0) > 0 else ("pe", "m1")):
                 # 亏损情景的倍数按规定写 0（见上），此时 r<0.8 与「倍数 < 0.6×base」
                 # 恒同时成立——反双重计数会把"倍数腿已声明失效"误报成漂移
-                if (eps["bear"] > 0 and r_bear < 0.8
+                if (eps["bear"] > 0 and r_bear < 0.8 and key not in _skip_bear
                         and sb[key] < 0.6 * ss[key] and not _exempt(sb)):
                     raise ValueError(
                         f"bear 双重计数：情景盈利已较 base 收缩至 {r_bear:.0%}，{key} 又 "
                         f"< 0.6×base——谷底盈利×谷底倍数会把周期惩罚计两次。请上调 bear.{key}"
                         "（市场对可修复的谷底给看穿周期的倍数），或判断为永久受损时设 "
                         "permanent_impairment=true 并在 impairment_note 给原文出处")
-                if eps["bull"] > 0 and r_bull > 1.25 and su[key] > 1.4 * ss[key]:
+                if (eps["bull"] > 0 and r_bull > 1.25 and key not in _skip_bull
+                        and su[key] > 1.4 * ss[key]):
                     raise ValueError(
                         f"bull 双重计数：情景盈利已较 base 扩张至 {r_bull:.0%}，{key} 又 "
                         f"> 1.4×base——景气顶点市场收敛倍数而非扩张。请下调 bull.{key}")
@@ -348,7 +462,17 @@ def _validate_judgment(d: dict, mode: str = "standard",
 
 
 def _validate_judgment_financials(d: dict) -> None:
-    """金融股（银行/券商/fintech）判断层校验：P/E + P/TBV 假设集，无 DCF margins。"""
+    """金融股（银行/券商/fintech）判断层校验：P/E + P/TBV 假设集，无 DCF margins。
+
+    v3（fin semantics_version=3, 2026-09-06）：standard 在 v2 就补的两道墙
+    financials 一直没有——SOFI 实测一次运行零警告发货。
+    - 跨情景排序（g/nm/pe/ptbv 须 bear<=base<=bull）：此前 bear.pe>bull.pe、
+      倒挂的 g 全部放行，正是 v2 给 standard 修掉的那类漂移放大器
+    - 亏损协议：nm 旧下界 0 让「刚扭亏 fintech 的 P20 bear 现实上是亏损」无法
+      表达，prompt 还推着模型『压到微利』——假微利 × 15-30x PE 会静默混进综合
+      （standard 的 COIN 微利除法事故同型，见 engine.py 近零利润守卫）。v3 起
+      nm 下界放宽到 -0.5，nm<=0 的情景必须 pe=0（引擎把 PE 腿标 n.m. 剔出综合，
+      综合退化为 P/TBV 单腿）；0<nm<1% 的微利由引擎打黄旗，不在此拒绝。"""
     # fwd_label 同 standard：已改为服务器注入，不再向判断层索要
     need = ("fwd_shares", "adj_ni", "adj_note", "scenarios", "rationale", "notes")
     for k in need:
@@ -377,15 +501,33 @@ def _validate_judgment_financials(d: dict) -> None:
             if k not in s or not _isnum(s[k]):
                 raise ValueError(f"{sc} 缺少数值字段 {k}")
         if not -0.5 < s["g"] < 1.5:
-            raise ValueError(f"{sc}.g 越界")
-        if not 0 < s["nm"] < 0.6:
-            raise ValueError(f"{sc}.nm（净利率）需在 (0, 0.6)")
-        if not 1 <= s["pe"] <= 60 or not 0.2 <= s["ptbv"] <= 8:
-            raise ValueError(f"{sc}: pe/ptbv 越界")
+            raise ValueError(f"{sc}.g 越界（需在 (-0.5, 1.5)）")
+        # 下界 -0.5：比「总净收入的一半都亏掉」更深的 NTM 亏损属于崩溃定价，
+        # 不是情景假设——与 standard 的 opm 下界哲学一致
+        if not -0.5 < s["nm"] < 0.6:
+            raise ValueError(f"{sc}.nm（净利率）需在 (-0.5, 0.6)")
+        if s["nm"] <= 0:
+            # 亏损情景：负 EPS × 正倍数 = 负目标价会静默混进综合。倍数腿失效
+            # 必须显式声明（与 standard 亏损时 pe=0 的约定同构）
+            if s["pe"] != 0:
+                raise ValueError(
+                    f"{sc}: NTM 净利率为负或零（{s['nm']:.1%}），目标 pe 必须写 0"
+                    "（PE 法不适用；负 EPS × 正倍数 = 负目标价）。引擎会把该腿剔出综合")
+        elif not 1 <= s["pe"] <= 60:
+            raise ValueError(f"{sc}.pe 需在 [1, 60]")
+        if not 0.2 <= s["ptbv"] <= 8:
+            raise ValueError(f"{sc}.ptbv 需在 [0.2, 8]")
         if not 0.05 <= s["wacc"] <= 0.25:
-            raise ValueError(f"{sc}.wacc 越界")
+            raise ValueError(f"{sc}.wacc 越界（需在 [0.05, 0.25]）")
         if s["wacc"] - s["tg"] < 0.045:
             raise ValueError(f"{sc}: wacc-tg 需 >= 0.045")
+
+    # ---- v3 跨情景一致性（镜像 standard 的 v2 块）：拦『所有参数同取极端』----
+    # 亏损协议与排序自洽：亏损情景 pe=0 天然 <= 盈利情景的正 pe，无须豁免
+    sb, ss, su = d["scenarios"]["bear"], d["scenarios"]["base"], d["scenarios"]["bull"]
+    for k in ("g", "nm", "pe", "ptbv"):
+        if not sb[k] <= ss[k] <= su[k]:
+            raise ValueError(f"情景排序：{k} 必须 bear <= base <= bull")
 
 
 async def _run(cmd: list[str], cwd: Path, timeout: int = 300) -> str:
@@ -497,25 +639,31 @@ async def _claude(prompt: str) -> str:
     # 频次低（每标的每季 1-3 次调用），用最强模型的成本可忽略；与 judge_openai_compat
     # 的默认（claude-opus-4-8）对齐。要快可显式 VALUATION_MODEL=sonnet
     cmd = os.environ.get("VALUATION_JUDGMENT_CMD")
+    custom = bool(cmd)
     if not cmd:
         model = os.environ.get("VALUATION_MODEL", "opus")
         cmd = f'"{_find_claude()}" -p --model {model}'
+    label = "判断层命令（VALUATION_JUDGMENT_CMD）" if custom else "claude -p"
+    timeout = _claude_timeout()
     proc = await asyncio.create_subprocess_shell(
         cmd, stdin=asyncio.subprocess.PIPE,
         stdout=asyncio.subprocess.PIPE, stderr=asyncio.subprocess.PIPE,
         env=dict(os.environ, PYTHONIOENCODING="utf-8"))
     try:
-        out, err = await asyncio.wait_for(proc.communicate(prompt.encode("utf-8")), CLAUDE_TIMEOUT)
+        out, err = await asyncio.wait_for(proc.communicate(prompt.encode("utf-8")), timeout)
     except asyncio.TimeoutError:
         proc.kill()
-        raise RuntimeError(f"claude -p 超时（{CLAUDE_TIMEOUT}s）")
+        raise RuntimeError(f"{label} 超时（{timeout}s）")
     if proc.returncode != 0:
         msg = (err or out).decode("utf-8", "ignore")[-500:]
         # 登录失效单独成类：它是"去点一下登录"就能解决的状态问题，不该和
-        # "模型输出跑偏"混在同一段红字里，前端要据此给按钮
-        if _AUTH_PAT.search(msg):
+        # "模型输出跑偏"混在同一段红字里，前端要据此给按钮。
+        # 只对本机 claude CLI 生效（0016）：自定义命令的 stderr 撞上 _AUTH_PAT
+        # （比如自家网关打印 "Invalid API key"）会被误译成「本机未登录」，
+        # 前端给出的「登录」按钮修不了它——自定义命令的失败按普通失败呈现
+        if not custom and _AUTH_PAT.search(msg):
             raise JudgmentAuthError("判断层未登录或登录已失效: " + msg)
-        raise RuntimeError("claude -p 失败: " + msg)
+        raise RuntimeError(f"{label} 失败: " + msg)
     return out.decode("utf-8", "ignore")
 
 
@@ -622,8 +770,119 @@ def fwd_window(ttm_end: str, fy_end: str, rolled_quarters: int = 0) -> dict:
     return out
 
 
+def _fcf_hist_lines(facts: dict) -> list[str]:
+    """服务器实算的年度 FCF 利润率表（终值 margins 的锚）-> 注入 prompt 的行。
+
+    prompt 清单 #5 命令判断层「锚在近十年 FCF 利润率区间」，而引擎
+    （terminal_margin_warnings）与校验层（hist_fcf_margin）各自都算了这张表，
+    唯独判断层一个数也拿不到——只能徒手从 FACTS 摘要外的口径拼凑，算错了
+    引擎事后才打旗。窗口与 engine.hist_fcf_margins 严格同口径：revenue/cfo/capex
+    三项齐全的财年取尾 10 个。覆盖缺口必须诚实标出：NVDA 的 capex_annual
+    缺 FY13-21，只写「近十年」会让判断层高估这张表的覆盖。"""
+    rev = facts.get("revenue_annual") or {}
+    cfo = facts.get("cfo_annual") or {}
+    cap = facts.get("capex_annual") or {}
+    hist = []
+    for k in sorted(rev):
+        r, c, x = rev.get(k), cfo.get(k), cap.get(k)
+        if all(_isnum(v) for v in (r, c, x)) and r:
+            hist.append((k, r, c, x, (c - x) / r))
+    window = hist[-10:]
+    in_window = {h[0] for h in window}
+    # 近 10 个营收财年里三项不齐的逐年点名缺什么——5 年覆盖不许被当成 10 年用
+    gaps = []
+    for k in sorted(rev)[-10:]:
+        if k in in_window:
+            continue
+        miss = "/".join(n for n, v in (("cfo", cfo.get(k)), ("capex", cap.get(k)))
+                        if not _isnum(v)) or "营收"
+        gaps.append(f"{k[:4]}缺{miss}")
+    if not window:
+        return ["年度 FCF 利润率表（服务器实算）：无任何财年 revenue/cfo/capex 三项齐全"
+                "——近十年 FCF 锚不可用，margins 路径须在 rationale.dcf_margin 写明替代依据"
+                + (f"（{'; '.join(gaps)}）" if gaps else "")]
+    lines = ["年度 FCF 利润率表（服务器实算 =(CFO−capex)÷营收，$M——终值 margins 的锚，"
+             "引擎按同口径峰值打旗）:"]
+    for k, r, c, x, m in window:
+        lines.append(f"  {k}: 营收 {r/1e6:,.0f} / CFO {c/1e6:,.0f} / "
+                     f"capex {x/1e6:,.0f} / FCF率 {m:.1%}")
+    ms = sorted(m for *_, m in window)
+    peak = max(window, key=lambda h: h[4])
+    lines.append(f"  ← 覆盖 {len(window)} 个财年（{window[0][0]}~{window[-1][0]}）"
+                 + (f"，缺口: {'; '.join(gaps)}——「近十年」按实际覆盖理解" if gaps else "")
+                 + f"；峰值 {peak[4]:.1%}（{peak[0][:4]}）、中位 {ms[len(ms) // 2]:.1%}")
+    return lines
+
+
+# OI&E 组件的 (facts 键, 中文标签)。顺序即展示顺序，与 fetch_facts.SPEC 的
+# 营业外组件区一一对应——加减组件两处要一起动
+_OIE_KEYS = (("interest_income", "利息收入"),
+             ("interest_expense_nonop", "利息支出(非经营)"),
+             ("other_nonop", "其他非经营"),
+             ("equity_inv_gain", "股权投资重估"),
+             ("fx_gain", "汇兑损益"))
+
+
+def _oie_lines(facts: dict) -> list[str]:
+    """OI&E（营业外损益）组件矩阵 + 逐季「税前−营业利润」残差行 -> 注入 prompt 的行。
+
+    other_income_note 的校验与 prompt 都要求推导「落在这些序列上」，此前却一个数
+    也不注入；且组件标签覆盖极不均（AAPL 的 interest_income 整列为空），沉默会让
+    判断层以为"说好的序列"都在。残差 = 税前 − 营业利润，是任何票都可推的
+    other_income 推导基（实测多个判断层 agent 只能自己徒手减这两列）。
+    不存在的序列显式点名——绝不许诺没有的数据。"""
+    qkeys = list(facts.get("revenue_quarterly") or {})[-8:]   # 与「季度尾8」同窗同序
+    akeys = list(facts.get("revenue_annual") or {})[-6:]
+
+    def _fmt(v):
+        return f"{v/1e6:+,.0f}" if _isnum(v) else "—"
+
+    lines = ["OI&E 组件（营业外损益，$M——other_income 的推导基础）:"]
+    pre_q = facts.get("pretax_income_quarterly") or {}
+    op_q = facts.get("op_income_quarterly") or {}
+    resid = []
+    for k in qkeys:
+        p, o = pre_q.get(k), op_q.get(k)
+        resid.append(f"{k} {_fmt(p - o) if _isnum(p) and _isnum(o) else '?'}")
+    resid_ok = any(not r.endswith("?") for r in resid)
+    avail = [(k, lab) for k, lab in _OIE_KEYS
+             if (facts.get(k + "_quarterly") or facts.get(k + "_annual"))]
+    # 双缺口先裁（0022 C8）：残差与全部组件同时缺席时，旧文案两条 ⚠ 各指对方当
+    # 回退（"以下方组件序列为准" vs "以残差行为准"）——互相甩锅，唯一可用的
+    # 财报原文反而没被点名为主路径。回退指向必须只指真实存在的通道。
+    if resid_ok:
+        lines.append("  逐季残差 税前−营业利润（=利息+其他收益合计，最可靠的推导基）: "
+                     + ", ".join(resid))
+    elif avail:
+        lines.append("  ⚠ 本票无 pretax_income XBRL 季度序列——残差行不可用，"
+                     "other_income 推导以下方组件序列与财报原文为准")
+    else:
+        lines.append("  ⚠ 本票无 OI&E 结构化序列（税前利润残差行与全部组件序列均缺）"
+                     "——other_income 需从财报原文推导，并在 other_income_note "
+                     "写明原文出处；不要引用任何 XBRL 序列")
+    if avail:
+        lines.append("  组件序列（季8 列序同上；— = 该期无值）:")
+        for k, lab in avail:
+            q = facts.get(k + "_quarterly") or {}
+            a = facts.get(k + "_annual") or {}
+            lines.append(f"    {lab}[{k}] 季8: "
+                         + " ".join(_fmt(q.get(kk)) for kk in qkeys)
+                         + " | 年6: "
+                         + " ".join(f"{kk[:4]}:{_fmt(a.get(kk))}" for kk in akeys))
+    missing = [lab for k, lab in _OIE_KEYS
+               if not (facts.get(k + "_quarterly") or facts.get(k + "_annual"))]
+    # 双缺口时上面那条一致行已把话说完，缺失清单不再重复出（全缺 = 清单即全集）
+    if missing and (resid_ok or avail):
+        lines.append("  ⚠ 本票无以下 XBRL 序列：" + "、".join(missing)
+                     + "——不要引用不存在的序列，推导以"
+                     + ("残差行" if resid_ok else "上方组件序列")
+                     + "与财报原文为准")
+    return lines
+
+
 def _compact_facts(facts: dict) -> str:
-    """给判断层的事实摘要：年度尾6 + 季度尾8（含 净利/营业利润 比，暴露一次性项目）。"""
+    """给判断层的事实摘要：年度尾6 + 季度尾8（含 净利/营业利润 比，暴露一次性项目）
+    + 年度 FCF 利润率表 + OI&E 组件与残差行（v4 注入）。"""
     if facts.get("mode") == "financials":
         return _compact_facts_financials(facts)
     lines = []
@@ -634,6 +893,7 @@ def _compact_facts(facts: dict) -> str:
                      f"{facts['op_income_annual'].get(k, 0)/1e6:,.0f} / "
                      f"{facts['net_income_annual'].get(k, 0)/1e6:,.0f} / "
                      f"{facts['eps_diluted_annual'].get(k, '?')}")
+    lines += _fcf_hist_lines(facts)
     lines.append("季度尾8 (期末: 营收/营业利润/净利 | 净利÷营业利润——比值异常=有一次性项目):")
     for k in list(facts["revenue_quarterly"])[-8:]:
         op = facts["op_income_quarterly"].get(k, 0)
@@ -641,6 +901,7 @@ def _compact_facts(facts: dict) -> str:
         ratio = f"{ni/op:.2f}" if op else "n/a"
         lines.append(f"  {k}: {facts['revenue_quarterly'][k]/1e6:,.0f} / {op/1e6:,.0f} / "
                      f"{ni/1e6:,.0f} | {ratio}")
+    lines += _oie_lines(facts)
     lines.append(f"TTM: { {k: (v.get('value') or 0)/1e6 for k, v in facts['ttm'].items()} }")
     bs = []
     for label, key in (("现金", "cash_instant"), ("短期证券", "st_securities_instant"),
@@ -686,16 +947,341 @@ def _compact_facts_financials(facts: dict) -> str:
     return "\n".join(lines)
 
 
+def _fwd_meta(fwd: dict | None, force_override: bool) -> str:
+    """前瞻期(NTM)窗口的注入文案 -> prompt 段。纯函数（0014 抽出，可直接单测）。
+
+    g 分母的契约必须跟着 override 走：PENDING_10Q / 陈旧 XBRL（stale_days>550）下
+    校验层与引擎都强制以 ttm_revenue_override 为营收基准（rev0 整体换基），此前
+    这里却硬写「TTM 即 FACTS 里的口径」——判断层照文档把 g 锚在旧 TTM 上，
+    与 caliber 注入的「g 锚定在 override 基准上」自相矛盾，且 8-K 已滚进 override
+    的那个季度会被再乘一次增速（前瞻窗口也已 +3 个月，两头都不该用旧分母）。
+    force_override 与注入/强制 override 的门禁严格同源（pending_8k 或 stale>550）。
+    """
+    if not fwd:
+        return ""
+    denom = ("分母 = 你输出的 ttm_revenue_override（按财报原文前滚后的 TTM），"
+             "**不是** FACTS 里的旧 TTM——校验层与引擎都按 override 整体换基"
+             if force_override else "TTM 即 FACTS 里的口径")
+    return (
+        f"\n前瞻期(NTM)={fwd['start']}~{fwd['end']}（{fwd['straddle']}）"
+        "\n  ← g / opm / tax / fwd_shares **全部针对这个 12 个月窗口**，不是某个财年。"
+        f"\n  g 的定义 = 该窗口营收 ÷ TTM营收 − 1（{denom}）。"
+        + ("\n  该窗口与公司财年重合，可直接套用财年指引。" if fwd["aligned"] else
+           "\n  ⚠ 该窗口**不等于**任何一个财年：财报 guidance 与卖方一致预期都按财年给，"
+           "必须先换算到这个窗口再定 g，不要直接搬用财年数字。")
+        + "\n  fwd_label 由服务器生成，你不要输出该字段。")
+
+
+def _band_meta(mode: str, facts: dict) -> str:
+    """历史带锚注入文案（standard=NTM PE 带 / financials=P/TBV 带）。
+
+    此前 band 只做 engine 事后 check，目标 PE 由判断层自由拍——与「前瞻 EPS ×
+    历史 PE 带」类参考基准相比，base 水平会系统性漂移（漂移方向随判断层口味，
+    且无证据可审计）。注入分位数并要求默认锚近 3 年子窗 P50：全窗把 2021 零利率
+    regime 原样计入（AMZN 全窗 P50≈31x），直接锚全窗会把泡沫倍数抬进锚。
+    与连续性纪律同哲学：无证据不偏离。
+    三种形态都必须有话（0008）：有带给锚；thin_coverage 给「本次无历史锚」；
+    带**整体缺席**（构建失败：外国发行人无季度 XBRL——TSM 实测、季节性剔穿、
+    新上市）此前 band_meta=''，判断层既无锚也不知道无锚，自由发挥还以为有历史
+    背书——缺席与薄覆盖同等处置，并把 pe_band_error 的原因一起给出。
+    纯函数（mode+facts 进、文案出），便于直接单测。
+    """
+    band_meta = ""
+    _b = facts.get("pe_band") or {}
+    if mode == "standard" and _b.get("thin_coverage"):
+        # 覆盖不足：不给锚（薄样本的 P50 没有话语权），但显式告诉判断层"没有锚"——
+        # 沉默会让它自由发挥还以为有历史背书
+        band_meta = (f"\n历史 NTM PE 带覆盖不足（仅 {_b.get('days')} 个交易日/"
+                     f"{_b.get('years')} 年，原始数据缺口）——**本次无历史锚**：目标 PE 按"
+                     "基本面第一性与可比经验判断，并在 rationale.pe 写明定价依据。")
+    elif mode == "standard" and _b.get("pctiles"):
+        _rc = _b.get("recent") or {}
+        _rp = _rc.get("pctiles") or {}
+
+        def _pfmt(pp):
+            return " / ".join(f"P{q} {pp[str(q)]:.1f}x" for q in (10, 25, 50, 75, 90)
+                              if str(q) in pp)
+        _anchor_win = f"近{_rc['years']}年" if _rp else f"近{_b['years']}年"
+        band_meta = (
+            f"\n历史已实现 NTM PE 带（与上述前瞻期同口径，basis={_b['basis']}，"
+            "一次性畸变窗口已剔除）："
+            f"\n  全窗近{_b['years']}年: {_pfmt(_b['pctiles'])}（{_b['days']}天）"
+            + (f"\n  近{_rc['years']}年子窗: {_pfmt(_rp)}（{_rc['days']}天）" if _rp else "")
+            + f"\n  ← base 情景目标 PE **默认锚{_anchor_win} P50**；bear/bull 参照"
+              " P25/P75 量级再叠加各自情景的盈利假设（量级参照，不受下述 ±15% 纪律"
+              "约束）。**base** 偏离 P50 ±15% 以上必须在 rationale.pe 给出财报证据"
+              "（增长/利润率结构变化、资本回报变化等），『保守起见』类无证据折价"
+              "不接受——那会系统性压低所有标的。"
+              "\n  若下方给出「上一次运行的假设（连续性基准）」，连续性优先——"
+              "本锚只约束首次基线与失锚重建。")
+        # 高倍数票的锚-上界死锁（0013）：锚纪律命令 base 锚锚窗 P50，而校验层硬上界
+        # pe<=60（TSLA 锚窗 P50 ~230x、ISRG 61.6x 实测）——照锚必被拒、照上界又吃
+        # 带偏离黄旗，两条纪律打架烧光 retry。上界不动（>60x 的"目标 PE"更多是动量
+        # 而非估值），死锁从两端拆：这里预告封顶指令，engine.pe_band_check 对封顶值
+        # 豁免偏离旗（同一条件，两处必须同门槛 60）
+        _a50 = (_rp if _rp else _b["pctiles"]).get("50")
+        if _isnum(_a50) and _a50 > 60:
+            band_meta += (
+                f"\n  ⚠ 锚窗 P50 {_a50:.1f}x 超出校验上界 pe<=60——按上界 60 封顶给出，"
+                "并在 rationale.pe 说明封顶事实；封顶导致的带下沿偏离引擎已豁免，"
+                "不追究，不要为凑纪律去压低其他假设。")
+        # 滞后必须告知判断层（2026-08-17）：ntm 口径要求"该日之后满 4 个季度已披露"，
+        # 最近约一年结构性无值。此前只把天数注进去，锚看起来像"截至今天的近3年"，
+        # 于是判断层在市场已经重新定价的标的上照旧锚旧中枢却毫不知情（MSFT 实测：
+        # 锚 P50 30.1x，而市场最近 10 个月付的 NTM 可比倍数只有 ~22x）。
+        # 这里只给事实（滞后天数 + 无滞后 trailing 对照），不放松 ±15% 纪律——
+        # "市场已重定价"是一类**合法证据**，但仍要在 rationale.pe 里写出来。
+        _sp = _b.get("span") or {}
+        if _sp.get("lag_days"):
+            band_meta += (
+                f"\n  ⚠ 本带止于 {_sp['end']}（滞后 {_sp['lag_days']} 天）："
+                "ntm 口径的分母是「该日之后 12 个月**实际实现**的 EPS」，那个未来对最近"
+                "约一年的交易日还没发生，因此**最近约一年的倍数不在本分布内**。")
+            _tn = _b.get("trailing_nolag") or {}
+            _tnp = {str(k): v for k, v in (_tn.get("pctiles") or {}).items()}
+            # NaN 兜底（源头已在 pe_band 剔除 NaN 收盘；这里防旧 facts.json 回放）：
+            # NaN 是 truthy，裸 truthiness 闸门会把「最新 nanx」注进判断层 prompt。
+            # x == x 是唯一可靠的 NaN 判据（band_lag_warnings 同法）
+            _tn50 = _tnp.get("50")
+            _tn50 = _tn50 if _isnum(_tn50) and _tn50 == _tn50 else None
+            _tncur = _tn.get("current")
+            _tncur = _tncur if _isnum(_tncur) and _tncur == _tncur else None
+            if _tn50:
+                band_meta += (
+                    f"\n    无滞后对照（trailing 口径，价÷过去12个月，{_tn['span']['start']}~"
+                    f"{_tn['span']['end']}）：P50 {_tn50:.1f}x"
+                    + (f"，最新 {_tncur:.1f}x" if _tncur is not None else "（最新值缺失）")
+                    + "。"
+                    "**不可与上面的 NTM 分位直接相减**——trailing 分母是过去 12 个月的"
+                    "已实现 GAAP EPS，NTM 分位的分母是未来 12 个月的 EPS。"
+                    "换算需要除以 **EPS 增速因子**（你给出的该情景 NTM EPS ÷ 当前 GAAP "
+                    "TTM EPS），**不是营收增速 g**——利润率、税率、其他收益、股数变化"
+                    "都会让 EPS 增速与营收增速显著分叉（利润率扩张叠加回购的票尤其）。"
+                    "当前 GAAP TTM EPS 见 FACTS 的 TTM 净利 ÷ 稀释股数。")
+                _gap = _tn.get("gap_since_main_band")
+                if _gap:
+                    band_meta += (f"\n    本带盲区那一段（{_gap['span']['start']}~"
+                                  f"{_gap['span']['end']}）trailing P50 {_gap['p50']:.1f}x。")
+            band_meta += ("\n    → 若折算后显示市场近一年的定价已明显偏离本带中枢，"
+                          "那是**锚可能已过时**的证据：此时偏离 P50 属于有证据的偏离，"
+                          "请在 rationale.pe 写明「近一年 regime 变化」并给出财报/定价依据。"
+                          "反之若两者量级一致，锚照常适用。")
+    elif mode == "standard":
+        # 带整体缺席（fetch_facts 已在 pe_band_error 留痕）：与 thin_coverage 同等
+        # 显式告知，附失败原因——判断层看得见"为什么没有锚"才不会把缺席当背书
+        _err = facts.get("pe_band_error") or "原因未记录，见 fetch_facts 日志"
+        band_meta = (f"\n本次无历史 PE 锚（带子未生成：{_err}）：目标 PE 按基本面"
+                     "第一性与可比经验判断，并在 rationale.pe 写明定价依据。")
+    # financials 的锚是 P/TBV 带（图3 的教科书结论：银行 E 带杠杆带周期，估值锚
+    # 是 P/B 系）——与 standard 的 PE 锚同一纪律结构，锚 s["ptbv"]
+    _tb = facts.get("ptbv_band") or {}
+    if mode == "financials" and _tb.get("thin_coverage"):
+        band_meta = (f"\n历史 P/TBV 带覆盖不足（仅 {_tb.get('days')} 个交易日）——本次无历史锚："
+                     "目标 P/TBV 按 ROTE/资本回报第一性判断，并在 rationale.ptbv 写明依据。")
+    elif mode == "financials" and _tb.get("pctiles"):
+        _rc2 = _tb.get("recent") or {}
+        _rp2 = _rc2.get("pctiles") or {}
+
+        def _pfmt2(pp):
+            return " / ".join(f"P{q} {pp[str(q)]:.2f}x" for q in (10, 25, 50, 75, 90)
+                              if str(q) in pp)
+        _aw2 = f"近{_rc2['years']}年" if _rp2 else f"近{_tb['years']}年"
+        band_meta = (
+            f"\n历史 P/TBV 带（trailing 口径，分母=当日已知每股有形账面价值，"
+            "与引擎 tbv_ps 同构）："
+            f"\n  全窗近{_tb['years']}年: {_pfmt2(_tb['pctiles'])}（{_tb['days']}天）"
+            + (f"\n  近{_rc2['years']}年子窗: {_pfmt2(_rp2)}（{_rc2['days']}天）" if _rp2 else "")
+            + f"\n  ← base 情景目标 P/TBV **默认锚{_aw2} P50**；bear/bull 参照 P25/P75"
+              " 量级再叠加各自情景的 ROTE/信贷假设。**base** 偏离 P50 ±15% 以上必须在"
+              " rationale.ptbv 给出财报证据（ROTE 结构变化、信贷周期位置、资本行动等）。"
+              "\n  若下方给出「上一次运行的假设（连续性基准）」，连续性优先。")
+        # fin 的锚-上界死锁预告（0022 C9，镜像 standard 的 pe<=60 预告，同门槛 8）：
+        # 高 ROTE 票锚窗 P50 可超过校验硬上界 ptbv<=8——照锚必被拒、烧掉一次
+        # retry。engine.pe_band_check 的 hard_cap=8 豁免早已就位（0013），此前
+        # 只有 standard 有预告端，fin 的封顶指令一直缺席，engine.py:539 的
+        # 「与 band_meta 封顶预告同门槛」对 fin 是空话。
+        _a50f = (_rp2 if _rp2 else _tb["pctiles"]).get("50")
+        if _isnum(_a50f) and _a50f > 8:
+            band_meta += (
+                f"\n  ⚠ 锚窗 P50 {_a50f:.2f}x 超出校验上界 ptbv<=8——按上界 8 封顶给出，"
+                "并在 rationale.ptbv 说明封顶事实；封顶导致的带下沿偏离引擎已豁免，"
+                "不追究，不要为凑纪律去压低其他假设。")
+    elif mode == "financials":
+        _err = facts.get("ptbv_band_error") or "原因未记录，见 fetch_facts 日志"
+        band_meta = (f"\n本次无历史 P/TBV 锚（带子未生成：{_err}）：目标 P/TBV 按 "
+                     "ROTE/资本回报第一性判断，并在 rationale.ptbv 写明依据。")
+    # fin 的 PE 腿信息锚（0022 C13）：engine 自 0005 起对 fin 各情景的 s["pe"] 跑
+    # pe_band_check（pe_band 对 fin facts 本就生成），而 fin prompt 只有泛可比
+    # 区间（成长 fintech 15-30x）——检查与锚不在同一场对话里，regime 已切换的票
+    # 每次运行都吃一条无法预辩护的中枢黄旗。这里把带子亮给判断层：**只作信息
+    # 参照**，P/TBV 仍是主锚（银行估值惯例），pe 不受 ±15% 锚纪律约束。
+    if mode == "financials":
+        _pb = facts.get("pe_band") or {}
+        _pbr = (_pb.get("recent") or {}).get("pctiles") or {}
+        _pbp = _pbr or _pb.get("pctiles") or {}
+        if _pbp and not _pb.get("thin_coverage"):
+            _pbw = (f"近{(_pb.get('recent') or {})['years']}年子窗" if _pbr
+                    else f"近{_pb.get('years')}年全窗")
+            band_meta += (
+                f"\n历史已实现 NTM PE 带（信息参照——P/TBV 仍是主锚）：{_pbw} "
+                + " / ".join(f"P{q} {_pbp[str(q)]:.1f}x" for q in (10, 25, 50, 75, 90)
+                             if str(q) in _pbp)
+                + "\n  ← 引擎会按此带对各情景 pe 做界外/中枢检查（base 界外打黄旗）；"
+                  "pe 明显偏离子窗 P50 时请在 rationale.pe 写明依据"
+                  "（regime 变化、盈利结构切换等），带内则无须额外辩护。")
+    return band_meta
+
+
+def _trading_range_payload(mode: str, facts: dict, val: dict):
+    """RESULT 载荷的 trading_range 块 -> (dict | None, 缺席原因 | None)。
+
+    trading_range 为 null 时前端/下游此前只看到一个 null——为什么没有区间
+    （带子构建失败？覆盖不足？base PE 腿 n.m.？financials 本就没有？）只活在
+    引擎红旗区，RESULT 的消费者看不见。缺席原因必须跟着缺席走。纯函数可单测。
+    """
+    _tr = val.get("trading_range")
+    if _tr and _tr.get("px"):
+        return (dict(lo=_tr["px"].get("25"), mid=_tr["px"].get("50"),
+                     hi=_tr["px"].get("75"), window=_tr["window"],
+                     # 盈利窗口 + 倍数窗口真实起止/滞后：只写"近3年PE带"
+                     # 会被读成区间的时间跨度（实测确实被这么问了）
+                     eps_window=_tr.get("eps_window"),
+                     span=_tr.get("span"),
+                     # 现价当前位置与倍数回归归因——区间中位的涨幅按构造
+                     # 全部来自倍数回归，不写出来读者看不见
+                     fwd_pe_now=_tr.get("fwd_pe_now"),
+                     # 带外只给关系不给截断分位（PR #5 review）
+                     fwd_pe_now_position=_tr.get("fwd_pe_now_position"),
+                     target_pe=_tr.get("target_pe"),
+                     mult_reversion=_tr.get("mult_reversion_to_p50"),
+                     # regime 失效红线（带外 + 带子滞后 >250 天，engine 置）：
+                     # 均值回归前提可能已失效——载荷消费者必须能看到
+                     regime_note=_tr.get("regime_note")), None)
+    if mode == "financials":
+        note = "financials 模式无交易区间（估值锚为 P/TBV，非 PE 分位）"
+    elif facts.get("pe_band_error"):
+        note = f"无历史 PE 带（{facts['pe_band_error']}）——区间无法构造"
+    elif (facts.get("pe_band") or {}).get("thin_coverage"):
+        note = (f"历史 PE 带覆盖不足（{(facts.get('pe_band') or {}).get('days')} 天"
+                "<250）——区间停用")
+    else:
+        note = "base PE 腿 n.m. 或带子缺分位——区间停用（详见报告红旗区）"
+    return None, note
+
+
+def _adr_calibration(price: float, mcap: float,
+                     shares_ord_m: float) -> tuple[float, float | None]:
+    """ADR 比例标定 -> (adr_multiple, 口径失配比例|None)。纯函数（0018 抽出可单测）。
+
+    yfinance 价是 ADR 价、XBRL 股数是普通股（TTM 加权稀释）：mcap÷普通股数反推
+    每普通股隐含价，price÷隐含价即 ADR 比例（TSM 1:5）。真实 ADR 比例只会是
+    整数或简单半数（2 普通股=1 ADR → 2；1 ADR=0.5 普通股 → 0.5），(0.5, 2) 内
+    既不落 1±8% 也不落半数容差的值不是 ADR，是两侧股数口径的噪声——yfinance
+    市值隐含股数与 XBRL 加权稀释股数本就能差几个百分点（回购/增发期两口径结构性
+    分叉）。此前这类值原样放行：TSLA 实测 0.8963 被当成「1 ADR=0.896 普通股」
+    发货——美股普通票挂上假 ADR 口径、shares 被 rebase、带子与每股值口径混掉。
+    现在回退 adr_multiple=1.0 并返回失配比例（进 caliber 说明 + 引擎全局黄旗），
+    shares 保持 XBRL 稀释口径。(0, 0.5] 与 [2, ∞) 之外圈维持原行为（整数 snap /
+    原样放行），不在本次收紧范围。"""
+    implied = mcap / (shares_ord_m * 1e6)
+    raw = price / implied if implied > 0 else 1.0
+    if abs(raw - 1) < 0.08:
+        return 1.0, None
+    snapped = round(raw)
+    if snapped >= 2 and abs(raw / snapped - 1) < 0.08:
+        return float(snapped), None
+    # 半数 ADR（1 ADR = 0.5 普通股）真实存在——与整数分支同构的容差 snap
+    if abs(raw - 0.5) < 0.04:
+        return 0.5, None
+    if 0.5 < raw < 2.0:
+        return 1.0, abs(raw - 1)
+    return raw, None
+
+
+# 期后 filing 索引只留资本结构类表单：424B*（增发定价）/S-*（注册）/8-K（事件）/
+# SC 13*（大额持股变动）/10-*（定期报告与修订）。Form 3/4/144 之类高频噪音会把 cap 吃光
+_PPCE_FORM_PREFIXES = ("424B", "S-", "SC 13", "8-K", "10-")
+
+
+def _postperiod_filing_index(rows: list[dict], periodic_end: str, cap: int = 30) -> str:
+    """报告期后的资本结构类 filing 一行索引——ppce（期后资本事件）核对的线索。
+
+    prompt 检查清单 #3 命令判断层「距报告期 >45 天必须查 8-K/424B」，此前却一份
+    filing 清单也不给——实测 4/9 个判断层 agent 只能自己去 curl EDGAR。只做过滤
+    与排版的纯函数：取数（edgar.recent_filings）与失败降级在 _pipeline。
+    过滤按 filingDate > 报告期末——报告期内的事件已在财报正文里，不重复列。
+    8-K 附 items（2.02=业绩、1.01=重大协议、3.02=非注册增发、8.01=其他），一眼可分类。"""
+    hits = [r for r in rows or []
+            if (r.get("filingDate") or "") > periodic_end
+            and str(r.get("form") or "").strip().startswith(_PPCE_FORM_PREFIXES)]
+    if not hits:
+        return (f"报告期 {periodic_end} 之后无上述类型的新 filing——期后若真有增发/"
+                "回购/并购/分红宣告，应已出现在这里")
+    hits.sort(key=lambda r: (r.get("filingDate") or "", r.get("accessionNumber") or ""),
+              reverse=True)
+    lines = []
+    for r in hits[:cap]:
+        form = str(r.get("form") or "").strip()
+        seg = f"  {r.get('filingDate')} {form}"
+        items = str(r.get("items") or "").strip()
+        if form.startswith("8-K") and items:
+            seg += f" items={items}"
+        if form.startswith("10-") and r.get("reportDate"):
+            seg += f" 期末={r['reportDate']}"
+        lines.append(seg)
+    head = (f"共 {len(hits)} 份（新→旧"
+            + (f"，仅列最近 {cap} 份" if len(hits) > cap else "") + "）:")
+    return head + "\n" + "\n".join(lines)
+
+
+# 连续性基准注入的字段集（0017）：假设 + 事实类锚。other_income/other_income_note
+# 与 seg1/seg2/seg1_share 曾缺席——8/31 补 other_income_note 的动机正是 AMZN 同日
+# 同输入两次运行 other_income 漂 -33%，而连续性注入偏偏不带这个字段：判断层看不到
+# 上次的值，纪律对它管不着，漂移从连续性通道原样漏回来。seg1_share 同理（SOTP 权重
+# 每次独立重拍）。
+_PREV_CORE_KEYS = ("date", "adj_ni", "net_cash", "fwd_shares",
+                   "other_income", "other_income_note",
+                   "seg1", "seg2", "seg1_share", "scenarios", "rationale")
+
+
+def _prev_core(prev: dict) -> dict:
+    """上次运行 config -> 注入 prompt 的连续性基准子集。按键存在过滤：
+    financials 配置没有 other_income/seg*，null 冒充『上次的假设』只会误导。"""
+    return {k: prev[k] for k in _PREV_CORE_KEYS if k in prev}
+
+
+def _persist_prev_config(ticker: str, cfg: dict, reds: list, latest_report) -> None:
+    """连续性锚持久化（v2）：只有 gate-clean（无 red 红旗）的 config 才能成为下次
+    运行的基准——带病假设冻结成锚会让偏差跨运行复利（方差可见，偏差不可见）。
+    原子写：避免任务中断留下半个 JSON 毒化后续所有运行。
+
+    2026-09-06 起 financials 同样持久化：load 路径（连续性失效触发器）本就按
+    mode 支持 fin 语义，写路径却挂着 mode=="standard" 门禁——fin 的自动连续性
+    结构上是 no-op，每次运行独立重采样，正是连续性机制要消灭的漂移源。
+    financials 今日没有 red 类诊断，gate-clean 即 reds 为空，两模式同一表达式；
+    跨版本复用由 load 侧的语义检查兜底（fin v3）。"""
+    if reds or os.environ.get("VALUATION_NO_CONTINUITY"):
+        return
+    PREV_DIR.mkdir(exist_ok=True)
+    _tmp = PREV_DIR / f".{ticker}.json.tmp"
+    _tmp.write_text(json.dumps(dict(cfg, manifest_latest=latest_report),
+                               ensure_ascii=False, indent=1), encoding="utf-8")
+    os.replace(_tmp, PREV_DIR / f"{ticker}.json")
+
+
 async def _pipeline(job: dict, ticker: str, email: str) -> None:
     wd = Path(job["dir"])
     today = date.today().isoformat()
 
     # 判断层登录探测放在第一步：④ 之前的取数/下载要跑好几分钟，登录失效却要等到
     # ⑤ 才暴露——用户白等一轮，SEC 也白请求一轮。探测只在能确凿判定未登录时拦。
+    # VALUATION_JUDGMENT_CMD 下整个预检跳过（0016）：判断层不经本机 claude CLI，
+    # 本机凭证过期与任务无关——照跑会让一份陈旧的 .credentials.json 拦死所有任务
     job["step"] = "preflight"
-    _auth = _auth_state()
-    if not _auth["ok"]:
-        raise JudgmentAuthError(f"判断层未登录（{_auth['reason']}）")
+    if not os.environ.get("VALUATION_JUDGMENT_CMD"):
+        _auth = _auth_state()
+        if not _auth["ok"]:
+            raise JudgmentAuthError(f"判断层未登录（{_auth['reason']}）")
 
     job["step"] = "facts"
     await _run([PY, str(VAL / "fetch_facts.py"), ticker, str(wd / "facts.json"), email], wd)
@@ -751,6 +1337,17 @@ async def _pipeline(job: dict, ticker: str, email: str) -> None:
     # PENDING_10Q 时 ttm_revenue_override 会把 TTM 前滚一个季度，窗口跟着滚
     FWD = (fwd_window(periodic_end, fy_end, rolled_quarters=1 if pending_8k else 0)
            if periodic_end else None)
+    # 期后 filing 索引（v4）：submissions 服务器本来就取过（company_info /
+    # build_zip_latest），这里只再取一次清单、不下载文档。索引是辅助线索，
+    # 任何失败降级为显式的"索引不可用"——绝不连累估值任务
+    filing_idx = ""
+    if periodic_end:
+        try:
+            filing_idx = _postperiod_filing_index(
+                await edgar.recent_filings(ticker, email), periodic_end)
+        except Exception as e:  # noqa: BLE001 —— 线索取不到要说清原因，但不许杀任务
+            filing_idx = (f"期后 filing 索引不可用（{type(e).__name__}: {e}），"
+                          "按 MANIFEST 与 SECTIONS 摘录判断")
 
     job["step"] = "sections"
     await _run([PY, str(VAL / "extract_sections.py"), str(wd / "sections.json"), *htms], wd)
@@ -758,15 +1355,9 @@ async def _pipeline(job: dict, ticker: str, email: str) -> None:
 
     job["step"] = "judgment"
     shares_ord = list(shares_series.values())[-1] / 1e6  # 普通股口径（百万股）
-    # ADR 换算：yfinance 价格是 ADR，XBRL 股数是普通股。用 mcap÷普通股数反推每普通股
-    # 隐含价，price/隐含价 即 ADR 比例（TSM 1:5）；接近 1 则视为无 ADR（股数口径误差）
-    implied = mcap / (shares_ord * 1e6)
-    adr_multiple = price / implied if implied > 0 else 1.0
-    snapped = round(adr_multiple)
-    if abs(adr_multiple - 1) < 0.08:
-        adr_multiple = 1.0
-    elif snapped >= 2 and abs(adr_multiple / snapped - 1) < 0.08:
-        adr_multiple = float(snapped)
+    # ADR 换算见 _adr_calibration：整数/半数比例 snap，(0.5,2) 内的其余值是股数
+    # 口径噪声而非 ADR，回退 1.0 并把失配比例带进 caliber 与引擎全局黄旗
+    adr_multiple, adr_mismatch = _adr_calibration(price, mcap, shares_ord)
     shares = round(shares_ord / adr_multiple)  # ADR 等效股数：mcap ≈ price × shares
     prompt_file = ("judgment_prompt_financials.md" if mode == "financials"
                    else "judgment_prompt.md")
@@ -775,10 +1366,20 @@ async def _pipeline(job: dict, ticker: str, email: str) -> None:
     if adr_multiple != 1.0:
         caliber += (f"\n口径说明：价格为 ADR 价（1 ADR = {adr_multiple:g} 普通股），"
                     f"shares 已折为 ADR 等效股数；你输出的 fwd_shares 也用 ADR 等效口径。")
+    if adr_mismatch is not None:
+        caliber += (f"\n口径说明：市值隐含股数与 XBRL 稀释股数差 {adr_mismatch:.1%}"
+                    "（非整数/半数比例，判定为股数口径噪声而非 ADR，已按 1 ADR=1 股处理）"
+                    "——shares 取 XBRL 加权稀释股数，net_cash/每股值一律按 XBRL 股数口径。")
     if facts.get("currency", "USD") != "USD":
         caliber += (f"\n口径说明：申报货币 {facts['currency']}，FACTS 已按现汇 "
                     f"{facts.get('fx_to_usd', 1):.5f} 折算美元（恒定汇率）；"
                     "历史增长率不受影响，绝对值以美元理解。")
+    # 营业利润推导回退（0021）：发行人停报 OperatingIncomeLoss、TTM 由
+    # rev−cogs−rnd−sga 推得——判断层必须知道这个数不是申报值
+    if (ttm.get("op_income") or {}).get("derived"):
+        caliber += ("\n口径说明：TTM 营业利润为推导值（rev−cogs−rnd−sga，发行人已停报 "
+                    "OperatingIncomeLoss），可能含未单列的摊销/重组项——"
+                    "opm 假设须与 SECTIONS 利润表原文核对后再定。")
     # financials 模式的营收口径是 RevenuesNetOfInterestExpense（净息后总净收入），
     # 照抄 standard 的"营收"会让判断层去取利息总收入或非 GAAP 的"调整后净收入"
     fin = mode == "financials"
@@ -831,9 +1432,9 @@ async def _pipeline(job: dict, ticker: str, email: str) -> None:
                 stale = None
                 if prev.get("ticker") != ticker:
                     stale = "标的不符"
-                elif prev.get("semantics_version", 1) != (3 if mode == "standard" else 2):
+                elif prev.get("semantics_version", 1) != (4 if mode == "standard" else 3):
                     stale = (f"语义版本 v{prev.get('semantics_version', 1)} != "
-                             f"v{3 if mode == 'standard' else 2}")
+                             f"v{4 if mode == 'standard' else 3}")
                 elif prev.get("manifest_latest") and latest_report \
                         and prev["manifest_latest"] != latest_report:
                     stale = f"出现新报告期 {latest_report}（上次基于 {prev['manifest_latest']}）"
@@ -843,8 +1444,7 @@ async def _pipeline(job: dict, ticker: str, email: str) -> None:
                     prev_section = (f"\n\n# 假设连续性说明\n上次运行（{prev.get('date')}）的假设"
                                     f"已失效：{stale}。本次独立重建全部假设。")
                 else:
-                    prev_core = {k: prev.get(k) for k in
-                                 ("date", "adj_ni", "net_cash", "fwd_shares", "scenarios", "rationale")}
+                    prev_core = _prev_core(prev)
                     prev_section = (
                         "\n\n# 上一次运行的假设（连续性基准）\n"
                         "连续性纪律：下面是上次运行的假设与理由。本次只在材料中出现**新证据**"
@@ -857,105 +1457,23 @@ async def _pipeline(job: dict, ticker: str, email: str) -> None:
                 # （VALUATION_PREV_CONFIG 支持用户手工指定/编辑的文件）
                 pass
     # 前瞻期是服务器算好的事实，不由判断层选——但必须显式告诉它窗口是哪一段，
-    # 否则 g/opm/fwd_shares 会各自锚在不同的"下一财年"上（AMZN 实测三次裂成两种口径）
-    fwd_meta = ""
-    if FWD:
-        fwd_meta = (
-            f"\n前瞻期(NTM)={FWD['start']}~{FWD['end']}（{FWD['straddle']}）"
-            "\n  ← g / opm / tax / fwd_shares **全部针对这个 12 个月窗口**，不是某个财年。"
-            "\n  g 的定义 = 该窗口营收 ÷ TTM营收 − 1（TTM 即 FACTS 里的口径）。"
-            + ("\n  该窗口与公司财年重合，可直接套用财年指引。" if FWD["aligned"] else
-               "\n  ⚠ 该窗口**不等于**任何一个财年：财报 guidance 与卖方一致预期都按财年给，"
-               "必须先换算到这个窗口再定 g，不要直接搬用财年数字。")
-            + "\n  fwd_label 由服务器生成，你不要输出该字段。")
-    # 历史 PE 带锚（与前瞻期同口径）：此前 band 只做 engine 事后 check，目标 PE
-    # 由判断层自由拍——与「前瞻 EPS × 历史 PE 带」类参考基准相比，base 水平会
-    # 系统性漂移（漂移方向随判断层口味，且无证据可审计）。注入分位数并要求默认
-    # 锚近 3 年子窗 P50：全窗把 2021 零利率 regime 原样计入（AMZN 全窗 P50≈31x），
-    # 直接锚全窗会把泡沫倍数抬进锚。与连续性纪律同哲学：无证据不偏离。
-    band_meta = ""
-    _b = facts.get("pe_band") or {}
-    if mode == "standard" and _b.get("thin_coverage"):
-        # 覆盖不足：不给锚（薄样本的 P50 没有话语权），但显式告诉判断层"没有锚"——
-        # 沉默会让它自由发挥还以为有历史背书
-        band_meta = (f"\n历史 NTM PE 带覆盖不足（仅 {_b.get('days')} 个交易日/"
-                     f"{_b.get('years')} 年，原始数据缺口）——**本次无历史锚**：目标 PE 按"
-                     "基本面第一性与可比经验判断，并在 rationale.pe 写明定价依据。")
-    elif mode == "standard" and _b.get("pctiles"):
-        _rc = _b.get("recent") or {}
-        _rp = _rc.get("pctiles") or {}
-
-        def _pfmt(pp):
-            return " / ".join(f"P{q} {pp[str(q)]:.1f}x" for q in (10, 25, 50, 75, 90)
-                              if str(q) in pp)
-        _anchor_win = f"近{_rc['years']}年" if _rp else f"近{_b['years']}年"
-        band_meta = (
-            f"\n历史已实现 NTM PE 带（与上述前瞻期同口径，basis={_b['basis']}，"
-            "一次性畸变窗口已剔除）："
-            f"\n  全窗近{_b['years']}年: {_pfmt(_b['pctiles'])}（{_b['days']}天）"
-            + (f"\n  近{_rc['years']}年子窗: {_pfmt(_rp)}（{_rc['days']}天）" if _rp else "")
-            + f"\n  ← base 情景目标 PE **默认锚{_anchor_win} P50**；bear/bull 参照"
-              " P25/P75 量级再叠加各自情景的盈利假设（量级参照，不受下述 ±15% 纪律"
-              "约束）。**base** 偏离 P50 ±15% 以上必须在 rationale.pe 给出财报证据"
-              "（增长/利润率结构变化、资本回报变化等），『保守起见』类无证据折价"
-              "不接受——那会系统性压低所有标的。"
-              "\n  若下方给出「上一次运行的假设（连续性基准）」，连续性优先——"
-              "本锚只约束首次基线与失锚重建。")
-        # 滞后必须告知判断层（2026-08-17）：ntm 口径要求"该日之后满 4 个季度已披露"，
-        # 最近约一年结构性无值。此前只把天数注进去，锚看起来像"截至今天的近3年"，
-        # 于是判断层在市场已经重新定价的标的上照旧锚旧中枢却毫不知情（MSFT 实测：
-        # 锚 P50 30.1x，而市场最近 10 个月付的 NTM 可比倍数只有 ~22x）。
-        # 这里只给事实（滞后天数 + 无滞后 trailing 对照），不放松 ±15% 纪律——
-        # "市场已重定价"是一类**合法证据**，但仍要在 rationale.pe 里写出来。
-        _sp = _b.get("span") or {}
-        if _sp.get("lag_days"):
-            band_meta += (
-                f"\n  ⚠ 本带止于 {_sp['end']}（滞后 {_sp['lag_days']} 天）："
-                "ntm 口径的分母是「该日之后 12 个月**实际实现**的 EPS」，那个未来对最近"
-                "约一年的交易日还没发生，因此**最近约一年的倍数不在本分布内**。")
-            _tn = _b.get("trailing_nolag") or {}
-            _tnp = {str(k): v for k, v in (_tn.get("pctiles") or {}).items()}
-            if _tnp.get("50"):
-                band_meta += (
-                    f"\n    无滞后对照（trailing 口径，价÷过去12个月，{_tn['span']['start']}~"
-                    f"{_tn['span']['end']}）：P50 {_tnp['50']:.1f}x，最新 {_tn['current']:.1f}x。"
-                    "**不可与上面的 NTM 分位直接相减**——trailing 分母是过去 12 个月的"
-                    "已实现 GAAP EPS，NTM 分位的分母是未来 12 个月的 EPS。"
-                    "换算需要除以 **EPS 增速因子**（你给出的该情景 NTM EPS ÷ 当前 GAAP "
-                    "TTM EPS），**不是营收增速 g**——利润率、税率、其他收益、股数变化"
-                    "都会让 EPS 增速与营收增速显著分叉（利润率扩张叠加回购的票尤其）。"
-                    "当前 GAAP TTM EPS 见 FACTS 的 TTM 净利 ÷ 稀释股数。")
-                _gap = _tn.get("gap_since_main_band")
-                if _gap:
-                    band_meta += (f"\n    本带盲区那一段（{_gap['span']['start']}~"
-                                  f"{_gap['span']['end']}）trailing P50 {_gap['p50']:.1f}x。")
-            band_meta += ("\n    → 若折算后显示市场近一年的定价已明显偏离本带中枢，"
-                          "那是**锚可能已过时**的证据：此时偏离 P50 属于有证据的偏离，"
-                          "请在 rationale.pe 写明「近一年 regime 变化」并给出财报/定价依据。"
-                          "反之若两者量级一致，锚照常适用。")
-    # financials 的锚是 P/TBV 带（图3 的教科书结论：银行 E 带杠杆带周期，估值锚
-    # 是 P/B 系）——与 standard 的 PE 锚同一纪律结构，锚 s["ptbv"]
-    _tb = facts.get("ptbv_band") or {}
-    if mode == "financials" and _tb.get("thin_coverage"):
-        band_meta = (f"\n历史 P/TBV 带覆盖不足（仅 {_tb.get('days')} 个交易日）——本次无历史锚："
-                     "目标 P/TBV 按 ROTE/资本回报第一性判断，并在 rationale.ptbv 写明依据。")
-    elif mode == "financials" and _tb.get("pctiles"):
-        _rc2 = _tb.get("recent") or {}
-        _rp2 = _rc2.get("pctiles") or {}
-
-        def _pfmt2(pp):
-            return " / ".join(f"P{q} {pp[str(q)]:.2f}x" for q in (10, 25, 50, 75, 90)
-                              if str(q) in pp)
-        _aw2 = f"近{_rc2['years']}年" if _rp2 else f"近{_tb['years']}年"
-        band_meta = (
-            f"\n历史 P/TBV 带（trailing 口径，分母=当日已知每股有形账面价值，"
-            "与引擎 tbv_ps 同构）："
-            f"\n  全窗近{_tb['years']}年: {_pfmt2(_tb['pctiles'])}（{_tb['days']}天）"
-            + (f"\n  近{_rc2['years']}年子窗: {_pfmt2(_rp2)}（{_rc2['days']}天）" if _rp2 else "")
-            + f"\n  ← base 情景目标 P/TBV **默认锚{_aw2} P50**；bear/bull 参照 P25/P75"
-              " 量级再叠加各自情景的 ROTE/信贷假设。**base** 偏离 P50 ±15% 以上必须在"
-              " rationale.ptbv 给出财报证据（ROTE 结构变化、信贷周期位置、资本行动等）。"
-              "\n  若下方给出「上一次运行的假设（连续性基准）」，连续性优先。")
+    # 否则 g/opm/fwd_shares 会各自锚在不同的"下一财年"上（AMZN 实测三次裂成两种口径）。
+    # g 分母在强制 override 场景切到 override（见 _fwd_meta docstring），门禁与
+    # 下方"注入指令/拒收缺失"两处严格同源
+    force_override = bool(pending_8k) or stale_days > 550
+    if force_override and mode == "standard":
+        # override 会把营收基准前滚，而 TTM cfo/capex 还停在旧 XBRL 窗口（0019）：
+        # 偏离 >10% 时校验层不再拿陈旧 FCF 率当 margins 锚，谷底下限与上界（0022 C2）
+        # 都改锚历史中位——提前写进口径说明，判断层被拒时才知道锚为什么换了。
+        # 自愿 override（非 force 场景）在 prompt 期不可知，其换锚说明走拒绝文案
+        # （margins 拒绝行点名上界/谷底锚，见 _validate_judgment），retry 仍是知情的
+        caliber += ("\n口径说明：TTM 现金流（cfo/capex）口径滞后于 ttm_revenue_override"
+                    "——override 偏离 FACTS 的 TTM 营收 >10% 时，margins 谷底下限"
+                    "与上界（1.2×）自动改锚历史年度 FCF 利润率中位（见 FCF 利润率表）。")
+    fwd_meta = _fwd_meta(FWD, force_override=force_override)
+    # 历史带锚注入（standard=NTM PE / financials=P/TBV，含 thin/缺席两种
+    # 「本次无历史锚」告知）——文案构造抽成 _band_meta 纯函数，缺席分支可单测
+    band_meta = _band_meta(mode, facts)
     # Rule of 40（fetch_facts 计算）：营收增速+利润率，「高倍数值不值得给」的对照
     # 标尺——分数高支撑倍数带上沿，分数低而倍数高 = 增速在烧钱换。给判断层做
     # pe/g 组合合理性的参照，不是硬规则（校验层不执法）。
@@ -973,30 +1491,32 @@ async def _pipeline(job: dict, ticker: str, email: str) -> None:
             + (f"\n  ⚠ 口径注意：{_r40['caliber_note']}" if _r40.get("caliber_note") else "")
             + "\n  ← 软件/平台类 >40 算优秀。用作 pe/g 组合合理性的对照：分数低于 40"
               " 而你给的目标倍数落在历史带上沿时，rationale.pe 里要说清为什么。")
+    # 期后 filing 索引紧跟 MANIFEST：它回答的是检查清单 #3「报告期之后发生了什么」，
+    # 与 MANIFEST（报告期内的财报）正好衔接
+    filing_meta = ""
+    if filing_idx:
+        filing_meta = (
+            f"# 报告期后 filing 索引（服务器实查 EDGAR：报告期 {periodic_end} 之后"
+            "提交的 424B*/S-*/8-K/SC 13*/10-*）\n"
+            f"{filing_idx}\n"
+            "  ← post_period_capital_events 的核对以此为线索（增发/发债→424B/8-K "
+            "Item 1.01/3.02，回购/分红宣告→8-K Item 8.01 或新闻稿）；"
+            "索引只是线索，金额与性质仍须回到原文\n\n")
     prompt = (f"{base_prompt}\n\n# 服务器注入的元数据（不要输出这些字段）\n"
               f"ticker={ticker} name={info['name']} date={today} price={price:.2f} "
               f"mcap={mcap/1e6:,.0f}M$ shares={shares}M股{fwd_meta}{band_meta}{ro40_meta}{caliber}\n\n"
               f"# FACTS（SEC XBRL）\n{_compact_facts(facts)}\n\n"
               f"# MANIFEST（本次分析的财报文件）\n{manifest}\n\n"
+              f"{filing_meta}"
               f"# SECTIONS（财报关键章节摘录 JSON）\n{sections}{prev_section}\n")
     # v2 一致性规则的事实输入：情景 EPS 用的营收基准与 TTM FCF 利润率
     rev0_m = ttm["revenue"]["value"] / 1e6
     fcfm = None
     if mode == "standard":
         fcfm = (ttm["cfo"]["value"] - ttm["capex"]["value"]) / ttm["revenue"]["value"]
-    # 负/近零 TTM FCF 时 margins 谷底护栏的备用锚：历史年度 FCF 利润率中位。
-    # 与 engine.hist_fcf_margins 同口径（年度 CFO−capex / 营收），此处只取中位数。
-    hist_fcfm = None
-    _hm = []
-    for k in sorted(facts.get("revenue_annual") or {}):
-        _r = (facts.get("revenue_annual") or {}).get(k)
-        _c = (facts.get("cfo_annual") or {}).get(k)
-        _x = (facts.get("capex_annual") or {}).get(k)
-        if all(_isnum(v) for v in (_r, _c, _x)) and _r:
-            _hm.append((_c - _x) / _r)
-    if _hm:
-        _hm = sorted(_hm[-10:])
-        hist_fcfm = _hm[len(_hm) // 2]
+    # 负/近零 TTM FCF 时 margins 谷底/上界护栏的备用锚：历史年度 FCF 利润率中位。
+    # 实现抽到 _hist_fcfm_median（0022 C4）——check_configs 回归工具与产线同源。
+    hist_fcfm = _hist_fcfm_median(facts)
     judgment = None
     last_err = ""
     last_raw = ""
@@ -1014,7 +1534,11 @@ async def _pipeline(job: dict, ticker: str, email: str) -> None:
             judgment = _parse_json(raw)
             _validate_judgment(judgment, mode,
                                rev0=float(judgment.get("ttm_revenue_override") or rev0_m),
-                               fcf_margin=fcfm, band=facts.get("pe_band"),
+                               # override 偏离旧 TTM >10% 时现金流锚已过期，
+                               # 传 None 让谷底下限落回历史中位（0019）
+                               fcf_margin=_fcfm_for_validation(
+                                   fcfm, judgment.get("ttm_revenue_override"), rev0_m),
+                               band=facts.get("pe_band"),
                                hist_fcf_margin=hist_fcfm)
             # 陈旧 XBRL（外国发行人 6-K 无季度框架）下，没有原文重锚的 TTM 会让
             # 全部情景锚在多年前的营收基准上——硬性要求判断层给 override。
@@ -1038,11 +1562,13 @@ async def _pipeline(job: dict, ticker: str, email: str) -> None:
     if judgment is None:
         raise RuntimeError(f"判断层输出两次校验失败：{last_err}")
 
-    # semantics_version=3（2026-08-14）：v2 的一致性规则/诊断红旗/SOTP 降级之上，
-    # 纳入判断层 PE 锚（66ad9c4 起注入历史 NTM 带、base 默认锚子窗 P50）——锚改变
-    # base PE 的产生方式与目标价水平，锚前样本与锚后样本混在趋势视图里聚合会把
-    # 语义变化读成基本面修正，必须靠版本号隔开。仅描述 standard 模式
-    # （financials 沿用 v1 情景语义，恒为 1）。
+    # semantics_version=4（2026-09-06）：v3 的 PE 锚之上，服务器前置注入十年
+    # FCF 利润率锚表、OI&E 组件+税前−营业利润残差行、期后 filing 索引——终值
+    # margins 与 other_income 的锚从"判断层徒手拼"变成"服务器实算注入"，锚的
+    # 来源改变 = 语义改变，与 v2→v3 的隔离理由同构（v3 =纳入判断层 PE 锚，
+    # 2026-08-14）。锚前样本与锚后样本混在趋势视图里聚合会把语义变化读成基本面
+    # 修正，必须靠版本号隔开。仅描述 standard 模式（financials 走 fin v3：跨情景
+    # 排序 + 亏损协议，见 _validate_judgment_financials 与 engine fin 分支注释）。
     # manifest_latest 直接进 cfg：bundle 里的 config_假设留档.json 与自动锚同源，
     # 显式 VALUATION_PREV_CONFIG 指向 bundle config 时报告期失效触发器才有指纹可查
     def _build_cfg(j: dict) -> dict:
@@ -1056,12 +1582,16 @@ async def _pipeline(job: dict, ticker: str, email: str) -> None:
                  price=round(price, 2), mcap=round(mcap / 1e6), shares=shares,
                  mode=mode, adr_multiple=adr_multiple,
                  currency=facts.get("currency", "USD"),
-                 semantics_version=3 if mode == "standard" else 2,
+                 semantics_version=4 if mode == "standard" else 3,
                  manifest_latest=latest_report,
                  # PENDING_10Q 标记进 cfg：engine 据此把 vintage 归档键前滚到 8-K
                  # 覆盖的季度（fwd_window 已 +3 个月），否则这次运行会归进旧
                  # report_end 的格子，趋势视图把"最新业绩下的估值"错当旧季度样本
                  pending_10q=bool(pending_8k))
+        # ADR 标定回退（0018）留下的股数口径失配：引擎据此打全局黄旗。只在失配时
+        # 写键——不给历史 config 无端加一个恒 null 字段
+        if adr_mismatch is not None:
+            c["share_count_mismatch"] = round(adr_mismatch, 4)
         # fwd_label 是可由 report_end 纯日期推导的事实，与 price/shares 同类：
         # 在此**覆盖**判断层的输出，让"选错财年"这个失败模式从构造上不存在。
         # 判断层若仍输出了该字段，静默被盖掉即可——prompt 已明确要求不要输出。
@@ -1088,9 +1618,13 @@ async def _pipeline(job: dict, ticker: str, email: str) -> None:
         await _run([PY, str(VAL / "engine.py"), str(wd / "config.json"), str(wd / "facts.json"),
                     str(wd / "valuation.json"), str(fdir / "manifest.csv")], wd)
         val = json.loads((wd / "valuation.json").read_text(encoding="utf-8"))
-        reds = [f"[{sc}] {msg}" for sc in ("bear", "base", "bull")
-                for lv, msg in (val["scenarios"].get(sc) or {}).get("warnings", [])
-                if lv == "red"]
+        # 全局通道（0015）一并计入：按构造它今天只有 yellow（vintage/带滞后都是
+        # 数据事实），但 red 统计漏一个通道 = 未来某个全局 red 会静默放行连续性锚
+        reds = ([f"[全局] {msg}" for lv, msg in val.get("warnings_global") or []
+                 if lv == "red"]
+                + [f"[{sc}] {msg}" for sc in ("bear", "base", "bull")
+                   for lv, msg in (val["scenarios"].get(sc) or {}).get("warnings", [])
+                   if lv == "red"])
         if not reds or gate_attempt == 1 or mode != "standard":
             break
         job["step"] = "judgment"
@@ -1106,7 +1640,11 @@ async def _pipeline(job: dict, ticker: str, email: str) -> None:
             revised = _parse_json(await _claude(retry_p))
             _validate_judgment(revised, mode,
                                rev0=float(revised.get("ttm_revenue_override") or rev0_m),
-                               fcf_margin=fcfm, band=facts.get("pe_band"),
+                               # 与首轮同一道口径闸（0019）：复审输出换了 override
+                               # 也要按它自己的偏差重新决定锚
+                               fcf_margin=_fcfm_for_validation(
+                                   fcfm, revised.get("ttm_revenue_override"), rev0_m),
+                               band=facts.get("pe_band"),
                                hist_fcf_margin=hist_fcfm)
             # 陈旧 XBRL / PENDING_10Q 的强制 override 在复审通道同样成立——revised
             # 整体替换 judgment，若复审输出丢掉 override，全部情景会锚回旧营收基准
@@ -1121,16 +1659,9 @@ async def _pipeline(job: dict, ticker: str, email: str) -> None:
             job["detail"] = f"复审输出未通过校验（{e!r:.120}），沿用原假设并保留红旗"
             break
 
-    # 连续性锚持久化（v2）：只有 gate-clean（无 red 红旗）的 config 才能成为下次
-    # 运行的基准——带病假设冻结成锚会让偏差跨运行复利（方差可见，偏差不可见）。
-    # 原子写：避免任务中断留下半个 JSON 毒化后续所有运行
-    if (mode == "standard" and not reds
-            and not os.environ.get("VALUATION_NO_CONTINUITY")):
-        PREV_DIR.mkdir(exist_ok=True)
-        _tmp = PREV_DIR / f".{ticker}.json.tmp"
-        _tmp.write_text(json.dumps(dict(cfg, manifest_latest=latest_report),
-                                   ensure_ascii=False, indent=1), encoding="utf-8")
-        os.replace(_tmp, PREV_DIR / f"{ticker}.json")
+    # 连续性锚持久化：gate 与写盘见 _persist_prev_config（2026-09-06 起 financials
+    # 一并持久化——此前写路径挂 mode 门禁，fin 的自动连续性结构上是 no-op）
+    _persist_prev_config(ticker, cfg, reds, latest_report)
 
     job["step"] = "report"
     xlsx = wd / f"{ticker}_valuation_{today}.xlsx"
@@ -1164,25 +1695,13 @@ async def _pipeline(job: dict, ticker: str, email: str) -> None:
         job["detail"] = f"vintage 归档失败（{e!r:.120}），不影响本次报告"
 
     # trading_range 走独立字段而非塞进 summary：前端 Object.entries(summary) 按
-    # "情景名 $blend（upside%）"渲染，混入结构不同的键会渲染出 undefined
-    _tr = val.get("trading_range")
+    # "情景名 $blend（upside%）"渲染，混入结构不同的键会渲染出 undefined。
+    # 区间缺席时 trading_range_note 说明原因（见 _trading_range_payload）
+    _trp, _trn = _trading_range_payload(mode, facts, val)
     job.update(status="done", step="done", result=str(bundle),
                summary={k: dict(blend=v["blend"], upside=v["upside"])
                         for k, v in val["scenarios"].items()},
-               trading_range=(dict(lo=_tr["px"].get("25"), mid=_tr["px"].get("50"),
-                                   hi=_tr["px"].get("75"), window=_tr["window"],
-                                   # 盈利窗口 + 倍数窗口真实起止/滞后：只写"近3年PE带"
-                                   # 会被读成区间的时间跨度（实测确实被这么问了）
-                                   eps_window=_tr.get("eps_window"),
-                                   span=_tr.get("span"),
-                                   # 现价当前位置与倍数回归归因——区间中位的涨幅按构造
-                                   # 全部来自倍数回归，不写出来读者看不见
-                                   fwd_pe_now=_tr.get("fwd_pe_now"),
-                                   # 带外只给关系不给截断分位（PR #5 review）
-                                   fwd_pe_now_position=_tr.get("fwd_pe_now_position"),
-                                   target_pe=_tr.get("target_pe"),
-                                   mult_reversion=_tr.get("mult_reversion_to_p50"))
-                              if _tr and _tr.get("px") else None))
+               trading_range=_trp, trading_range_note=_trn)
 
 
 async def _run_job(job_id: str, ticker: str, email: str) -> None:
@@ -1225,6 +1744,11 @@ async def create_valuation(req: ValuationRequest):
 @router.get("/api/valuation/auth")
 async def valuation_auth():
     """判断层登录状态。前端在弹出登录窗口后轮询它，登录完成即可重试。"""
+    # 自定义命令模式（0016）：判断层不经本机 claude CLI，本机凭证状态与任务无关。
+    # 不给 cli/can_popup——「登录」按钮在这个模式下什么也修不了
+    if os.environ.get("VALUATION_JUDGMENT_CMD"):
+        return {"ok": True, "reason": "判断层=自定义命令（VALUATION_JUDGMENT_CMD），无需本机登录",
+                "cli": None, "can_popup": False}
     st = _auth_state()
     try:
         st["cli"] = _find_claude()

@@ -64,6 +64,12 @@ def _sample(val: dict, gate_clean: bool) -> dict:
         "run_date": val.get("date") or date.today().isoformat(),
         "run_ts": time.time(),
         "gate_clean": bool(gate_clean),
+        # 情景无关警告的全局通道（0015）：时效/期后事件/带滞后从 base.warnings 移到
+        # warnings_global，不计快照会让"移动后"样本的 base yellows 看似凭空下降
+        "reds_global": sum(1 for lv, _ in val.get("warnings_global") or []
+                           if lv == "red"),
+        "yellows_global": sum(1 for lv, _ in val.get("warnings_global") or []
+                              if lv == "yellow"),
         "semantics_version": val.get("semantics_version"),
         "blend_weights": val.get("blend_weights"),
         # PENDING_10Q 样本：TTM 基准来自 8-K 新闻稿滚动而非 XBRL，10-Q 落地后的

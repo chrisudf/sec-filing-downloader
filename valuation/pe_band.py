@@ -30,6 +30,7 @@
 import argparse
 import bisect
 import json
+import math
 import statistics
 import sys
 from datetime import date, timedelta
@@ -255,15 +256,143 @@ def backfill_shares_from_eps(sh, ni, eps_rows):
     return added
 
 
-def build_ttm_eps(ni_q, sh_q, anom_k=ANOM_K):
+def _loo_worst(items):
+    """leave-one-out 最大偏离：items=[(period_end, val)] -> (worst_ratio, anom_q, sign)。
+
+    判据（0061）：逐季与"其余三季的中位"比。旧判据拿全窗四季中位当基准——窗内
+    两季同向畸变时中位被拖走、偏离缩水到门槛之下（GOOG 2026H1 连续两季股权重估
+    实测漏网：Q1'26 那扇窗 dev/median<1.25）。拿掉自己再取中位，三季里至多一季脏、
+    中位必落在干净季上，单季/双季畸变同判据覆盖。sign 是偏离方向（+1 吹大 −1 打穿），
+    季节性豁免要求跨年**同向**重现——方向翻转的不是季节结构。
+    """
+    anom_q, worst, sign = None, 0.0, 0
+    for j, (k, x) in enumerate(items):
+        others = [y for i2, (_, y) in enumerate(items) if i2 != j]
+        med_o = statistics.median(others)
+        if not med_o:
+            continue
+        r = abs(x - med_o) / abs(med_o)
+        if r > worst:
+            worst, anom_q, sign = r, k, (1 if x > med_o else -1)
+    return worst, anom_q, sign
+
+
+def _same_fq(k1, k2, tol=45):
+    """两个期末是否为不同年份的同一财季（相隔 ≈ n×365 天，n>=1）。
+
+    tol=45：4-4-5 财历的季度末逐年漂移最多约一周、53 周年跳一周，45 天容差
+    覆盖之余仍与相邻季度（±91 天）清晰分离。"""
+    days = abs((date.fromisoformat(k2) - date.fromisoformat(k1)).days)
+    if days < 300:
+        return False
+    rem = days % 365.25
+    return rem <= tol or rem >= 365.25 - tol
+
+
+def _valid_windows(ni_q):
+    """滚动四季窗迭代器（相邻期末 80-100 天的连续性校验）。
+
+    loo_outlier_map 与 loo_covered_periods 必须扫**同一批**窗口——各写一份窗口
+    校验会在边界窗上判出两个答案（季节性密度闸的分母与分子随之错位）。"""
+    qs = sorted(ni_q.items())
+    for i in range(3, len(qs)):
+        window = qs[i - 3:i + 1]
+        ends = [date.fromisoformat(k) for k, _ in window]
+        if all(80 <= (ends[j + 1] - ends[j]).days <= 100 for j in range(3)):
+            yield window
+
+
+def loo_outlier_map(ni_q, anom_k=ANOM_K):
+    """全序列滚动四季窗扫一遍，记录每个「窗内 leave-one-out 最大偏离 > anom_k」的
+    季度及其方向 -> {period_end: sign}。季节性豁免的原料：同一财季跨年反复成为
+    同向离群季，是结构不是事故。"""
+    omap = {}
+    for window in _valid_windows(ni_q):
+        worst, anom_q, sign = _loo_worst([(k, v["val"]) for k, v in window])
+        if anom_q and worst > anom_k:
+            omap.setdefault(anom_q, sign)
+    return omap
+
+
+def loo_covered_periods(ni_q):
+    """出现在至少一扇完整四季窗里的期末集合——季节性密度闸的分母原料（0022 C1）。
+
+    分母若数「同财季有数据的所有年份」，从未进过任何完整窗（相邻季缺失、结构上
+    不可能被 loo_outlier_map 标记）的期末也会被算成「该重现而没重现」，密度被
+    人为压低。只有可能被标记的期末才有资格进分母。"""
+    covered = set()
+    for window in _valid_windows(ni_q):
+        covered.update(k for k, _ in window)
+    return covered
+
+
+def is_recurring_seasonal(anom_q, sign, omap, covered, min_recur=2):
+    """离群季 anom_q 的形态是否为**结构性**季节重现 -> bool。
+
+    稳定季节性（INTU 财年 Q3 占全年 60-70%、玩具股 Q4 重）在 leave-one-out 判据下
+    峰值季占全年 > 2.25/5.25 ≈ 43% 就会让**每一扇** TTM 窗都被标畸变——三个口径
+    全灭，compute_band 报「有效交易日仅 0 天」还把锅甩给披露滞后。一次性事件
+    （AMZN Anthropic 重估、Rivian、税改）都是单窗/单期形态，同财季其他年份不会
+    同向离群，照旧剔除。
+
+    两道闸（0022 C1 补第二道）：
+    ① 跨年同向重现 >= min_recur 次（原判据）；
+    ② 密度：同财季**其他**年份里（分母只数进过完整四季窗的期末，见
+       loo_covered_periods），同向离群的年份须占**至少一半**。真季节性本质上
+       年年重现；商誉减值这类一次性项目结构性扎堆在同一财季（年度减值测试季）、
+       却隔多年才来一次——14 年里 3 次 Q4 减值不是季节结构，修前它豁免掉当期
+       减值季、TTM EPS 被打穿还标成「稳定季节性」。
+    已知代价：① 连续 3 年以上的超高速 ramp（每年同一季都创阶跃）可能被当成季节性
+    放行——那类窗口本就属"误标好过混入"的灰区；② 近年才形成的季节性（并购来的
+    季节性业务）在其重现次数占到历史一半之前照旧被剔——方向与"误标好过混入"一致，
+    且全量留痕（anom_windows）可核对。"""
+    others = [k2 for k2 in covered if k2 != anom_q and _same_fq(anom_q, k2)]
+    n = sum(1 for k2 in others if omap.get(k2) == sign)
+    return n >= min_recur and 2 * n >= len(others)
+
+
+def _window_verdict(items, anom_k, omap, covered):
+    """整窗四季的畸变裁决 -> (anomalous, anom_q, seasonal_q)。
+
+    季节性豁免此前只裁单一 argmax（0022 C0）：豁免掉季节峰值季之后，窗内**并存**
+    的一次性畸变（偏离落在 anom_k 与峰值偏离之间）被顺带放行，窗口还被标成
+    「稳定季节性保留」——合成复现：TTM EPS 吹大 25%、PE 少算 20%、零留痕。
+    修法：argmax 属季节结构时把它从窗里拿掉、对剩余季度重跑 leave-one-out，
+    亚军仍越界且自身不属季节结构时照旧整窗标畸变。循环处理"窗内多个季节季"；
+    剩 <3 季时停止——2 季的 leave-one-out 退化为两点互比，没有干净中位可言。"""
+    seasonal_q = None
+    pool = list(items)
+    while len(pool) >= 3:
+        worst, anom_q, sign = _loo_worst(pool)
+        if not anom_q or worst <= anom_k:
+            return False, None, seasonal_q
+        if is_recurring_seasonal(anom_q, sign, omap, covered):
+            seasonal_q = seasonal_q or anom_q
+            pool = [(k, v) for k, v in pool if k != anom_q]
+            continue
+        return True, anom_q, seasonal_q
+    return False, None, seasonal_q
+
+
+def build_ttm_eps(ni_q, sh_q, anom_k=ANOM_K, omap=None, covered=None):
     """滚动四季 TTM EPS，附「最早可知日」= 四个季度里最晚的 filed 日。
 
     附一次性畸变标记（anomalous）：单季净利偏离同窗中位季 > ANOM_K 倍即整窗标记。
     双侧判定——巨额一次性收益把 EPS 吹大（PE 假低）和巨额减值把 EPS 打穿（PE 假高）
     是同一种"分母不代表盈利能力"，near-zero 地板只挡得住后者的极端形态。标记不删点
     （删点会让 ntm 配对的 i+4 错位），由消费侧跳过并计数。
+    季节性豁免（0008，0022 改由 _window_verdict 裁决）：离群季属季节结构时保留窗口
+    并标 seasonal_q；豁免季节季后窗内仍有越界的一次性季则照旧整窗标畸变（C0），
+    判据/密度闸/代价见 is_recurring_seasonal 与 _window_verdict 的 docstring。
+    对超高速 ramp（NVDA 2023 型）单年阶跃仍照剔（跨年不重现）。
+    omap/covered 可由调用方传入复用（compute_band 的 FY 层豁免用同一套表），
+    None 则自建；两者必须来自同一 ni_q。
     """
     pts, qs = [], sorted(ni_q.items())
+    if anom_k and omap is None:
+        omap = loo_outlier_map(ni_q, anom_k)
+    if anom_k and covered is None:
+        covered = loo_covered_periods(ni_q)
     for i in range(3, len(qs)):
         window = qs[i - 3:i + 1]
         ends = [date.fromisoformat(k) for k, _ in window]
@@ -279,30 +408,21 @@ def build_ttm_eps(ni_q, sh_q, anom_k=ANOM_K):
                     max(s["first_filed"] for s in sh))
         if not known:
             continue
-        vals = {k: v["val"] for k, v in window}
-        # leave-one-out 判据（0061）：逐季与"其余三季的中位"比。旧判据拿全窗四季
-        # 中位当基准——窗内两季同向畸变时中位被拖走、偏离缩水到门槛之下
-        # （GOOG 2026H1 连续两季股权重估实测漏网：Q1'26 那扇窗 dev/median<1.25）。
-        # 拿掉自己再取中位，三季里至多一季脏、中位必落在干净季上，单季/双季畸变
-        # 同判据覆盖。代价：对超高速 ramp（NVDA 2023 型）更敏感，会多剔几扇窗——
-        # 该类窗口 PE 离散度本就极大，剔除且留痕好过静默混入（与 ANOM_K 注释同）。
-        items = list(vals.items())
-        anom_q, worst = None, 0.0
-        for j, (k, x) in enumerate(items):
-            others = [y for i2, (_, y) in enumerate(items) if i2 != j]
-            med_o = statistics.median(others)
-            if not med_o:
-                continue
-            r = abs(x - med_o) / abs(med_o)
-            if r > worst:
-                worst, anom_q = r, k
-        anomalous = bool(anom_k) and worst > anom_k
+        if anom_k:
+            anomalous, anom_q, seasonal_q = _window_verdict(
+                [(k, v["val"]) for k, v in window], anom_k,
+                omap or {}, covered or set())
+        else:
+            anomalous, anom_q, seasonal_q = False, None, None
         pts.append({"period_end": window[-1][0], "known_from": known,
                     "ttm_ni": sum(v["val"] for _, v in window),
                     "avg_diluted_shares": avg_sh,
                     "ttm_eps": sum(v["val"] for _, v in window) / avg_sh,
                     "anomalous": anomalous,
-                    "anom_q": anom_q if anomalous else None})
+                    "anom_q": anom_q if anomalous else None,
+                    # 被剔窗口不再列为"季节性保留"——seasonal_windows 的语义是
+                    # 「被豁免 = 留在分布里」，剔了还挂季节标签会误导核对
+                    "seasonal_q": seasonal_q if not anomalous else None})
     return sorted(pts, key=lambda p: p["known_from"])
 
 
@@ -348,8 +468,13 @@ def load_inputs(ticker, email, years=5):
     if hist.empty:
         raise RuntimeError(f"yfinance 取不到 {ticker} 价格")
     splits = {d.date(): float(r) for d, r in tk.splits.items() if r and float(r) != 1.0}
+    # taxonomy 随 inputs 下传（0020）：报错分类要区分「外国发行人」与「历史太短」，
+    # ifrs 是前者最强的形态证据。判据必须与上面 facts 的选择同为**真值**判断
+    # （0022 C7）：空 us-gaap 桩 + 有数据的 ifrs-full 并存时，facts 取了 IFRS，
+    # 按键存在判 taxonomy 会标成 us-gaap——外国发行人被分类成「历史太短」
     return {"cik": cik, "facts": facts, "dei": allf.get("dei") or {},
-            "hist": hist, "splits": splits, "years": years}
+            "hist": hist, "splits": splits, "years": years,
+            "taxonomy": "us-gaap" if allf.get("us-gaap") else "ifrs-full"}
 
 
 def build_trailing_nolag(unfiltered_rows, main_band_last_date, prefix="pe",
@@ -387,6 +512,32 @@ def build_trailing_nolag(unfiltered_rows, main_band_last_date, prefix="pe",
             if len(gap) >= min_gap else None)}
 
 
+def _has_nonusd_units(facts, tags) -> bool:
+    """非美元申报形态：给定 tag 下存在 USD 系以外的货币单位（ASML 的 EUR 等）。"""
+    for t in tags:
+        for u in (facts.get(t) or {}).get("units") or {}:
+            if u not in ("USD", "shares") and "/" not in u:
+                return True
+    return False
+
+
+def insufficient_q_msg(ticker, detail, taxonomy, facts, tags, n_annual, n_q) -> str:
+    """季度序列不足的报错分类（0020）。
+
+    「外国发行人常无季度 XBRL」此前是唯一措辞——美股新上市票（年度 0 期 +
+    2 个季度）也被诊断成外国发行人，实测把失败原因带偏。外国发行人措辞只给
+    真正像外国发行人的形态：ifrs taxonomy / 非美元申报 / 有年度却无任何季度
+    （20-F 年报节奏）；其余按「历史太短」呈现，并给出可行动的下一步。"""
+    foreign = (taxonomy == "ifrs-full" or _has_nonusd_units(facts, tags)
+               or (n_annual > 0 and n_q == 0))
+    if foreign:
+        return (f"{ticker} 季度 XBRL 不足（{detail}）"
+                "——外国发行人常无季度 XBRL，本工具需要季度序列")
+    return (f"{ticker} 季度 XBRL 不足（{detail}）"
+            "——历史太短（新上市发行人常见），带子需 >=4 个连续季度，"
+            "待后续 10-Q 申报后再试")
+
+
 def compute_band(ticker, email, years=5, basis="forward", include_series=False,
                  metric="eps", inputs=None):
     """算出历史 PE/P.S 分布，返回纯数据 dict（不打印）。
@@ -410,8 +561,15 @@ def compute_band(ticker, email, years=5, basis="forward", include_series=False,
     ni_q = derive_q4(pick(facts, NUM_TAGS, "quarterly", {"USD"},
                           prefer_max=(metric == "rps")), ni_a)
     if len(ni_q) < 4:
-        raise RuntimeError(f"{ticker} 季度 XBRL 不足（{NUM_WORD} {len(ni_q)} 期）"
-                         "——外国发行人常无季度 XBRL，本工具需要季度序列")
+        raise RuntimeError(insufficient_q_msg(
+            ticker, f"{NUM_WORD} {len(ni_q)} 期", inputs.get("taxonomy"),
+            facts, NUM_TAGS, len(ni_a), len(ni_q)))
+    # 年度序列可以为空（首个完整财年年报未出的新上市发行人：有季度 XBRL、FY 长度
+    # 行 0 期，SPCX 型）——此前一路走到财年边界表才 fy_ends[-1] IndexError，
+    # 数据形态问题必须以「样本不足」级别的干净 RuntimeError 呈现，不是崩栈
+    if not ni_a:
+        raise RuntimeError(f"{ticker} 年度{NUM_WORD} 0 期——新上市发行人常见"
+                           "（首个完整财年年报未出），待首个完整财年后可用")
     sh_a = pick(facts, SH_TAGS, "annual", {"shares"})
     sh_q = pick(facts, SH_TAGS, "quarterly", {"shares"})
     # 股数兜底（0060）：反推的分子必须是净利（与 EPS 同分子），与本带 metric 无关。
@@ -436,8 +594,9 @@ def compute_band(ticker, email, years=5, basis="forward", include_series=False,
                            "EPS 舍入误差 ~0.2-1.6%）")
     sh_q = derive_q4_avg(sh_q, sh_a)
     if len(sh_q) < 4:
-        raise RuntimeError(f"{ticker} 季度 XBRL 不足（{NUM_WORD} {len(ni_q)} 期/股数 {len(sh_q)} 期）"
-                         "——外国发行人常无季度 XBRL，本工具需要季度序列")
+        raise RuntimeError(insufficient_q_msg(
+            ticker, f"{NUM_WORD} {len(ni_q)} 期/股数 {len(sh_q)} 期",
+            inputs.get("taxonomy"), facts, SH_TAGS, len(sh_a), len(sh_q)))
     # 残留口径跳变哨兵：逐条 filed 规则的兜底（yfinance 拆股日偏差、罕见的不重述
     # 再申报都会在相邻期股数上留下台阶）。只留痕不修数——修数需要能定位口径边界，
     # 启发式做不到，上面的教训就是这么来的
@@ -450,8 +609,13 @@ def compute_band(ticker, email, years=5, basis="forward", include_series=False,
 
     # 畸变守卫只对 eps 生效：ANOM_K=1.25 按净利一次性损益校准（AMZN 1.40x），
     # 营收没有"一次性膨胀"的常见类似物，极端季节性票（游戏/税务软件 Q4 >2.25×
-    # 中位是常态结构）会被整段误剔——P/S 带宁可保留全部窗口
-    pts = build_ttm_eps(ni_q, sh_q, anom_k=(ANOM_K if metric == "eps" else None))
+    # 中位是常态结构）会被整段误剔——P/S 带宁可保留全部窗口。
+    # _omap/_cov 在窗口层与 FY 层之间共享：季节性豁免两层必须同一判据，各建一张表
+    # 会在边界窗上判出两个答案
+    _omap = loo_outlier_map(ni_q) if metric == "eps" else {}
+    _cov = loo_covered_periods(ni_q) if metric == "eps" else set()
+    pts = build_ttm_eps(ni_q, sh_q, anom_k=(ANOM_K if metric == "eps" else None),
+                        omap=_omap, covered=_cov)
     if not pts:
         raise RuntimeError(f"{ticker} 无法构造连续四季 TTM EPS")
 
@@ -465,25 +629,24 @@ def compute_band(ticker, email, years=5, basis="forward", include_series=False,
     # 亏损年 PE 无意义，整年从分布里剔除——不说出来的话会被当成"数据缺了一段"
     dropped = [e for e in fy_ends if e not in eps_fy and e >= str(date.today().year - years)]
     # 财年层面的一次性畸变（forward 口径的对应物）：FY 含畸变季则该年实现 EPS 同样
-    # 不代表盈利能力，与亏损年同等处置——整年剔除并单独留痕
-    anom_fys = []
+    # 不代表盈利能力，与亏损年同等处置——整年剔除并单独留痕。
+    # 季节性豁免与窗口层同一判据同一张 _omap（0008）：稳定季节性票的**每一个** FY
+    # 都含 >1.25x 离群季，不豁免则 forward 口径整段剔穿
+    anom_fys, seasonal_fys = [], []
     for e in (list(eps_fy) if metric == "eps" else []):
         ae = date.fromisoformat(e)
-        qv = [v["val"] for k, v in ni_q.items()
-              if 0 <= (ae - date.fromisoformat(k)).days < 340]
-        if len(qv) != 4:
+        qkv = [(k, v["val"]) for k, v in ni_q.items()
+               if 0 <= (ae - date.fromisoformat(k)).days < 340]
+        if len(qkv) != 4:
             continue
-        # 与 build_ttm_eps 同一 leave-one-out 判据（财年 = 固定四季窗）
-        hit = False
-        for j, x in enumerate(qv):
-            others = [y for i2, y in enumerate(qv) if i2 != j]
-            med_o = statistics.median(others)
-            if med_o and abs(x - med_o) / abs(med_o) > ANOM_K:
-                hit = True
-                break
-        if hit:
+        # 与 build_ttm_eps 同一裁决（财年 = 固定四季窗）：豁免季节季后仍有越界的
+        # 一次性季则整年照剔（C0 的 FY 层同型泄漏）
+        _anom, _, _seas = _window_verdict(qkv, ANOM_K, _omap, _cov)
+        if _anom:
             del eps_fy[e]
             anom_fys.append(e)
+        elif _seas:
+            seasonal_fys.append(e)
 
     def fy_of(d):
         i = bisect.bisect_left(fy_ends, d)
@@ -513,6 +676,7 @@ def compute_band(ticker, email, years=5, basis="forward", include_series=False,
     series = []
     anom_days = {"trailing": 0, "ntm": 0}
     stale_days = 0
+    nan_close_days = 0
     # 陈旧点守卫：Q4 被 sanity gate 拒掉时 build_ttm_eps 会跳过含缺口的 4 个窗口，
     # bisect 回退拿到的可能是 5 个季度前的点——「宁缺勿错」的缺必须真缺，
     # 拿陈旧 EPS 除当期价格混进分布比缺一段更糟。>210 天（约缺一个季度以上）跳过留痕
@@ -522,6 +686,13 @@ def compute_band(ticker, email, years=5, basis="forward", include_series=False,
         if d < start:
             continue
         px = float(row["Close"])
+        # NaN 收盘（yfinance 偶发空行/停牌残行，KO/AAPL 实测）必须在源头剔掉：
+        # NaN 既 truthy 又过不了任何比较，下游全部失守——混进分布 pstdev 直接抛
+        # AttributeError（整条带子死于 pe_band_error），落在 trailing 尾段则
+        # trailing_nolag.current=NaN 一路流进 prompt/stdout 渲染成「nanx」。留痕计数
+        if math.isnan(px):
+            nan_close_days += 1
+            continue
         rec = {"date": d, "close": px}
         i = bisect.bisect_right(knowns, d) - 1
         if i >= 0 and (date.fromisoformat(d)
@@ -677,7 +848,13 @@ def compute_band(ticker, email, years=5, basis="forward", include_series=False,
         "split_notes": split_notes, "dropped_fys": dropped,
         "anom_windows": [{"period_end": p["period_end"], "quarter": p["anom_q"]}
                          for p in by_end if p.get("anomalous")],
+        # 季节性豁免的窗口/财年单独留痕：被豁免 = 保留在分布里，读者要能核对
+        # "为什么这票的 Q4 高峰没被当畸变剔掉"
+        "seasonal_windows": [{"period_end": p["period_end"], "quarter": p["seasonal_q"]}
+                            for p in by_end if p.get("seasonal_q")],
+        "seasonal_fys": seasonal_fys,
         "anom_days": anom_days, "anom_fys": anom_fys, "stale_days": stale_days,
+        "nan_close_days": nan_close_days,
         "near_zero_days": len(near_zero),
         "near_zero_range": ([near_zero[0], near_zero[-1]] if near_zero else None),
         "candidates": [{"name": n, "lo": lo, "hi": hi, "mid": (lo + hi) / 2,
@@ -781,10 +958,15 @@ def compute_ptbv_band(ticker, email, years=5, inputs=None):
     knowns = [p["known_from"] for p in pts]
     series = []
     stale_days = 0
+    nan_close_days = 0
     neg_days = []
     for ts, row in hist.iterrows():
         d = ts.date().isoformat()
         if d < start:
+            continue
+        px = float(row["Close"])
+        if math.isnan(px):
+            nan_close_days += 1  # 同 compute_band：NaN 收盘在源头剔除并留痕
             continue
         i = bisect.bisect_right(knowns, d) - 1
         if i >= 0 and (date.fromisoformat(d)
@@ -795,8 +977,7 @@ def compute_ptbv_band(ticker, email, years=5, inputs=None):
             neg_days.append(d)  # 负/零 TBV 期照 near-zero 惯例留痕，不静默消失
             continue
         if i >= 0:
-            series.append({"date": d, "close": float(row["Close"]),
-                           "ptbv": float(row["Close"]) / pts[i]["tbv_ps"],
+            series.append({"date": d, "close": px, "ptbv": px / pts[i]["tbv_ps"],
                            "tbv_ps": pts[i]["tbv_ps"], "period_end": pts[i]["period_end"]})
     if len(series) < 60:
         raise RuntimeError(f"{ticker} P/TBV 有效交易日仅 {len(series)} 天，样本不足")
@@ -828,7 +1009,7 @@ def compute_ptbv_band(ticker, email, years=5, inputs=None):
         "mean": statistics.mean(vals), "median": pcts[50], "stdev": statistics.pstdev(vals),
         "min": sv[0], "max": sv[-1], "pctiles": pcts, "recent": recent, "current": cur,
         "split_notes": split_notes, "shares_basis": shares_basis,
-        "stale_days": stale_days,
+        "stale_days": stale_days, "nan_close_days": nan_close_days,
         "neg_equity_days": len(neg_days),
         "neg_equity_range": ([neg_days[0], neg_days[-1]] if neg_days else None),
         "near_zero_days": len(near_zero),
@@ -880,6 +1061,9 @@ def main():
     if a.basis == "forward" and b["anom_fys"]:
         print(f"  剔除: 财年 {', '.join(b['anom_fys'])} 含单季一次性畸变"
               f"（偏离同年中位季 >{ANOM_K}x），实现{EW}不代表盈利能力，整年不计入")
+    if a.basis == "forward" and b.get("seasonal_fys"):
+        print(f"  保留: 财年 {', '.join(b['seasonal_fys'])} 的离群季属稳定季节性"
+              "（同一财季跨年同向重现 >=2 次），非一次性畸变，整年照常计入")
     if b["anom_windows"] and a.basis in ("trailing", "ntm"):
         _tail = "、".join(f"{w['period_end']}(畸变季 {w['quarter']})"
                           for w in b["anom_windows"][-3:])
@@ -890,9 +1074,16 @@ def main():
               f"（末几个: {_tail}）——影响本窗 trailing {b['anom_days']['trailing']} 天 / "
               f"ntm {b['anom_days']['ntm']} 天；巨额一次性损益会把实现{EW}吹大、"
               f"{LBL} 假性变低，双侧剔除")
+    if b.get("seasonal_windows") and a.basis in ("trailing", "ntm"):
+        print(f"  保留: 全历史 {len(b['seasonal_windows'])} 个 TTM 窗口的离群季属"
+              "稳定季节性（同一财季跨年同向重现 >=2 次）——季节结构不是一次性畸变，"
+              "窗口照常计入分布")
     if b.get("stale_days"):
         print(f"  剔除: {b['stale_days']} 个交易日的最近已知点距该日 >210 天（数据缺口/"
               "Q4 推导被拒）——陈旧分母不入分布")
+    if b.get("nan_close_days"):
+        print(f"  剔除: {b['nan_close_days']} 个交易日收盘价为 NaN（yfinance 空行/"
+              "停牌残行）——不入分布")
     if b["near_zero_days"]:
         r = b["near_zero_range"]
         print(f"  剔除: {b['near_zero_days']} 个交易日的{EW}低于窗口中位数的 25%"
