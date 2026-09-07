@@ -139,6 +139,21 @@ def test_trough_fallback_documented_in_prompt_and_tuning():
     assert "历史年度 FCF 利润率中位" in TUNING
 
 
+def test_prompt_negative_fcf_note_matches_trough_fallback():
+    """同一份 prompt 不许自相矛盾（PR #16 评审）。
+
+    上面第 5 条已写「谷底锚会退到历史年度中位」，下面的 ⚠️ 段却还说负 FCF 时
+    「两道护栏都退化、DCF 基本是裸奔」。判断层照后者写深谷底 → 自检通过 →
+    被校验器拒 → 白烧一轮 retry（单次运行总调用 <=3）。"""
+    assert "两道护栏都退化" not in STD_PROMPT
+    assert "裸奔" not in STD_PROMPT
+    # 行为侧同时钉住：当期 FCF 为负 + 历史中位健康 → 下限照样拦得住
+    # （既有用例只覆盖了当期为正但 <=2% 的 0.01，负值正是 ⚠️ 段说的场景）
+    with pytest.raises(ValueError, match="历史年度 FCF 利润率中位"):
+        _validate_judgment(_mk(), "standard", fcf_margin=-0.015,
+                           hist_fcf_margin=0.054)
+
+
 def test_trough_rejection_names_ttm_anchor():
     d = _mk()   # bear 谷底 0.02 < 0.4×0.10
     with pytest.raises(ValueError, match="当前 TTM FCF 利润率"):

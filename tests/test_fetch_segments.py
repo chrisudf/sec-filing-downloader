@@ -370,7 +370,9 @@ def test_build_segments_all_skipped_raises_true_cause(monkeypatch):
     monkeypatch.setattr(fs, "_collect_versions", lambda c, k, p: (
         {}, {}, {}, [("a1", "申报 a1 里找不到 XBRL instance"),
                      ("a2", "申报 a2 里找不到 XBRL instance")], {}))
-    with pytest.raises(SegmentsError, match="全部取不到"):
+    # 文案在 PR #16 评审后合并了两种成因，不再写死「全部」（混合批次里那是
+    # 假话）——断言仍钉住"真实成因必须被携带"这个意图
+    with pytest.raises(SegmentsError, match="2 份申报取不到 XBRL instance"):
         fs.build_segments("XXXX", "t@e.st", cik=1)
 
 
@@ -436,3 +438,40 @@ def test_build_segments_all_dropped_raises(monkeypatch):
         {}, {}, {}, [], {"num-comma-decimal": 40}))
     with pytest.raises(SegmentsError, match="transform"):
         fs.build_segments("XXXX", "t@e.st", cik=1)
+
+
+# ---- PR #16 评审：计数范围与零期护栏的成因 ----
+
+def test_dropped_transforms_ignores_unrelated_concepts():
+    """transform 丢弃计数只该覆盖营收/集中度 concept。
+
+    申报里随便一个无关事实（股数、每股股利……）用了未识别 transform，就会被
+    算进 dropped_transforms；对一家本来就没披露分部营收的公司，零期护栏于是
+    把「公司没这个披露」报成「解析器故障」，成功结果也会挂上误导性告警。"""
+    doc = _IXBRL_DOC.replace(b'name="us-gaap:Revenues"',
+                             b'name="us-gaap:CommonStockSharesOutstanding"')
+    doc = doc.replace(b"ixt:num-dot-decimal", b"ixt:num-comma-decimal")
+    out = _parse_instance(doc)
+    assert out["periods"] == {}          # 无关 concept 本就不产期间
+    assert out["dropped_transforms"] == {}
+
+
+def test_zero_period_error_carries_both_causes(monkeypatch):
+    """混合批次：一份缺 instance + 其余败给未识别 transform。
+
+    两个护栏原来是先后两条 if，skip 分支先命中并宣称「全部取不到 instance」——
+    对有 instance 只是丢了事实的那几份是假话，而唯一可行动的信息（transform
+    名）被整条吞掉。"""
+    monkeypatch.setattr(fs, "_list_filings", lambda c, k, cut: [
+        {"acc": "a1", "filed": "2026-08-26", "report": "2026-07-26"},
+        {"acc": "a2", "filed": "2026-05-20", "report": "2026-04-26"}])
+    monkeypatch.setattr(fs, "_sweep_stale_cache", lambda: None)
+    monkeypatch.setattr(fs, "_collect_versions", lambda c, k, p: (
+        {}, {}, {}, [("a1", "申报 a1 里找不到 XBRL instance")],
+        {"num-comma-decimal": 7}))
+    with pytest.raises(SegmentsError) as e:
+        fs.build_segments("XXXX", "t@e.st", cik=1)
+    msg = str(e.value)
+    assert "XBRL instance" in msg          # 成因一仍在
+    assert "num-comma-decimal" in msg      # 成因二：可行动的名字不许被吞掉
+    assert "全部" not in msg               # 混合批次里"全部"是假话

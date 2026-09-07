@@ -10,6 +10,7 @@ from datetime import date, timedelta
 
 import pytest
 
+from valuation import pe_band as pb
 from valuation.pe_band import compute_band
 
 
@@ -255,3 +256,37 @@ def test_zero_fy_rows_raises_clean_runtime_error():
     with pytest.raises(RuntimeError, match="年度净利 0 期"):
         compute_band("IPO", "x@example.com", years=5, basis="trailing",
                      inputs=_inputs(facts, _hist()))
+
+
+# ---- PR #16 评审：季节性档案必须收全窗内每个越界季 ----
+
+def _ni_q(pattern, years=4, start_year=2022):
+    """{期末: {"val": v}}，每年四季按 pattern 重复（季末间隔 ~91 天）。"""
+    out = {}
+    for y in range(start_year, start_year + years):
+        for (m, d), v in zip(((3, 31), (6, 30), (9, 30), (12, 31)), pattern):
+            out[f"{y}-{m:02d}-{d:02d}"] = {"val": v}
+    return out
+
+
+def test_loo_outlier_map_records_every_outlier_not_just_argmax():
+    """一扇窗里两个季度都越界时，只记 argmax 会让较弱的那个永远进不了档案。"""
+    ni_q = _ni_q((100.0, 100.0, 400.0, 300.0), years=1)
+    omap = pb.loo_outlier_map(ni_q)
+    # Q3 偏离 3.0、Q4 偏离 2.0，都在 ANOM_K=1.25 之上
+    assert set(omap) == {"2022-09-30", "2022-12-31"}
+    assert omap["2022-09-30"] == 1 and omap["2022-12-31"] == 1
+
+
+def test_two_seasonal_quarters_do_not_reject_the_window():
+    """档案残缺的下游后果：_window_verdict 剥掉冠军季后，亚军因查无跨年重现
+    被当成一次性事故，整扇窗被判畸变——那个「循环处理窗内多个季节季」的设计
+    永远走不到第二轮。"""
+    ni_q = _ni_q((100.0, 100.0, 400.0, 300.0))      # 四年同形态 = 真季节结构
+    omap = pb.loo_outlier_map(ni_q)
+    covered = pb.loo_covered_periods(ni_q)
+    window = [(k, v["val"]) for k, v in sorted(ni_q.items())[4:8]]
+    anomalous, anom_q, seasonal_q = pb._window_verdict(
+        window, pb.ANOM_K, omap, covered)
+    assert not anomalous, f"窗被误判畸变，肇事季 {anom_q}"
+    assert seasonal_q is not None

@@ -69,6 +69,9 @@ MAX_INSTANCE_BYTES = 30_000_000
 PARSE_VER = 7               # 解析逻辑变更时递增，旧缓存自动失效
 # 集中度披露：带 1 的才是现行 us-gaap concept（无后缀版已弃用、返回零条）
 CONC_TAGS = {"ConcentrationRiskPercentage1", "ConcentrationRiskPercentage"}
+# 只为这批 concept 记 transform 丢弃数：计数要喂零期护栏与前端告警，
+# 混进申报里无关的数值事实会把"本来就没披露分部营收"的公司报成解析故障
+_COUNTED_CONCEPTS = set(REVENUE_LOCALNAMES) | CONC_TAGS
 CACHE_DIR = Path(__file__).resolve().parent.parent / "jobs" / "segments_cache"
 
 _rate_lock = threading.Lock()
@@ -235,23 +238,29 @@ def _ix_number(el, dropped: dict | None = None) -> float | None:
     return -val if el.get("sign") == "-" else val
 
 
-def _fact_items(root, dropped: dict | None = None):
+def _fact_items(root, dropped: dict | None = None, count_concepts=None):
     """统一两种载体的数值事实遍历，产出 (concept 局部名, contextRef, 值)。
 
     普通 instance：概念是顶层元素标签，值在 text；
     iXBRL（XHTML 内嵌，收缩目录申报的唯一形态）：事实是 ix:nonFraction，
     概念在 @name，值要按 format/scale/sign 还原。同一事实在 iXBRL 里
     常重复出现（封面+附注），调用方按 contextRef 覆盖去重。
-    dropped：未识别 transform 的丢弃计数（见 _ix_number）。"""
+    dropped：未识别 transform 的丢弃计数（见 _ix_number）。
+    count_concepts：只为这批 concept 计数（None=全部）。计数会喂零期护栏与
+    前端告警——把申报里每个无关数值事实都算进来，会让"公司本来就没披露分部
+    营收"变成一句"解析器故障"（PR #16 评审）。"""
     if _local(root.tag) == "html":
         for ns in _IX_NS:
             for el in root.iter(f"{{{ns}}}nonFraction"):
                 cref = el.get("contextRef")
                 if cref is None:
                     continue
-                val = _ix_number(el, dropped)
+                ln = _local(el.get("name", ""))
+                counted = (dropped if count_concepts is None
+                           or ln in count_concepts else None)
+                val = _ix_number(el, counted)
                 if val is not None:
-                    yield _local(el.get("name", "")), cref, val
+                    yield ln, cref, val
         return
     for el in root.iter():
         cref = el.get("contextRef")
@@ -300,7 +309,7 @@ def _parse_instance(xml_bytes: bytes) -> dict:
     # (concept, contextRef) -> value：iXBRL 同一事实常重复出现（封面+附注），
     # 按键覆盖去重；两个集中度 concept 同 context 并存时互不挤占
     conc_facts: dict = {}
-    for ln, cref, val in _fact_items(root, dropped):
+    for ln, cref, val in _fact_items(root, dropped, _COUNTED_CONCEPTS):
         if cref not in contexts:
             continue
         if ln in facts:
@@ -703,20 +712,23 @@ def build_segments(ticker: str, email: str, cik: int | None = None,
         versions, totals, conc_cells, skipped, dropped_fmt = _collect_versions(
             client, cik, picked)
 
-    if skipped and not versions and not totals and not conc_cells:
+    if not versions and not totals and not conc_cells and (skipped or dropped_fmt):
         # 全军覆没时必须响亮携带真实原因：静默返回空结果会被服务端缓存
         # 6 小时，且 404 文案「没有可用的分部营收数据」把取数故障说成
-        # 公司未披露——这正是逐份跳过想避免的假阴性
-        raise SegmentsError(
-            f"{ticker} 的 {len(skipped)} 份申报全部取不到 XBRL instance"
-            f"（如 {skipped[0][1]}）")
-    if dropped_fmt and not versions and not totals and not conc_cells:
-        # 同类假阴性的 transform 版：事实全被未识别 format 丢掉时零期出卡
-        # 且无 skip 记录（NVDA 2019 曾整批中招）——响亮点名具体 transform
-        raise SegmentsError(
-            f"{ticker} 解析出零期，且 {sum(dropped_fmt.values())} 个数值事实"
-            f"因未识别的 iXBRL transform（{'/'.join(sorted(dropped_fmt))}）被丢弃"
-            f"——解析器 transform 白名单可能落后于注册表")
+        # 公司未披露——这正是逐份跳过想避免的假阴性。
+        # 两种成因合并成一条（PR #16 评审）：混合批次里（一份缺 instance +
+        # 其余败给未识别 transform）原来先命中 skip 分支, 报"全部取不到
+        # instance"既不准确、又把唯一可行动的信息（transform 名）吞掉
+        causes = []
+        if skipped:
+            causes.append(f"{len(skipped)} 份申报取不到 XBRL instance"
+                          f"（如 {skipped[0][1]}）")
+        if dropped_fmt:
+            causes.append(
+                f"{sum(dropped_fmt.values())} 个数值事实因未识别的 iXBRL "
+                f"transform（{'/'.join(sorted(dropped_fmt))}）被丢弃"
+                f"——解析器 transform 白名单可能落后于注册表")
+        raise SegmentsError(f"{ticker} 解析出零期：" + "；".join(causes))
 
     aliases = _detect_aliases(versions)
     cells = _pick_cells(versions, aliases)

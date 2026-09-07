@@ -302,15 +302,38 @@ def _valid_windows(ni_q):
             yield window
 
 
+def _loo_all(items, anom_k):
+    """窗内**每个** leave-one-out 偏离越界的季度 -> [(period_end, sign)]。
+
+    与 _loo_worst 的分工：裁决单扇窗看最坏的那个季（argmax），但建
+    季节性档案（omap）必须收全部越界季——只记 argmax 时，两个都属真季节
+    结构的季度里较强的那个会赢下每一扇窗，较弱的永远进不了 omap，于是
+    _window_verdict 剥掉冠军后把亚军当一次性事故，整扇窗被否（PR #16 评审）。"""
+    out = []
+    for j, (k, x) in enumerate(items):
+        others = [y for i2, (_, y) in enumerate(items) if i2 != j]
+        med_o = statistics.median(others)
+        if not med_o:
+            continue
+        r = abs(x - med_o) / abs(med_o)
+        if r > anom_k:
+            out.append((k, 1 if x > med_o else -1))
+    return out
+
+
 def loo_outlier_map(ni_q, anom_k=ANOM_K):
-    """全序列滚动四季窗扫一遍，记录每个「窗内 leave-one-out 最大偏离 > anom_k」的
-    季度及其方向 -> {period_end: sign}。季节性豁免的原料：同一财季跨年反复成为
-    同向离群季，是结构不是事故。"""
+    """全序列滚动四季窗扫一遍，记录**每个**「leave-one-out 偏离 > anom_k」的季度
+    及其方向 -> {period_end: sign}。季节性豁免的原料：同一财季跨年反复成为同向
+    离群季，是结构不是事故。
+
+    一窗多季全收（不是只收 argmax）：两个季度都属真季节结构时，较强的那个会
+    赢下每一扇窗，较弱的永远进不了 omap；_window_verdict 剥掉冠军后重跑，亚军
+    因档案里查无跨年重现而被当成一次性事故，整扇窗被否——那个「循环处理窗内
+    多个季节季」的设计就永远走不到第二轮（PR #16 评审）。"""
     omap = {}
     for window in _valid_windows(ni_q):
-        worst, anom_q, sign = _loo_worst([(k, v["val"]) for k, v in window])
-        if anom_q and worst > anom_k:
-            omap.setdefault(anom_q, sign)
+        for k, sign in _loo_all([(k, v["val"]) for k, v in window], anom_k):
+            omap.setdefault(k, sign)
     return omap
 
 
