@@ -107,6 +107,9 @@ def vintage_warnings(cfg, vintage, dividends_quarterly=None):
 
     **一律 yellow，绝不 red**：red 会把这条打回判断层，而它是*数据事实*不是假设，
     判断层能"修"它的唯一途径就是扭曲假设——那正是上面那条级联的成因。
+    v4（2026-09-06）加一档 **info**：事件已逐笔 reflected_in_net_cash=true 确认
+    计入 net_cash 时降级为 info 留痕行——那是对账记录不是隐患，vintages 的
+    yellows 计数不含它。
 
     dividends_quarterly：facts 里的季度分红序列。分红是股数差检查唯一的盲区
     （分红不改股数），所以近四季有没有分红决定文案分叉——对不分红的标的
@@ -123,6 +126,13 @@ def vintage_warnings(cfg, vintage, dividends_quarterly=None):
     ppce = cfg.get("post_period_capital_events") or []
     mcap = cfg.get("mcap") or 0
     end = vt.get("report_end", "?")
+    # financials cfg 没有 net_cash 假设（2026-09-06 起 fin 分支也走本护栏）——
+    # 停在报告期的是整张资产负债表（TBV）。时点混用逻辑同构（TBV 停在
+    # report_end，price/fwd_shares 是当前值；增发=权益已流入未计入 TBV →
+    # P/TBV 腿系统性低估，回购反向），只是锚的名字不同。standard 文案逐字不变。
+    _nc = cfg.get("net_cash")
+    bs = f"net_cash={_nc:,.0f}M" if _isnum(_nc) else "TBV（报告期股东权益口径）"
+    bs_name = "net_cash" if _isnum(_nc) else "TBV"
 
     if ppce:
         # amount_musd 是**现金流向**，不等于对 net_cash（现金−负债）的影响：
@@ -149,6 +159,31 @@ def vintage_warnings(cfg, vintage, dividends_quarterly=None):
                 seg += f"（净现金 {imp:+,.0f}M）"
             parts.append(seg)
         desc = "；".join(parts)
+        # v4 泄压阀（2026-09-06）：判断层已逐笔以 reflected_in_net_cash=true 确认
+        # 计入 net_cash 时，「请确认已算进去」就从提醒变成了无法解除的噪音
+        # （AAPL/MSFT 实测：net_cash_note 里已对完账，这条黄旗照样响）。有金额的
+        # 事件全部确认 → 降级为 info 短行（build_report 仍渲染为 ⚠ 行，但 vintages
+        # 的 yellows 计数不含 info——「可解除」就体现在这）；任何一笔有金额的事件
+        # 缺确认 → 黄旗照旧。纯或有（担保或有 amount=0）无现金可对账，不要求确认。
+        # 只认布尔 True："true"（字符串）不算，校验层已拒绝非布尔。
+        material = [e for e in ppce
+                    if abs(_amt(e)) > 0 or abs(_impact(e) or 0) > 0]
+        # 纯或有清单（0022 C5）：material 为空时 all([]) 空真，旧文案照说「已逐笔
+        # 确认计入 net_cash」——对从未确认过（甚至显式 reflected_in_net_cash=false）
+        # 且无现金可对账的或有事件，这是凭空捏造的对账记录。降级 info 本身是对的
+        # （或有事件无须确认），只有措辞要分叉：说清"无现金可对账"。
+        if not material:
+            note = str(cfg.get("ppce_note") or "").strip()
+            return [["info",
+                     f"期后资本事件 {len(ppce)} 笔均为或有/零现金事件（无现金可对账，"
+                     f"无需 {bs_name} 确认）：{desc}"
+                     + (f"。{note}" if note else "")]]
+        if all(e.get("reflected_in_net_cash") is True for e in material):
+            note = str(cfg.get("ppce_note") or "").strip()
+            return [["info",
+                     f"期后资本事件 {len(ppce)} 笔已声明并逐笔确认计入 "
+                     f"{bs}：{desc}"
+                     + (f"。{note}" if note else "")]]
         if missing:
             head = (f"现金流向合计 {sum(_amt(e) for e in ppce):+,.0f}M"
                     f"——{len(missing)}/{len(ppce)} 笔未给 net_cash_impact_musd，"
@@ -158,8 +193,8 @@ def vintage_warnings(cfg, vintage, dividends_quarterly=None):
             head = (f"对净现金影响 {net:+,.0f}M"
                     + (f"，占市值 {abs(net) / mcap:.1%}" if mcap else ""))
         return [["yellow", f"期后资本事件已声明（{head}）：{desc}。"
-                           f"请确认 net_cash={cfg['net_cash']:,.0f}M 已把它们算进去——"
-                           "引擎不自动调整，net_cash 的最终值由判断层负责"]]
+                           f"请确认 {bs} 已把它们算进去——"
+                           f"引擎不自动调整，{bs_name} 的最终值由判断层负责"]]
     if age is None or age <= 45:
         return []
 
@@ -169,16 +204,32 @@ def vintage_warnings(cfg, vintage, dividends_quarterly=None):
     # 所以不听声明，改看**可机械证明的自相矛盾**：股数侧建模了回购/增发，
     # 现金侧却用报告期口径——同一件事只记了一半。
     d = cfg["shares"] - cfg["fwd_shares"]      # >0 净回购，<0 净增发
-    if cfg["shares"] and abs(d) / cfg["shares"] > 0.005:
+    # 阈值 1.5%（v4，2026-09-06）：fwd_shares 是「前瞻加权稀释股本、考虑回购趋势」
+    # （schema 原文），与报告期股数差 ~1% 属常规前瞻建模——SBC 摊薄或回购趋势的
+    # 外推，不是期后离散资本事件。TSLA 实测 +0.8% 被当成「现金流入未计入 net_cash」
+    # 的增发报出来，纯噪声；AAPL 1.05% 回购形态自此改由下方分红盲区条继续覆盖。
+    # 已声明增发/发债事件时不豁免（防御式：当前控制流里声明非空在上方已 return）。
+    _issuance_declared = any(isinstance(e, dict) and e.get("kind") in ("增发", "发债")
+                             for e in ppce)
+    if cfg["shares"] and abs(d) / cfg["shares"] > (0.005 if _issuance_declared else 0.015):
         what = "净回购" if d > 0 else "净增发"
-        direction = ("现金流出未从 net_cash 扣除 → 系统性**高估**" if d > 0
-                     else "现金流入未计入 net_cash → 系统性**低估**")
-        tail_msg = ("post_period_capital_events 声明为空，与股数侧的假设矛盾，请复核"
-                    if declared else
-                    "请在 post_period_capital_events 里声明并让 net_cash 反映最终值")
+        direction = (f"现金流出未从 {bs_name} 扣除 → 系统性**高估**" if d > 0
+                     else f"现金流入未计入 {bs_name} → 系统性**低估**")
+        # 补救指令按 bs_name 分叉（0022 C6）：fin cfg 既没有 net_cash 也没有
+        # post_period_capital_events（fin schema 不含该字段），指着两个不存在的
+        # 字段让判断层"反映最终值"是不可执行的指令——fin 改指 notes 与 TBV 口径。
+        # standard 文案逐字不变。
+        if declared:
+            tail_msg = "post_period_capital_events 声明为空，与股数侧的假设矛盾，请复核"
+        elif bs_name == "net_cash":
+            tail_msg = "请在 post_period_capital_events 里声明并让 net_cash 反映最终值"
+        else:
+            tail_msg = ("fin 配置无 post_period_capital_events 字段——请在 notes 里"
+                        "说明该期后资本事件，并核对 TBV 是否已反映最终值")
         return [["yellow", f"时点不一致：fwd_shares {cfg['fwd_shares']:,.0f}M 较报告期股数 "
                            f"{cfg['shares']:,.0f}M 差 {abs(d):,.0f}M（{abs(d) / cfg['shares']:.1%}，"
-                           f"已建模{what}），但 net_cash={cfg['net_cash']:,.0f}M 仍是 "
+                           "超过 1.5% 的常规建模阈值——SBC 摊薄/回购趋势到不了这个量级，"
+                           f"已建模{what}），但 {bs} 仍是 "
                            f"{end} 口径（龄 {age} 天）——{direction}。" + tail_msg]]
 
     # 股数差不显著只排除了增发/大额回购，**排不掉分红**——分红不改股数，上面那条
@@ -188,7 +239,12 @@ def vintage_warnings(cfg, vintage, dividends_quarterly=None):
     _dq = dividends_quarterly or {}
     _pays_div = any(v for _, v in sorted(_dq.items())[-4:])
     if not declared:
-        tail_msg = "期后资本事件未声明，请核对增发/回购/并购/分拆/分红后填写"
+        # fin cfg 无 post_period_capital_events 字段（0022 C6）：让它"填写"是不可
+        # 执行的指令，改指 notes；standard 文案逐字不变
+        tail_msg = ("期后资本事件未声明，请核对增发/回购/并购/分拆/分红后填写"
+                    if bs_name == "net_cash" else
+                    "请核对期后增发/回购/并购/分拆/分红——发现事件请在 notes 里说明"
+                    "（fin 配置无 post_period_capital_events 字段）")
     elif _pays_div:
         tail_msg = ("期后资本事件已声明为无——但分红不改股数，"
                     "机械检查看不见它，请自行确认分红流出是否重大")
@@ -200,7 +256,7 @@ def vintage_warnings(cfg, vintage, dividends_quarterly=None):
                     "股数与分红两条路径均已排除，仅剩并购/分拆/发债偿债需人工确认")
     return [["yellow", f"报告期末已 {age} 天"
                        + ("（>100 天，严重滞后）" if age > 100 else "")
-                       + f"，net_cash={cfg['net_cash']:,.0f}M 仍是 {end} 口径；" + tail_msg]]
+                       + f"，{bs} 仍是 {end} 口径；" + tail_msg]]
 
 def band_lag_warnings(band, span, now_pe, min_lag=270):
     """PE 带子滞后的时效提示 -> [[level, msg], ...]。
@@ -281,22 +337,60 @@ def other_income_crosscheck(facts, other_income, eps1, fwd_shares,
                            "（标签未收录或期数不足）。该字段全靠判断层给数，"
                            "请按 other_income_note 的推导自行复核"]]
     ref = ii - ie + on
-    if not fwd_shares or eps1 is None:
+    if not fwd_shares:
         return []
     gap = other_income - ref
     eps_gap = gap / fwd_shares
-    if abs(eps_gap) < abs_eps_gate or abs(eps_gap) < rel_gate * abs(eps1):
+    if abs(eps_gap) < abs_eps_gate:
+        return []
+    # eps1 假值时不做相对门槛、不给占比：None=PE 腿 n.m.；0.0=近盈亏平衡标的
+    # 的 round(ni1/fwd_shares, 2) 把 |eps1|<0.005 抹成零——正是 pe_nm 人群。
+    # 此前 rel_gate×0=0 放行后占比除法 ZeroDivisionError，在全部 LLM 花费之后
+    # 炸掉整个 engine 子进程。差额仍是真实信息，只去掉占比子句，不静默跳过。
+    if eps1 and abs(eps_gap) < rel_gate * abs(eps1):
         return []
     # 指出差额主要落在哪一项，读者一眼看出被剔掉的是什么
     parts = {"利息收入": ii, "利息支出": -ie, "其他非经营": on}
     top = max(parts, key=lambda k: abs(parts[k]))
+    pct = (f"，占前瞻 EPS {abs(eps_gap) / abs(eps1):.0%}" if eps1
+           else "；前瞻 EPS≈0，占比无意义")
     return [["yellow",
              f"other_income={other_income:,.0f}M 与财报原始行差 {gap:+,.0f}M"
-             f"（≈ EPS {eps_gap:+.2f}，占前瞻 EPS {abs(eps_gap) / abs(eps1):.0%}）："
+             f"（≈ EPS {eps_gap:+.2f}{pct}）："
              f"TTM 利息收入 {ii:,.0f} − 利息支出 {ie:,.0f} + 其他非经营 {on:,.0f} "
              f"= {ref:,.0f}M，其中「{top}」{parts[top]:+,.0f}M 权重最大。"
              "差额来自一次性项目属正常——引擎不自动采纳原始行（股权重估/衍生品"
              "重估/减值常混在这一行里），但 other_income_note 必须能解释它"]]
+
+
+def seg_share_crosscheck(seg1_share, seg_rev_share, n_seg, sotp_in_blend,
+                         gate=0.25):
+    """seg1_share（判断层的利润集中度）vs 发行人 XBRL 分部营收集中度 -> [[lv, msg]]。
+
+    呈现层的对照（0023）。校验层（valuation_service._check_seg1_share）只拦
+    「关掉 SOTP 腿又不给理由」这一种形态，其余偏离一律放行——利润集中度本来就
+    可以显著高于/低于营收集中度。但放行不等于不说：两个口径差多少、SOTP 腿因此
+    在不在综合里，读者必须能在报表上看见，否则「这票为什么只有两条腿」无处可查。
+
+    分两档措辞：SOTP 已被降级时点明「整条腿退出综合」（这是有后果的那一种），
+    否则只作口径提示。缺对照物（单一分部发行人 / 分部取数失败）时不出旗——
+    没有对照就没有对照结论。
+    """
+    if not _isnum(seg1_share) or not _isnum(seg_rev_share) or not n_seg:
+        return []
+    gap = seg1_share - seg_rev_share
+    if abs(gap) < gate:
+        return []
+    head = (f"分部口径差 {gap:+.0%}：判断层给的主分部**利润**占比 {seg1_share:.0%}，"
+            f"而发行人按 {n_seg} 个分部申报的主分部**营收**占比是 {seg_rev_share:.0%}")
+    if not sotp_in_blend:
+        return [["yellow", head + f"——因 seg1_share >= {SOTP_SEG1_CAP:.0%}，"
+                                  "SOTP 腿已降级为参考项、**整条腿退出综合**"
+                                  "（综合 = PE/DCF 两法）。利润比营收更集中是可能的，"
+                                  "依据见 rationale.sotp"]]
+    return [["yellow", head + "——两个口径不同（低利润率分部拉低利润占比是常态），"
+                              "SOTP 腿照常入综合；此处只作口径提示"]]
+
 
 def hist_fcf_margins(facts):
     """历年 FCF 利润率（年度 CFO−capex / 营收）-> [(财年末, 利润率), ...] 按年排序。
@@ -334,6 +428,14 @@ def terminal_margin_warnings(hist, scenarios, gate=1.0, window=10, tol=0.005):
     # 与 pe_band 的"近 3 年子窗避开 2021 regime"是同一个思路。
     recent = hist[-window:]
     peak = max(m for _, m in recent)
+    if peak <= 0:
+        # RKLB 型 pre-FCF 发行人：近窗年年 FCF 为负，逐情景 continue 等于整条护栏
+        # 静默关闭——而"终值利润率无任何历史锚"恰是这类票最该说出口的事实。
+        # 不逐情景判罚（没有锚就没有"超越锚"可言），给一条黄旗留痕
+        return [["yellow",
+                 f"近 {len(recent)} 个财年（{recent[0][0][:4]}~{recent[-1][0][:4]}）"
+                 "无正 FCF 年份——终值利润率无历史锚，谷底深度与修复斜率需在 "
+                 "rationale.dcf_margin 给出可比公司或结构性依据"]]
     med = sorted(m for _, m in recent)[len(recent) // 2]
     out = []
     for name in ("bear", "base", "bull"):
@@ -433,7 +535,8 @@ def _pctile_rank(pcts, x):
     return 50.0
 
 
-def pe_band_check(scenario_name, pe, band, ddiag, label="PE", diag_key="pe_vs_history"):
+def pe_band_check(scenario_name, pe, band, ddiag, label="PE", diag_key="pe_vs_history",
+                  hard_cap=60):
     """目标 PE 相对该票自身历史「已实现前瞻 PE」分布的位置。
 
     口径对齐：band 由 fetch_facts 以 basis="ntm" 写入——分母是「该日已知的最新
@@ -451,6 +554,12 @@ def pe_band_check(scenario_name, pe, band, ddiag, label="PE", diag_key="pe_vs_hi
     label/diag_key 参数化后同一套逻辑服务 financials 的 P/TBV 带（trailing 口径，
     分母=当日已知每股 TBV，与 engine 的 tbv_ps 同构）——检查结构完全同型：
     全窗 min/max 管「从未出现过」，base 管子窗中枢并集。
+
+    hard_cap = 校验层对该倍数的硬上界（standard/fin 的 pe=60、P/TBV 调用点传 8）。
+    锚窗 P50 高于上界的高倍数票（TSLA P50 ~230x、ISRG 61.6x）上，锚纪律与上界
+    死锁：判断层被 band_meta 注入命令按上界封顶——封顶值必然低于锚/带下沿，
+    偏离是上界强加的，不是背离锚纪律。此时本函数不打偏离/从未出现旗，只在 base
+    留一条说明性黄旗（可见但不追究），并把封顶事实写进 ddiag。
     """
     if not band or not band.get("pctiles"):
         return []
@@ -480,6 +589,17 @@ def pe_band_check(scenario_name, pe, band, ddiag, label="PE", diag_key="pe_vs_hi
         "anchor_window": cwin,
         "anchor_p50": (round(cpcts["50"], 1) if "50" in cpcts else None),
         "years": band["years"], "days": band["days"], "basis": band["basis"]}
+    # 封顶豁免（0013，与 valuation_service._band_meta 的封顶预告同门槛）：倍数被
+    # 校验上界封顶且锚窗 P50 高于上界时，带下沿/从未出现旗都是上界的伪影——不打，
+    # 换成 base 上一条说明性黄旗留痕。pe != 上界（判断层自己给了更低值）不豁免。
+    _a50 = cpcts.get("50")
+    if hard_cap is not None and pe == hard_cap and (_a50 or 0) > hard_cap:
+        ddiag[diag_key]["capped_at_validation_limit"] = hard_cap
+        if scenario_name == "base":
+            return [["yellow", f"base 目标 {label} {pe:g}x = 校验硬上界封顶"
+                               f"（锚窗 P50 {_a50:.1f}x 高于上界）——低于锚/带下沿属"
+                               "封顶所致，偏离旗豁免；上行弹性看其余估值腿与区间分位"]]
+        return []
     ctx = (f"（近 {band['years']} 年已实现{label}：中位 {pcts['50']:.1f}x，"
            f"实际区间 {band['min']:.1f}~{band['max']:.1f}x，{band['days']} 个交易日）")
     if not band["min"] <= pe <= band["max"]:
@@ -502,6 +622,92 @@ def pe_band_check(scenario_name, pe, band, ddiag, label="PE", diag_key="pe_vs_hi
                                f"{ANCHOR_TOL:.0%} 后为 [{lo_ok:.1f},{hi_ok:.1f}]x，"
                                f"全窗第 {rank:.0f} 百分位）{ctx}——base 应为中枢情景"]]
     return []
+
+
+def dcf_diag_warnings(ddiag, dcf_eq, fcf_base, rev0, ocf):
+    """DCF 三道巡航护栏（第10年营收倍数 / 终值占比 / P/FCF 界外）-> [[level, msg]]。
+
+    从情景循环抽出的纯函数（派生诊断量写回 ddiag），便于按 test_valuation_guards
+    的 ast 抽取手法直接单测。本轮修的三个覆盖洞：
+    ① TV 占比 >75% 的 red 对 TTM FCF 非正/近零（pre-FCF）发行人是结构必然——
+      wacc−tg 给定时终值倍数是数学，red 会经 econ-review 打回判断层，逼它扭曲
+      margins 消红旗（RKLB 实测级联）。判据与下方 P/FCF 护栏同一条（fcf_base >
+      2% 营收的补集），pre-FCF 降级 yellow，与 trough/P-FCF 护栏的自动放宽一致。
+    ② pv_explicit<=0 时 dcf() 把 tv_pv_share 置 None，truthiness 闸门整条跳过——
+      「估值全押终值」的**最坏形态**恰好免检（RKLB bear 实测）。tv_pv>0 而
+      share=None 时按同级补发，措辞点明显式期 PV 非正。
+    ③ OCF 兜底黄旗的措辞说「TTM FCF 非正」而闸门是 <=2% 营收——0<FCF<=2% 时
+      自相矛盾。措辞改为如实反映闸门，数额与占比都给。
+    """
+    warnings = []
+    # pre-FCF 判据 = P/FCF 护栏闸门的补集（fcf_base <= 2% 营收），两处必须同一条：
+    # 各设一条会出现"P/FCF 护栏认定无意义、TV 红旗却按有意义打回"的自相矛盾
+    pre_fcf = not (fcf_base > 0.02 * rev0)
+    if ddiag["yrN_rev_multiple"] and ddiag["yrN_rev_multiple"] > 8:
+        warnings.append(["red", f"DCF 第10年营收为 TTM 的 {ddiag['yrN_rev_multiple']:.1f} 倍"
+                                "（>8x，隐含 10 年 CAGR >23%）——增长路径过于激进"])
+    _tvs = ddiag["tv_pv_share"]
+    _tv_lv = "yellow" if pre_fcf else "red"
+    _tv_tail = ("。TTM FCF 非正/近零：pre-FCF 发行人 TV 占比高属结构性，降级黄旗"
+                "（终值利润率依据仍须在 rationale.dcf_margin 交代）" if pre_fcf else "")
+    if _tvs and _tvs > 0.75:
+        warnings.append([_tv_lv, f"终值折现占 EV {_tvs:.0%}（>75%）——"
+                                 "估值几乎全押在永续段，对 wacc-tg 极端敏感" + _tv_tail])
+    elif _tvs is None and (ddiag.get("tv_pv") or 0) > 0:
+        warnings.append([_tv_lv,
+                         f"显式期 PV 非正（{ddiag.get('pv_explicit') or 0:,.0f}M），"
+                         f"估值全押终值（终值 PV {ddiag['tv_pv']:,.0f}M，占比无法定义）"
+                         "——比 >75% 更极端的同一形态，对 wacc-tg 的敏感性只增不减"
+                         + _tv_tail])
+    if not pre_fcf:
+        p_fcf = dcf_eq / fcf_base
+        ddiag["dcf_equity_over_ttm_fcf"] = round(p_fcf, 1)
+        if not 5 <= p_fcf <= 90:
+            warnings.append(["red", f"DCF 隐含股权价值为 TTM FCF 的 {p_fcf:.1f} 倍"
+                                    "（界外 [5,90]）——路径假设与当前现金流量级脱节"])
+    else:
+        # capex 周期股（AMZN TTM FCF −1.5%）走到这里：P/FCF 无意义，此前**整条
+        # 护栏静默跳过**——而 FCF 为负恰是 DCF 最不可靠的时候。不静默，改用 OCF
+        # 当备用锚（AMZN TTM OCF/营收 20.8%，正且稳）并说明本护栏未生效。
+        # 不给 OCF 设硬区间：跨行业的 P/OCF 合理带无法一刀切，给数不判罚。
+        _p_ocf = (dcf_eq / ocf) if _isnum(ocf) and ocf > 0 else None
+        if _p_ocf is not None:
+            ddiag["dcf_equity_over_ttm_ocf"] = round(_p_ocf, 1)
+        # 三档各出一条完整解释太吵（AMZN 实测刷了三遍同样的话）——压成一句：
+        # 事实 + 本档的备用锚数字。为什么要紧由 base 的终值敏感性那条承担。
+        # 措辞如实反映闸门（非正**或**占营收<=2%）：0<FCF<=2% 时说"非正"是撒谎
+        warnings.append(["yellow",
+                         f"TTM FCF {fcf_base:,.0f}M 非正或占营收 <=2%"
+                         f"（实际占比 {fcf_base / rev0:.1%}），"
+                         "『DCF权益/TTM FCF』护栏未生效"
+                         + (f"；改用 OCF 锚 = {_p_ocf:.1f}x" if _p_ocf is not None
+                            else "；TTM OCF 亦非正，无备用锚")])
+    return warnings
+
+
+def ps_reference(psb, rev1, fwd_shares, scen_name, ddiag):
+    """近零利润守卫的 P/S 参考价片段（不入综合）-> 追加进黄旗文案的字符串。
+
+    thin_coverage 的带子没有锚的话语权——pe_band_check/交易区间/锚注入三处都按
+    同一闸门停用，唯独这里此前不看该字段：60 天薄样本的 P50 照样被拿去乘参考价。
+    薄带只注明覆盖不足，不给数（ddiag 也不写 ps_ref）。
+    """
+    psb = psb or {}
+    if psb.get("thin_coverage"):
+        return (f"；P/S 参考带覆盖不足（{psb.get('days')} 天）——"
+                "薄样本无锚话语权，参考价不出")
+    _psp = (psb.get("recent") or {}).get("pctiles") or psb.get("pctiles") or {}
+    if "50" not in _psp or not fwd_shares:
+        return ""
+    _rps1 = rev1 / fwd_shares
+    ddiag["ps_ref"] = {
+        "basis": psb.get("basis"),
+        "window": ("recent" if (psb.get("recent") or {}).get("pctiles") else "full"),
+        "ps_p50": round(float(_psp["50"]), 2), "rps1": round(_rps1, 2),
+        "px": {q: round(float(_psp[q]) * _rps1, 1)
+               for q in ("25", "50", "75") if q in _psp}}
+    return (f"；P/S 参考（不入综合）：历史 P/S P50 {float(_psp['50']):.2f}x × "
+            f"{scen_name} 每股营收 {_rps1:.2f} ≈ {float(_psp['50']) * _rps1:.1f}")
 
 
 ttm = facts["ttm"]
@@ -548,8 +754,11 @@ if MODE == "financials":
         ticker=cfg["ticker"], name=cfg["name"], date=cfg["date"], mode="financials",
         # financials 语义 v2（2026-08-14）：P/TBV 带锚（判断层注入 + ptbv_band_check）
         # 改变 base ptbv 的产生方式与目标价水平——与 standard v2→v3 的理由同构，
-        # 锚前(v1)/锚后(v2) 金融股样本在 trend/compare 里必须按版本隔离
-        semantics_version=2,
+        # 锚前(v1)/锚后(v2) 金融股样本在 trend/compare 里必须按版本隔离。
+        # v3（2026-09-06）：跨情景排序 + 亏损协议（nm<=0 → pe=0，PE 腿 n.m. 剔出
+        # 综合）+ 微利守卫——亏损/微利票的综合从「假微利 × 倍数」变成 P/TBV 单腿，
+        # 目标价的产生方式结构性改变，v2 样本不可与 v3 混聚，连续性锚跨版本失效重建
+        semantics_version=3,
         blend_weights={m: BLEND_W[m] for m in ("pe", "ptbv")},
         meta=dict(price=cfg["price"], mcap=cfg["mcap"], shares=cfg["shares"],
                   fwd_shares=cfg["fwd_shares"], fwd_label=cfg["fwd_label"],
@@ -568,6 +777,8 @@ if MODE == "financials":
         rote_ttm=round(cfg["adj_ni"] / tbv, 4),
         notes=cfg["notes"], rationale=cfg["rationale"], adj_note=cfg["adj_note"],
         rev0_note=rev0_note, scenarios={}, manifest=manifest,
+        # 情景无关警告的全局通道（0015，与 standard 同构）
+        warnings_global=[],
     )
 
     for name, s in cfg["scenarios"].items():
@@ -578,26 +789,79 @@ if MODE == "financials":
         ptbv_ps = tbv_ps * s["ptbv"]
         rote1 = ni1 / tbv
         justified = (rote1 - s["tg"]) / (s["wacc"] - s["tg"])
-        _wsum = BLEND_W["pe"] + BLEND_W["ptbv"]
-        blend = ((pe_ps * BLEND_W["pe"] + ptbv_ps * BLEND_W["ptbv"]) / _wsum
-                 if _wsum > 0 else (pe_ps + ptbv_ps) / 2)
+        # 近零/亏损守卫（fin v3，镜像 standard 的 pe_nm）：亏损（校验层已强制
+        # pe=0）或微利（nm<1%）时「盈利×倍数」是除法事故不是估值——刚扭亏票
+        # 的 bear 假微利 × 15-30x 会把一个 ≈0 的数字当估值腿拖低综合（standard
+        # 的 COIN 实测同型）。PE 腿标 n.m. 退出综合，综合退化为 P/TBV 单腿；
+        # pe_target 仍照算并展示——退出综合 ≠ 隐藏。
+        pe_nm = eps1 <= 0 or s["nm"] < 0.01
+        blend_methods = (["pe"] if not pe_nm else []) + ["ptbv"]
+        _vals = {"pe": pe_ps, "ptbv": ptbv_ps}
+        _wsum = sum(BLEND_W[m] for m in blend_methods)
+        blend = (sum(_vals[m] * BLEND_W[m] for m in blend_methods) / _wsum
+                 if _wsum > 0
+                 else sum(_vals[m] for m in blend_methods) / len(blend_methods))
+        # 方法离散度只对参与综合的腿有意义：PE 腿 n.m. 后只剩单腿，谈不上分歧
+        methods = [_vals[m] for m in blend_methods]
+        spread = (round(max(methods) / min(methods), 2)
+                  if len(methods) > 1 and min(methods) > 0 else None)
         # P/TBV 带检查（standard 的 pe_band_check 同一套逻辑，label 换 P/TBV）：
         # financials 此前无 warnings/diagnostics 通道——TODO 里挂了两轮的项，
         # 带子进来时必须一起开通，否则检查结果没地方去
         ddiag = {}
         warnings = pe_band_check(name, s["ptbv"], facts.get("ptbv_band"), ddiag,
-                                 label="P/TBV", diag_key="ptbv_vs_history")
+                                 label="P/TBV", diag_key="ptbv_vs_history",
+                                 hard_cap=8)   # fin 校验层的 ptbv 硬上界是 8，不是 60
+        # 目标 PE 的历史带比对：pe_band 对 financials facts 同样生成（fetch_facts
+        # 的 PE 带无 mode 门禁），此前却只查了 P/TBV 腿——PE 腿的倍数假设无任何
+        # 历史对照。PE 腿 n.m. 时跳过：对已声明不适用的倍数比对只会产出必然的
+        # 「从未出现过」黄旗（standard 同规则）
+        if not pe_nm:
+            warnings += pe_band_check(name, s["pe"], facts.get("pe_band"), ddiag)
+        if pe_nm:
+            warnings.append(["yellow",
+                             f"{name} PE 腿 n.m.（eps1 {eps1:.2f} / nm {s['nm']:.1%}——亏损或"
+                             "微利下『盈利×倍数』无定价意义），综合退化为 P/TBV 单腿"])
+        if spread and spread > 2:
+            warnings.append(["yellow", f"方法离散度 {spread}x（>2x）——各法分歧大，"
+                                       "综合可信度降低"])
         out["scenarios"][name] = dict(
             assumptions=s, rev1=round(rev1), ni1=round(ni1), eps1=round(eps1, 2),
             pe_target=round(pe_ps, 1), ptbv_ps=round(ptbv_ps, 1),
             rote1=round(rote1, 4), justified_ptbv=round(justified, 2),
             justified_ps=round(tbv_ps * justified, 1),
             blend=round(blend, 1), upside=round(blend / cfg["price"] - 1, 4),
-            fwd_pe=round(cfg["price"] / eps1, 1),
-            method_spread=round(max(pe_ps, ptbv_ps) / min(pe_ps, ptbv_ps), 2)
-            if min(pe_ps, ptbv_ps) > 0 else None,
+            # eps1<=0 时 fwd_pe 是负数假读数（nm=0 更会直接除零），与 standard 同法置 None
+            fwd_pe=round(cfg["price"] / eps1, 1) if eps1 > 0 else None,
+            # blend 由哪几条腿构成——build_report 的综合公式必须与引擎同构，
+            # 否则 verify_report 的交叉核对会在 PE 腿 n.m. 时假 FAIL
+            blend_methods=blend_methods,
+            method_spread=spread,
             diagnostics=ddiag, warnings=warnings,
         )
+
+    # ---- 基线护栏（2026-09-06，镜像 standard）：fin 分支此前在**每一条** base 级
+    # 护栏之前就 return——而银行/券商/fintech 恰是 10-Q 滞后的重灾区（业绩先走
+    # 8-K、10-Q 晚 2-6 周，本文件 PENDING_10Q 注释自己就这么说），却唯独它没有
+    # 时效检查；base 锚检查同样缺席（SOFI 实测零警告发货）。----
+    # base 锚检查：综合与市价偏离 >35% 本身不是错（估值可以偏离市价），
+    # 但必须显式看到并辩护，而不是三档整队随 base 静默平移
+    _dev = out["scenarios"]["base"]["blend"] / cfg["price"] - 1
+    if abs(_dev) > 0.35:
+        out["scenarios"]["base"]["warnings"].append(
+            ["yellow", f"base 综合较现价偏离 {_dev:+.0%}（>±35%）——请核对 base 假设"
+                       "或在注记中显式说明为何与市场定价分歧"])
+    # 时效护栏：fin cfg 没有 net_cash 假设——vintage_warnings 内部把资产负债表
+    # 锚退到 TBV 口径（见该函数注释），时点混用逻辑与 standard 同构。
+    # 数据事实与情景无关，进全局通道（0015）
+    out["warnings_global"] += vintage_warnings(
+        cfg, VINTAGE, facts.get("dividends_quarterly"))
+    # 股数口径失配（0018，与 standard 同一条黄旗）：ADR 标定回退 1.0 的留痕
+    if cfg.get("share_count_mismatch"):
+        out["warnings_global"].append(
+            ["yellow", f"市值隐含股数与 XBRL 稀释股数差 {cfg['share_count_mismatch']:.1%}"
+                       "——两侧口径不一致（yfinance 市值 vs XBRL 加权稀释股数），"
+                       "net_cash/每股值按 XBRL 股数口径"])
 
     # 敏感性：base 口径 justified P/TBV 每股价值 = f(WACC, 永续g)
     s = cfg["scenarios"]["base"]
@@ -626,8 +890,13 @@ if MODE == "financials":
     print(f"TTM: rev {ttm_m['revenue']:,} pretax {ttm_m['pretax_income']:,} "
           f"adjNI {cfg['adj_ni']:,} adjEPS {out['adj_eps']} | TBV {tbv:,} "
           f"(${out['meta']['tbv_ps']}/股, ROTE {out['rote_ttm']:.1%})")
+    for lv, msg in out["warnings_global"]:
+        print(f"全局  {'⛔' if lv == 'red' else '⚠️'} {msg}")
     for n, v in out["scenarios"].items():
-        print(f"{n:5s}| EPS1 {v['eps1']:7.2f} | PE法 {v['pe_target']:8.1f} | "
+        # 被守卫剔出综合的 PE 腿打 x（与 standard stdout 同一约定）：数字照显示，
+        # 只标出它没参与综合
+        print(f"{n:5s}| EPS1 {v['eps1']:7.2f} | PE法 {v['pe_target']:8.1f}"
+              f"{' ' if 'pe' in v['blend_methods'] else 'x'}| "
               f"P/TBV法 {v['ptbv_ps']:8.1f} (justified {v['justified_ptbv']:.2f}x) | "
               f"综合 {v['blend']:8.1f} | {v['upside']:+.1%}")
         for lv, msg in v["warnings"]:
@@ -656,8 +925,10 @@ out = dict(
     # 诊断），重放 v1 老 config 时若透传声明值会得到"标 v1 却是两法综合"的自相矛盾
     # 输出，compare.py 的 1==1 还会静默掉它本该拦的口径跳变告警。
     # v3（2026-08-14）：判断层 PE 锚（历史 NTM 带子窗 P50）纳入语义——锚改变 base
-    # PE 的产生方式与目标价水平，锚前(≤v2)/锚后(v3) 样本不可直接对比或混聚
-    semantics_version=3,
+    # PE 的产生方式与目标价水平，锚前(≤v2)/锚后(v3) 样本不可直接对比或混聚。
+    # v4（2026-09-06）：服务器前置注入十年 FCF 锚表、OI&E 组件+税前−营业利润残差行、
+    # 期后 filing 索引——终值 margins 与 other_income 的锚来源改变，隔离理由同 v3
+    semantics_version=4,
     config_semantics_version=cfg.get("semantics_version", 1),
     # 只记录可能参与综合的腿：SOTP 降级为参考项时 W_SOTP 惰性——记进去会让
     # compare/trend 把两次数值完全相同的运行当成口径不同
@@ -672,7 +943,14 @@ out = dict(
     ttm=ttm_m, adj_ni=cfg["adj_ni"], adj_eps=round(cfg["adj_ni"] / cfg["shares"], 2),
     notes=cfg["notes"], rationale=cfg["rationale"],
     net_cash_note=cfg["net_cash_note"], adj_note=cfg["adj_note"],
-    other_income=cfg["other_income"], rev0_note=rev0_note, scenarios={}, manifest=manifest,
+    # other_income_note（0015）：校验层硬要求的推导口径此前在这里被丢弃，报告只能
+    # 拍一句通用话。.get 兜底空串：8/31 之前的老 config 重放没有该字段，不该崩
+    other_income=cfg["other_income"], other_income_note=cfg.get("other_income_note", ""),
+    rev0_note=rev0_note, scenarios={}, manifest=manifest,
+    # 情景无关的警告（时效/期后事件/带滞后——数据事实而非情景假设）此前全部挂在
+    # base 下，bear/bull 的 warnings 读起来"干净"（0015）。挂全局通道，报告的红旗区
+    # 单列「全局」块；vintages/服务层的 red 统计两个通道都要看
+    warnings_global=[],
 )
 
 for name, s in cfg["scenarios"].items():
@@ -710,35 +988,9 @@ for name, s in cfg["scenarios"].items():
 
     # ---- v2 经济合理性诊断（red=假设可修复，服务层可据此打回判断层一次；
     #      yellow=呈现层警示。全部随报告红旗区展示，不静默）----
-    warnings = []
-    if ddiag["yrN_rev_multiple"] and ddiag["yrN_rev_multiple"] > 8:
-        warnings.append(["red", f"DCF 第10年营收为 TTM 的 {ddiag['yrN_rev_multiple']:.1f} 倍"
-                                "（>8x，隐含 10 年 CAGR >23%）——增长路径过于激进"])
-    if ddiag["tv_pv_share"] and ddiag["tv_pv_share"] > 0.75:
-        warnings.append(["red", f"终值折现占 EV {ddiag['tv_pv_share']:.0%}（>75%）——"
-                                "估值几乎全押在永续段，对 wacc-tg 极端敏感"])
-    if fcf_base > 0.02 * rev0:
-        p_fcf = dcf_eq / fcf_base
-        ddiag["dcf_equity_over_ttm_fcf"] = round(p_fcf, 1)
-        if not 5 <= p_fcf <= 90:
-            warnings.append(["red", f"DCF 隐含股权价值为 TTM FCF 的 {p_fcf:.1f} 倍"
-                                    "（界外 [5,90]）——路径假设与当前现金流量级脱节"])
-    else:
-        # capex 周期股（AMZN TTM FCF −1.5%）走到这里：P/FCF 无意义，此前**整条
-        # 护栏静默跳过**——而 FCF 为负恰是 DCF 最不可靠的时候。不静默，改用 OCF
-        # 当备用锚（AMZN TTM OCF/营收 20.8%，正且稳）并说明本护栏未生效。
-        # 不给 OCF 设硬区间：跨行业的 P/OCF 合理带无法一刀切，给数不判罚。
-        _ocf = ttm_m.get("cfo")
-        _p_ocf = (dcf_eq / _ocf) if _isnum(_ocf) and _ocf > 0 else None
-        if _p_ocf is not None:
-            ddiag["dcf_equity_over_ttm_ocf"] = round(_p_ocf, 1)
-        # 三档各出一条完整解释太吵（AMZN 实测刷了三遍同样的话）——压成一句：
-        # 事实 + 本档的备用锚数字。为什么要紧由 base 的终值敏感性那条承担。
-        warnings.append(["yellow",
-                         f"TTM FCF {fcf_base:,.0f}M 非正（营收占比 {fcf_base / rev0:.1%}），"
-                         "『DCF权益/TTM FCF』护栏未生效"
-                         + (f"；改用 OCF 锚 = {_p_ocf:.1f}x" if _p_ocf is not None
-                            else "；TTM OCF 亦非正，无备用锚")])
+    # DCF 三道巡航护栏抽成 dcf_diag_warnings（0009）：TV 占比对 pre-FCF 发行人
+    # 降级 yellow、pv_explicit<=0 的 None 逃逸补检、OCF 兜底措辞如实反映闸门
+    warnings = dcf_diag_warnings(ddiag, dcf_eq, fcf_base, rev0, ttm_m.get("cfo"))
     if cfg["adj_ni"] > 0:
         p_ni = blend * cfg["shares"] / cfg["adj_ni"]
         ddiag["blend_p_adjni"] = round(p_ni, 1)
@@ -753,19 +1005,9 @@ for name, s in cfg["scenarios"].items():
                                 "净现金深负）——综合失去有效支撑腿，请修正 margins 路径"
                                 "或声明永久受损"])
     if pe_nm:
-        _ps_ref = ""
-        _psb = facts.get("ps_band") or {}
-        _psp = (_psb.get("recent") or {}).get("pctiles") or _psb.get("pctiles") or {}
-        if "50" in _psp and cfg["fwd_shares"]:
-            _rps1 = rev1 / cfg["fwd_shares"]
-            ddiag["ps_ref"] = {
-                "basis": _psb.get("basis"),
-                "window": ("recent" if (_psb.get("recent") or {}).get("pctiles") else "full"),
-                "ps_p50": round(float(_psp["50"]), 2), "rps1": round(_rps1, 2),
-                "px": {q: round(float(_psp[q]) * _rps1, 1)
-                       for q in ("25", "50", "75") if q in _psp}}
-            _ps_ref = (f"；P/S 参考（不入综合）：历史 P/S P50 {float(_psp['50']):.2f}x × "
-                       f"{name} 每股营收 {_rps1:.2f} ≈ {float(_psp['50']) * _rps1:.1f}")
+        # P/S 参考价（ps_reference，0009）：thin_coverage 薄带只注明覆盖不足不给数
+        _ps_ref = ps_reference(facts.get("ps_band"), rev1, cfg["fwd_shares"],
+                               name, ddiag)
         warnings.append(["yellow",
                          f"{name} PE 腿 n.m.（eps1 {eps1:.2f} / opm {s['opm']:.1%}——近零或"
                          "负利润下『盈利×倍数』无定价意义），综合退化为 "
@@ -802,8 +1044,19 @@ if abs(_dev) > 0.35:
         ["yellow", f"base 综合较现价偏离 {_dev:+.0%}（>±35%）——请核对 base 假设"
                    "或在注记中显式说明为何与市场定价分歧"])
 
-out["scenarios"]["base"]["warnings"] += vintage_warnings(
+# 时效/期后事件/时点一致性是数据事实，与哪个情景无关——进全局通道（0015）
+out["warnings_global"] += vintage_warnings(
     cfg, VINTAGE, facts.get("dividends_quarterly"))
+# 股数口径失配（0018）：服务层 ADR 标定判定「非整数/半数比例=口径噪声」回退 1.0
+# 时留下的失配比例——市值与每股值两侧的分母不一致必须可见，数据事实进全局通道
+if cfg.get("share_count_mismatch"):
+    out["warnings_global"].append(
+        ["yellow", f"市值隐含股数与 XBRL 稀释股数差 {cfg['share_count_mismatch']:.1%}"
+                   "——两侧口径不一致（yfinance 市值 vs XBRL 加权稀释股数），"
+                   "net_cash/每股值按 XBRL 股数口径"])
+out["warnings_global"] += seg_share_crosscheck(
+    cfg.get("seg1_share"), cfg.get("segment_revenue_share"),
+    cfg.get("segment_count"), sotp_in_blend)
 out["scenarios"]["base"]["warnings"] += other_income_crosscheck(
     facts, cfg["other_income"], out["scenarios"]["base"]["eps1"], cfg["fwd_shares"])
 
@@ -814,9 +1067,12 @@ out["scenarios"]["base"]["warnings"] += other_income_crosscheck(
 _hist_fcf = hist_fcf_margins(facts)
 out["scenarios"]["base"]["warnings"] += terminal_margin_warnings(_hist_fcf, cfg["scenarios"])
 _bcfg, _bout = cfg["scenarios"]["base"], out["scenarios"]["base"]
+# 股本基必须与被包夹的 base dcf_ps 一致（cfg["shares"]，同其余全部 dcf() 调用）：
+# 此前误传 fwd_shares，lo/base/hi 三元组混两个股本基——+4.9% 增发实测把
+# "36/43/50（±16%）"印成"34/43/48（±20%）"，敏感性被增发/回购幅度污染
 out["scenarios"]["base"]["warnings"] += terminal_sensitivity(
     lambda m: dcf(rev0, _bcfg["g0"], _bcfg["gN"], m, _bcfg["wacc"], _bcfg["tg"],
-                  cfg["net_cash"], cfg["fwd_shares"])[0],
+                  cfg["net_cash"], cfg["shares"])[0],
     (_bout.get("diagnostics") or {}).get("tv_pv_share"),
     _bcfg["margins"], _bout.get("dcf_ps"))
 
@@ -911,7 +1167,8 @@ if (not _base_pe_nm and not _band.get("thin_coverage")
     # 此时目标价的涨幅几乎全部押在"倍数回到中枢"，而带子恰好看不见最近一年
     # 究竟发生了什么（滞后 span.lag_days 天）。
     _trw = out["trading_range"]
-    out["scenarios"]["base"]["warnings"] += band_lag_warnings(_band, _trw.get("span"), _now_pe)
+    # 带滞后是带子自身的数据事实，与情景无关——全局通道（0015）
+    out["warnings_global"] += band_lag_warnings(_band, _trw.get("span"), _now_pe)
     if _now_pe and (_now_pe < _tr_pe["10"] or _now_pe > _tr_pe["90"]):
         _side = "跌出下沿 P10" if _now_pe < _tr_pe["10"] else "冲破上沿 P90"
         _sp = _trw.get("span") or {}
@@ -921,6 +1178,16 @@ if (not _base_pe_nm and not _band.get("thin_coverage")
             f"{_trw['mult_reversion_to_target']:+.0%} 的纯倍数变动；"
             f"而带子止于 {_sp.get('end', '?')}（滞后 {_sp.get('lag_days', '?')} 天），"
             "最近一年的倍数不在分布内，请用下方 trailing 对照自行判断 regime 是否已变"])
+        # regime 失效红线（0010）：带外 + 带子滞后 >250 天两个条件叠加时（ISRG 实测：
+        # fwd_pe_now 36.5 低于 P10、滞后 320 天、mult_reversion 0.687，区间 546~675
+        # vs 现价 367 却无任何健康警示），「按历史分位均值回归」这个区间的前提本身
+        # 可能已失效——市场可能已给了新 regime 的定价而带子看不见。**只加注不改数**：
+        # 数字照出，regime_note 随 trading_range 进报告红线行与 RESULT 载荷
+        if (_sp.get("lag_days") or 0) > 250:
+            out["trading_range"]["regime_note"] = (
+                f"现价隐含倍数 {_now_pe:.1f}x 已{_side}（带外）且带子滞后 "
+                f"{_sp['lag_days']} 天——区间的均值回归前提可能已失效，"
+                "改看 target_pe 对照与 trailing 分布")
 
 # Rule of 40 透传（fetch_facts 计算，standard 模式）：营收增速+利润率的标尺，
 # 与 pe_band 同属"倍数值不值得给"的判断参照，进报告与 prompt 元数据
@@ -1006,12 +1273,17 @@ if out.get("trading_range"):
         # pctiles 的键经 facts.json 往返后是字符串（pe_band 里建的是 int）——两种都收，
         # 这正是 test_engine_band 记下的那个潜在坑，别在这里踩第二次
         _tnp = {str(k): v for k, v in (_tn.get("pctiles") or {}).items()}
-        _tn50 = _tnp.get("50")
+        # NaN 兜底（源头已在 pe_band 剔除 NaN 收盘；这里防旧 facts.json 回放）：
+        # NaN 是 truthy，直接 format 会把「最新 nanx」打进 stdout（KO/AAPL 实测形态）
+        def _fin(x):
+            return x if _isnum(x) and x == x else None
+        _tn50 = _fin(_tnp.get("50"))
+        _tncur = _fin(_tn.get("current"))
         _eq = _tn50 / (1 + _g) if (_g is not None and _tn50) else None
         print(f"  ⚠ 无滞后对照（trailing 口径，价÷过去12个月，**不可与上面直接相减**）: "
               f"{_tn['span']['start']}~{_tn['span']['end']}"
               + (f" P50 {_tn50:.1f}x，" if _tn50 else " ")
-              + f"最新 {_tn['current']:.1f}x"
+              + (f"最新 {_tncur:.1f}x" if _tncur is not None else "最新值缺失")
               + (f"；按 NTM EPS 增速 {_g:+.0%}（建模 NTM EPS ÷ GAAP TTM EPS）折成 "
                  f"NTM 可比口径约 {_eq:.1f}x" if _eq else "；无 GAAP TTM EPS，不做换算"))
         _gap = _tn.get("gap_since_main_band")
@@ -1021,6 +1293,8 @@ if out.get("trading_range"):
                   + (f" ≈ NTM 可比 {_gap['p50'] / (1 + _g):.1f}x" if _g is not None else ""))
 if not sotp_in_blend:
     print(f"SOTP 降级为参考项（主分部利润占比 {cfg['seg1_share']:.0%} >= 85%），综合 = PE/DCF 均值")
+for lv, msg in out["warnings_global"]:
+    print(f"全局  {'⛔' if lv == 'red' else '⚠️'} {msg}")
 for n, v in out["scenarios"].items():
     # 被守卫剔出综合的腿打 x（* 仍表示 seg1_share 降级），避免 stdout 看起来像
     # "三法都进了综合"——数字照显示，只是标出它没参与

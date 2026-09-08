@@ -213,10 +213,16 @@ def resolve_cik(ticker: str, headers: dict) -> int:
                   headers=headers, timeout=60)
     if r.status_code != 200:
         raise FactsError(f"SEC 代码表接口返回 {r.status_code}", transient=True)
-    for v in r.json().values():
+    mapping = r.json()
+    for v in mapping.values():
         if v["ticker"].upper() == ticker:
             return int(v["cik_str"])
-    raise FactsError(f"SEC EDGAR 中未找到 {ticker}")
+    # 与「接口失败」严格分开（0020，DRAM 实测被读成取数问题）：映射本身取到了，
+    # 只是没有这个代码——退市/改名/不申报 companyfacts 的 ETF 三类都长这样
+    raise FactsError(
+        f"SEC ticker 映射已取得（{len(mapping):,} 个代码）但无 {ticker}——"
+        "可能已退市/改名，或是不进 ticker 映射的 ETF/基金/信托；"
+        "若已知 CIK，可用 build_facts(ticker, email, cik=...) 绕过映射重试")
 
 
 def pick(facts: dict, tag_names, kind, prefer_max=False, units=USD_UNITS, fx=1.0):
@@ -417,6 +423,39 @@ def _companyfacts(ticker: str, cik: int, headers: dict) -> dict:
     return resp
 
 
+# 信托/基金类实体名 token：GLD（SPDR GOLD TRUST）实测——商品信托无损益表 XBRL，
+# 旧报错只有一句「重组旧 CIK」假设，把真实原因整个盖掉。名字就在 companyfacts
+# payload 里，不为 SIC 多打一次 submissions 接口
+_FUND_NAME_TOKENS = ("TRUST", "FUND", "ETF")
+
+
+def _no_revenue_reason(resp: dict, ticker: str, cik: int) -> str:
+    """companyfacts 里找不到任何营收概念时的分类报错（0020）。纯函数可单测。
+
+    三种形态分开说，原因按可能性排序——单一的「重组旧 CIK」假设在实测里
+    4/6 个失败被带偏：①实体名含 TRUST/FUND/ETF 直接定性；②taxonomy 整体
+    缺席；③taxonomy 在但营收概念探测全空（探测过的 tag 列出来，可核对）。"""
+    name = str(resp.get("entityName") or "?")
+    head = f"{ticker}（CIK {cik}，{name}）"
+    words = set(name.upper().replace(",", " ").replace(".", " ").split())
+    if words & set(_FUND_NAME_TOKENS):
+        return (head + " 实体名含 TRUST/FUND/ETF——商品信托/基金类发行人无经营营收"
+                "（申报不含损益表 XBRL），不适配本估值框架；其价格跟踪标的资产，"
+                "请按资产本身分析")
+    present = [t for t in ("us-gaap", "ifrs-full") if t in (resp.get("facts") or {})]
+    if not present:
+        return (head + " 无 us-gaap/ifrs-full taxonomy。按可能性排序：①基金/信托类"
+                "载体不申报财务报表 XBRL；②ticker 映射指向重组后的新实体，历史财务"
+                "留在旧 CIK 下——可在 https://www.sec.gov/cgi-bin/browse-edgar "
+                "按公司名搜旧实体确认")
+    probed = (SPEC["revenue"]["tags"] + SPEC["revenue"]["override"]
+              + SPEC_IFRS["revenue"]["tags"])
+    return (head + f" 有 {'/'.join(present)} taxonomy 但无营收概念"
+            f"（探测了这些 tag：{', '.join(probed)}）。按可能性排序：①信托/基金/"
+            "持牌载体无经营营收；②重组后的新实体，历史财务留在旧 CIK 下"
+            "（EDGAR 按公司名搜旧实体确认）")
+
+
 def _pick_taxonomy(resp: dict, ticker: str, cik: int) -> tuple[dict, str]:
     """税则按「谁的营收数据更新」选择：SONY/TM 等公司中途从 US GAAP 切到
     IFRS，companyfacts 里两个税则并存，无脑取 us-gaap 会拿到停更多年的旧数据。"""
@@ -435,10 +474,15 @@ def _pick_taxonomy(resp: dict, ticker: str, cik: int) -> tuple[dict, str]:
         return all_facts["us-gaap"], "us-gaap"
     if ifrs:
         return all_facts["ifrs-full"], "ifrs-full"
-    raise FactsError(
-        f"{ticker}（CIK {cik}，{resp.get('entityName', '?')}）没有 us-gaap/ifrs-full 数据。"
-        f"常见原因：ticker 映射指向重组后的新实体（如控股公司架构调整），历史财务留在旧 CIK 下"
-        f"——可在 https://www.sec.gov/cgi-bin/browse-edgar 按公司名搜旧实体确认")
+    raise FactsError(_no_revenue_reason(resp, ticker, cik))
+
+
+# 券商类经营收入标签——broker 签名的形态证据（0021）。companyfacts 里没有 SIC，
+# 不为分类多打一次 submissions 接口：这些标签在经营性公司几乎不出现，且签名还
+# 叠加「营业利润缺席/停报」硬条件，误路由面被压到极窄
+_BROKER_TAGS = ("InterestAndDividendIncomeOperating",
+                "BrokerageCommissionsRevenue",
+                "InterestIncomeExpenseNet")
 
 
 def _detect_mode(facts: dict, taxonomy: str) -> tuple[str, dict]:
@@ -452,6 +496,44 @@ def _detect_mode(facts: dict, taxonomy: str) -> tuple[str, dict]:
     op_end = _newest_end(facts, "OperatingIncomeLoss")
     if rn_end and (not op_end or
                    (date.fromisoformat(rn_end) - date.fromisoformat(op_end)).days > 400):
+        return "financials", SPEC
+    # 券商签名（0021，HOOD 实测漏检）：利润表是「总收入 − 总运营费用 → 税前」，
+    # 既无 OperatingIncomeLoss 也无银行的 RevenuesNetOfInterestExpense——两个既有
+    # 签名都不认，误落 standard 后因缺营业利润被判「不适配」。Revenues（券商的
+    # Total net revenues，语义即净收入）与税前利润同步新鲜 + 券商标签在场即路由
+    # financials：fin 模式的营收主列表本就含 Revenues，P/E+P/TBV 对券商成立；
+    # 券商 CFO 含客户资金摆动，standard 的 DCF 腿本来就不该碰（fin 不出 CFO TTM）。
+    # OperatingIncomeLoss 新鲜的经营性公司不受影响；停报营业利润的经营性公司
+    # （COHR 型）无券商标签，走 standard 的推导回退（_derive_op_income_ttm）
+    rev_end = max((_newest_end(facts, t) for t in
+                   ("Revenues", "RevenueFromContractWithCustomerExcludingAssessedTax")),
+                  default="")
+    pre_end = max((_newest_end(facts, t) for t in SPEC["pretax_income"]["tags"]),
+                  default="")
+
+    def _fresh(end_s: str) -> bool:
+        """与本分支其余条件同一时效窗：距营收锚 <=400 天算新鲜。"""
+        return bool(end_s and rev_end) and (date.fromisoformat(rev_end)
+                                            - date.fromisoformat(end_s)).days <= 400
+
+    # 券商标签也过时效闸（0022 C17）：此前 presence-anywhere（历史上出现过即算），
+    # 与旁边逐条 date-gated 的 rev/pretax/op 条件不对称——带着一枚陈年 broker tag
+    # 的经营性公司（UHT 实测今天就持 InterestIncomeExpenseNet）一旦改列报停掉
+    # OperatingIncomeLoss，会被静默按银行估值（P/TBV 框架、fin prompt、CFO/capex
+    # 全压掉，零警告）。
+    broker_end = max((_newest_end(facts, t) for t in _BROKER_TAGS), default="")
+    # 经营性公司的推导救援优先（0022 C17）：_detect_mode 跑在 _derive_op_income_ttm
+    # 之前，路由 financials 会**结构性**关掉 standard 分支里的 op = rev−cogs−rnd−sga
+    # 救援。rev/cogs/rnd/sga 组件全新鲜说明利润表仍是经营性列报（券商不报 cogs），
+    # COHR 型停报票必须留在 standard 吃救援，即便它恰好带着新鲜的 broker tag。
+    _deriv_fresh = all(
+        _fresh(max((_newest_end(facts, t) for t in SPEC[n]["tags"]), default=""))
+        for n in ("cogs", "rnd", "sga"))
+    if (_fresh(broker_end) and rev_end and pre_end and not _deriv_fresh
+            and (not op_end or (date.fromisoformat(rev_end)
+                                - date.fromisoformat(op_end)).days > 400)
+            and (date.fromisoformat(rev_end)
+                 - date.fromisoformat(pre_end)).days <= 400):
         return "financials", SPEC
     return "standard", SPEC
 
@@ -479,6 +561,79 @@ def income_items(mode: str) -> tuple:
     """核心损益科目：缺任何一项都说明该发行人不适配当前估值框架。"""
     return ("revenue", "pretax_income", "net_income") if mode == "financials" \
         else ("revenue", "op_income", "net_income")
+
+
+def _derive_op_income_ttm(out: dict, ttm: dict) -> None:
+    """营业利润 TTM 的自下而上推导回退（0021，COHR 救援）。原地改写 ttm。
+
+    发行人停报 OperatingIncomeLoss（改列报）时，TTM 锚定检查把 op_income 置
+    None、整票被判不适配——但 rev/cogs/rnd/sga 若在**同一 TTM 窗口**（营收锚的
+    4 个季度）全部在场，营业利润可推导：op = rev − cogs − rnd − sga
+    （COHR 验证：7,118.2 − 4,449.1 − 723.0 − 1,044.6 ≈ 901.5M）。推导值打
+    derived 标记 + note——服务层据此在 prompt 注入口径提示（可能含未单列的
+    摊销/重组项，判断层须与利润表原文核对）。任一组件缺任一窗口季度即放弃、
+    维持既有 hard fail：宁可拒绝，不造一个看起来合理的错数。"""
+    op = ttm.get("op_income") or {}
+    rev = ttm.get("revenue") or {}
+    if op.get("value") is not None or "quarters" not in rev:
+        return
+    window = rev["quarters"]
+    comps = {}
+    for name in ("cogs", "rnd", "sga"):
+        q = out.get(name + "_quarterly") or {}
+        if any(k not in q for k in window):
+            return
+        comps[name] = sum(q[k] for k in window)
+    ttm["op_income"] = {
+        "value": rev["value"] - comps["cogs"] - comps["rnd"] - comps["sga"],
+        "quarters": list(window), "derived": True,
+        "note": "推导值 = rev − cogs − rnd − sga（OperatingIncomeLoss 停报/滞后），"
+                "可能含未单列的摊销/重组项"}
+
+
+def classify_core_gaps(out: dict) -> list[str]:
+    """核心科目 TTM 缺数的适配性分类（0020）-> problems 行。纯函数可单测。
+
+    此前一句「该发行人未申报对应科目」盖住所有形态，实测 4/6 个失败诊断被带偏：
+    COHR 是 op_income 停在 2024-06-30 之后**停报**（营收照常申报 143 期，发行人
+    改了列报口径）；新上市票是**历史不足**（XBRL 只有 2 季，等 10-Q 即可）——
+    都不是「未申报」。逐核心概念给出最后申报期，报错本身就是诊断。"""
+    ttm = out["ttm"]
+    missing = [k for k in income_items(out["mode"])
+               if (ttm.get(k) or {}).get("value") is None]
+    if not missing:
+        return []
+    # 新上市发行人：年度 0 期且季度 <4——不是没申报，是历史还不够构成 TTM
+    ann = out.get("revenue_annual") or {}
+    q = out.get("revenue_quarterly") or {}
+    if not ann and len(q) < 4:
+        ends = "、".join(sorted(q)) or "—"
+        return [f"新上市发行人：XBRL 仅 {len(q)} 季（期末：{ends}），"
+                "TTM 需 4 个连续季度——待后续 10-Q 申报后再试"]
+    per = []
+    # 「停报」的对照锚 = 全票最新数据期末（UV1）：概念最新期与锚同步却凑不齐 TTM 的，
+    # 是**新开始申报、期数不足**（或中间有缺口），不是停报——刚开始报某概念的发行人
+    # 被告知"发行人改了列报口径"会把诊断带向完全相反的方向
+    anchor = out.get("data_latest") or max(
+        max(out.get("revenue_annual") or {}, default=""),
+        max(out.get("revenue_quarterly") or {}, default=""))
+    for k in missing:
+        a = out.get(k + "_annual") or {}
+        qq = out.get(k + "_quarterly") or {}
+        n = len(a) + len(qq)
+        if not n:
+            per.append(f"  · {k}: 从未申报该概念"
+                       "（保险/部分能源与REIT/外国银行的科目体系暂不支持）")
+            continue
+        last = max(list(a) + list(qq))
+        if anchor and last >= anchor:
+            per.append(f"  · {k}: 历史有 {n} 期、最新一期 {last} 与全票数据锚同步"
+                       "（仍在申报，非停报）——期数不足或中间有缺口，凑不齐连续"
+                       " 4 季 TTM，待后续申报累积后再试")
+        else:
+            per.append(f"  · {k}: 历史有 {n} 期、最后一期 {last} 之后停报"
+                       "（发行人改了列报口径，非从未申报）")
+    return ["核心损益科目 TTM 无数据：" + ", ".join(missing) + "\n" + "\n".join(per)]
 
 
 def _rule_of_40(out: dict, ttm: dict) -> dict:
@@ -612,6 +767,9 @@ def build_facts(ticker: str, email: str, cik: int | None = None) -> dict:
                                    - date.fromisoformat(r["end"])).days) > 100:
                     r = {"value": None, "error": f"口径滞后：最新期 {r['end']}"}
                 ttm[name] = r
+        # 营业利润停报的自下而上推导回退（0021）——组件不齐则保持 None，
+        # 由 classify_core_gaps 按「停报」分类报错
+        _derive_op_income_ttm(out, ttm)
     out["ttm"] = ttm
     out["data_latest"] = max(max(out["revenue_annual"], default=""),
                              max(out["revenue_quarterly"], default=""))
@@ -711,13 +869,10 @@ def main() -> None:
           f"季度 {len(q)} 期, 最新 {out['data_latest'] or '-'}")
     print("TTM:", {k: v.get("value") for k, v in ttm.items()})
 
-    # ---- 适配性诊断：能修的已自动路由（financials/IFRS/非美元），剩下的给可诊断的报错
+    # ---- 适配性诊断：能修的已自动路由（financials/IFRS/非美元），剩下的给可诊断的报错。
+    # 分类（新上市/停报/从未申报）见 classify_core_gaps（0020）
     problems, warnings = [], []
-    missing = [k for k in income_items(out["mode"])
-               if (ttm.get(k) or {}).get("value") is None]
-    if missing:
-        problems.append(f"核心损益科目无数据：{', '.join(missing)}"
-                        "（该发行人未申报对应科目——保险/部分能源与REIT/外国银行的科目体系暂不支持）")
+    problems += classify_core_gaps(out)
     if out["mode"] == "financials" and not out.get("equity_instant"):
         problems.append("缺股东权益时点数据，P/TBV 法无法计算")
     if out["data_latest"]:

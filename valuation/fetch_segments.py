@@ -66,9 +66,12 @@ TARGET_AXES = {
 REQUEST_GAP = 0.12          # SEC 限速 10 req/s，全局（跨线程）生效
 MAX_FILINGS = 48            # 防误选超大范围
 MAX_INSTANCE_BYTES = 30_000_000
-PARSE_VER = 6               # 解析逻辑变更时递增，旧缓存自动失效
+PARSE_VER = 7               # 解析逻辑变更时递增，旧缓存自动失效
 # 集中度披露：带 1 的才是现行 us-gaap concept（无后缀版已弃用、返回零条）
 CONC_TAGS = {"ConcentrationRiskPercentage1", "ConcentrationRiskPercentage"}
+# 只为这批 concept 记 transform 丢弃数：计数要喂零期护栏与前端告警，
+# 混进申报里无关的数值事实会把"本来就没披露分部营收"的公司报成解析故障
+_COUNTED_CONCEPTS = set(REVENUE_LOCALNAMES) | CONC_TAGS
 CACHE_DIR = Path(__file__).resolve().parent.parent / "jobs" / "segments_cache"
 
 _rate_lock = threading.Lock()
@@ -181,23 +184,52 @@ _IX_NS = ("http://www.xbrl.org/2013/inlineXBRL",
           "http://www.xbrl.org/2008/inlineXBRL")
 _XSI_NIL = "{http://www.w3.org/2001/XMLSchema-instance}nil"
 
+# iXBRL transform 白名单：同一语义在五代注册表（TR1-TR5）里名字不同，
+# EDGAR 五个注册表全收——NVDA 2019-2020 的申报用 TR1-3 无连字符旧名，
+# 只认 TR4 连字符名会让整份申报解析出零期并被永久缓存成空结果（且无
+# skip 记录，全军覆没守卫也不触发）。
+# comma-decimal 族（欧陆逗号小数：numcommadecimal/num-comma-decimal 等）
+# 语义相反，逗号剥离会把 1.234,5 读成 12345——不实现正确解析就不进白名单，
+# 走 dropped 计数上浮，绝不静默吞。
+_IX_FMT_ZERO = {
+    "fixed-zero",   # TR4/TR5
+    "zerodash",     # TR2/TR3
+    "numdash",      # TR1
+}
+_IX_FMT_DOT_DECIMAL = {
+    "num-dot-decimal",  # TR4/TR5（逗号/空格/nbsp 千分位 + 点小数）
+    "numdotdecimal",    # TR2/TR3
+    "numcommadot",      # TR1：逗号千分位 + 点小数
+    "numspacedot",      # TR1：空格千分位 + 点小数
+}
 
-def _ix_number(el) -> float | None:
-    """ix:nonFraction -> 数值。文本按 num-dot-decimal 清洗（US 申报的
-    绝对主流），scale 缩放（NVDA 营收 '96,221'×10⁶、集中度 '22'×10⁻²），
-    sign 取负。罕见 format（欧陆千分位等）解析不了就返回 None 跳过该事实。"""
+
+def _ix_number(el, dropped: dict | None = None) -> float | None:
+    """ix:nonFraction -> 数值。format 按白名单族清洗（千分位剥离 + 点小数），
+    scale 缩放（NVDA 营收 '96,221'×10⁶、集中度 '22'×10⁻²），sign 取负。
+    未识别的 transform 返回 None 并按名计入 dropped——注册表还在演进，
+    静默丢弃会把「解析器过时」伪装成「公司没披露」。"""
     if el.get(_XSI_NIL) == "true":
         return None
     fmt = (el.get("format") or "").rsplit(":", 1)[-1]
     txt = "".join(el.itertext()).strip()
-    if fmt == "fixed-zero" or txt in ("", "—", "–", "-"):
+    if fmt in _IX_FMT_ZERO or txt in ("", "—", "–", "-"):
         val = 0.0
-    elif fmt in ("", "num-dot-decimal"):
+    elif fmt in _IX_FMT_DOT_DECIMAL:
+        try:
+            val = float(txt.replace(",", "").replace("\xa0", "").replace(" ", ""))
+        except ValueError:
+            return None
+    elif fmt == "":
+        # 无 format = 字面值：不剥空格（"1 2"→12 是静默错数），只容忍
+        # 千分位逗号/nbsp（与旧行为一致）
         try:
             val = float(txt.replace(",", "").replace("\xa0", ""))
         except ValueError:
             return None
     else:
+        if dropped is not None:
+            dropped[fmt] = dropped.get(fmt, 0) + 1
         return None
     try:
         val *= 10.0 ** int(el.get("scale") or 0)
@@ -206,22 +238,29 @@ def _ix_number(el) -> float | None:
     return -val if el.get("sign") == "-" else val
 
 
-def _fact_items(root):
+def _fact_items(root, dropped: dict | None = None, count_concepts=None):
     """统一两种载体的数值事实遍历，产出 (concept 局部名, contextRef, 值)。
 
     普通 instance：概念是顶层元素标签，值在 text；
     iXBRL（XHTML 内嵌，收缩目录申报的唯一形态）：事实是 ix:nonFraction，
     概念在 @name，值要按 format/scale/sign 还原。同一事实在 iXBRL 里
-    常重复出现（封面+附注），调用方按 contextRef 覆盖去重。"""
+    常重复出现（封面+附注），调用方按 contextRef 覆盖去重。
+    dropped：未识别 transform 的丢弃计数（见 _ix_number）。
+    count_concepts：只为这批 concept 计数（None=全部）。计数会喂零期护栏与
+    前端告警——把申报里每个无关数值事实都算进来，会让"公司本来就没披露分部
+    营收"变成一句"解析器故障"（PR #16 评审）。"""
     if _local(root.tag) == "html":
         for ns in _IX_NS:
             for el in root.iter(f"{{{ns}}}nonFraction"):
                 cref = el.get("contextRef")
                 if cref is None:
                     continue
-                val = _ix_number(el)
+                ln = _local(el.get("name", ""))
+                counted = (dropped if count_concepts is None
+                           or ln in count_concepts else None)
+                val = _ix_number(el, counted)
                 if val is not None:
-                    yield _local(el.get("name", "")), cref, val
+                    yield ln, cref, val
         return
     for el in root.iter():
         cref = el.get("contextRef")
@@ -235,9 +274,11 @@ def _fact_items(root):
 
 def _parse_instance(xml_bytes: bytes) -> dict:
     """单份 instance（普通 XBRL 或 iXBRL XHTML）-> {"periods":
-    {(start,end): {"total": v|None, "axes": {axis_key: {member: value}}}}}，
+    {(start,end): {"total": v|None, "axes": {axis_key: {member: value}}}},
+    "concentration": [...], "dropped_transforms": {fmt: 次数}}，
     只收季度/年度跨度的营收事实。"""
     root = ET.fromstring(xml_bytes)
+    dropped: dict = {}  # 未识别 iXBRL transform 的丢弃计数，随结果上浮
 
     contexts = {}
     for ctx in root.iter(f"{{{XBRLI}}}context"):
@@ -268,7 +309,7 @@ def _parse_instance(xml_bytes: bytes) -> dict:
     # (concept, contextRef) -> value：iXBRL 同一事实常重复出现（封面+附注），
     # 按键覆盖去重；两个集中度 concept 同 context 并存时互不挤占
     conc_facts: dict = {}
-    for ln, cref, val in _fact_items(root):
+    for ln, cref, val in _fact_items(root, dropped, _COUNTED_CONCEPTS):
         if cref not in contexts:
             continue
         if ln in facts:
@@ -373,7 +414,8 @@ def _parse_instance(xml_bytes: bytes) -> dict:
         concentration.append({"start": c["start"], "end": c["end"],
                               "days": c["days"], "value": val,
                               "dims": dict(c["dims"])})
-    return {"periods": periods, "concentration": concentration}
+    return {"periods": periods, "concentration": concentration,
+            "dropped_transforms": dropped}
 
 
 def _parse_filing_cached(client: httpx.Client, cik: int, acc: str) -> dict:
@@ -396,7 +438,8 @@ def _parse_filing_cached(client: httpx.Client, cik: int, acc: str) -> dict:
             # 畸形 instance：跳过该申报，不毒化请求
             parsed = {"periods": {}, "concentration": []}
     out = {"periods": {f"{s}|{e}": v for (s, e), v in parsed["periods"].items()},
-           "concentration": parsed.get("concentration", [])}
+           "concentration": parsed.get("concentration", []),
+           "dropped_transforms": parsed.get("dropped_transforms") or {}}
     fd, tmp = tempfile.mkstemp(dir=CACHE_DIR, suffix=".tmp")
     with os.fdopen(fd, "w", encoding="utf-8") as f:
         f.write(json.dumps(out, ensure_ascii=False))
@@ -479,6 +522,7 @@ def _collect_versions(client: httpx.Client, cik: int, picked: list[dict]):
     totals: dict = {}
     conc_cells: dict = {}  # _conc_group -> (filed, [entries])
     skipped: list = []     # [(acc, 原因)]，上浮到 API warning
+    dropped_fmt: dict = {}  # 未识别 iXBRL transform 聚合计数（fmt -> 次数）
     for row in picked:
         try:
             parsed = _parse_filing_cached(client, cik, row["acc"])
@@ -487,6 +531,8 @@ def _collect_versions(client: httpx.Client, cik: int, picked: list[dict]):
                 raise
             skipped.append((row["acc"], str(e)))
             continue
+        for fmt, n in (parsed.get("dropped_transforms") or {}).items():
+            dropped_fmt[fmt] = dropped_fmt.get(fmt, 0) + n
         for entry in parsed.get("concentration", []):
             k = _conc_group(entry)
             if k not in conc_cells or row["filed"] > conc_cells[k][0]:
@@ -501,7 +547,7 @@ def _collect_versions(client: httpx.Client, cik: int, picked: list[dict]):
             for axis_key, members in slot.get("axes", {}).items():
                 versions.setdefault((axis_key, s, e), []).append(
                     (row["filed"], members))
-    return versions, totals, conc_cells, skipped
+    return versions, totals, conc_cells, skipped, dropped_fmt
 
 
 def _detect_aliases(versions: dict) -> dict:
@@ -663,16 +709,26 @@ def build_segments(ticker: str, email: str, cik: int | None = None,
                         key=lambda r: r["report"], reverse=True)[:MAX_FILINGS]
 
         _sweep_stale_cache()
-        versions, totals, conc_cells, skipped = _collect_versions(
+        versions, totals, conc_cells, skipped, dropped_fmt = _collect_versions(
             client, cik, picked)
 
-    if skipped and not versions and not totals and not conc_cells:
+    if not versions and not totals and not conc_cells and (skipped or dropped_fmt):
         # 全军覆没时必须响亮携带真实原因：静默返回空结果会被服务端缓存
         # 6 小时，且 404 文案「没有可用的分部营收数据」把取数故障说成
-        # 公司未披露——这正是逐份跳过想避免的假阴性
-        raise SegmentsError(
-            f"{ticker} 的 {len(skipped)} 份申报全部取不到 XBRL instance"
-            f"（如 {skipped[0][1]}）")
+        # 公司未披露——这正是逐份跳过想避免的假阴性。
+        # 两种成因合并成一条（PR #16 评审）：混合批次里（一份缺 instance +
+        # 其余败给未识别 transform）原来先命中 skip 分支, 报"全部取不到
+        # instance"既不准确、又把唯一可行动的信息（transform 名）吞掉
+        causes = []
+        if skipped:
+            causes.append(f"{len(skipped)} 份申报取不到 XBRL instance"
+                          f"（如 {skipped[0][1]}）")
+        if dropped_fmt:
+            causes.append(
+                f"{sum(dropped_fmt.values())} 个数值事实因未识别的 iXBRL "
+                f"transform（{'/'.join(sorted(dropped_fmt))}）被丢弃"
+                f"——解析器 transform 白名单可能落后于注册表")
+        raise SegmentsError(f"{ticker} 解析出零期：" + "；".join(causes))
 
     aliases = _detect_aliases(versions)
     cells = _pick_cells(versions, aliases)
@@ -680,7 +736,7 @@ def build_segments(ticker: str, email: str, cik: int | None = None,
     _derive_q4(axes)
     return {"ticker": ticker, "cik": cik, "axes": axes,
             "concentration": _dedupe_concentration(conc_cells),
-            "skipped": skipped}
+            "skipped": skipped, "dropped_transforms": dropped_fmt}
 
 
 def main() -> None:
@@ -695,6 +751,10 @@ def main() -> None:
     # 与 API/前端 warning 同等的降级可见性：CLI 不能静默丢申报
     for acc, reason in out.get("skipped") or []:
         print(f"⚠ 跳过 {acc}: {reason}", file=sys.stderr)
+    dt = out.get("dropped_transforms") or {}
+    if dt:
+        print(f"⚠ {sum(dt.values())} 个数值事实因未识别的 iXBRL transform "
+              f"被丢弃: {dt}", file=sys.stderr)
     for axis_key, data in out["axes"].items():
         q, a = data["quarterly"], data["annual"]
         print(f"{axis_key}: 季度 {len(q)} 期 / 年度 {len(a)} 期")

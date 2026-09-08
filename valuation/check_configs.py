@@ -17,7 +17,8 @@ import os
 import sys
 
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
-from app.valuation_service import _validate_judgment  # noqa: E402
+from app.valuation_service import (_fcfm_for_validation, _hist_fcfm_median,  # noqa: E402
+                                   _validate_judgment)
 
 
 def _facts_for(ticker, facts_dir):
@@ -51,7 +52,7 @@ def main(argv):
         cfg = json.load(open(p, encoding="utf-8"))
         ticker = cfg.get("ticker") or os.path.basename(p).split("_")[0]
         mode = cfg.get("mode") or "standard"
-        rev0 = fcfm = band = None
+        rev0 = fcfm = band = hist_fcfm = None
         depth = "边界+排序"
         fp = _facts_for(ticker, facts_dir)
         if fp and mode == "standard":
@@ -59,6 +60,9 @@ def main(argv):
             # band 必须与产线同源传入：0050 起低倍数票 pe 下限带 band 自适应，
             # 不传会用静态 8 误拦产线能过的 config（回归工具比产线严=假警报）
             band = fj.get("pe_band")
+            # 历史年度中位锚与产线共用同一实现（0022 C4）：margins 谷底/上界在
+            # TTM 锚失效时都退到它，工具不传就会比产线严
+            hist_fcfm = _hist_fcfm_median(fj)
             ttm = fj["ttm"]
             try:
                 rev0 = ttm["revenue"]["value"] / 1e6
@@ -67,8 +71,17 @@ def main(argv):
                 depth = "完整"
             except (KeyError, TypeError, ZeroDivisionError):
                 rev0 = fcfm = None   # facts 不全就退回边界检查，不让工具自己崩
+            # 产线同源的口径闸（0019/0022 C4）：产线以 config 的 ttm_revenue_override
+            # 为 rev0 基准，并把 fcfm 过 >10% 偏差闸（偏离即弃 TTM 锚、退历史中位）。
+            # 工具此前直接用 facts TTM——PENDING_10Q/陈旧 XBRL 的留档 config 必带
+            # override，产线 PASS 的 config 被工具按过期锚 BLOCK
+            _ov = cfg.get("ttm_revenue_override")
+            fcfm = _fcfm_for_validation(fcfm, _ov, rev0)
+            if _ov and isinstance(_ov, (int, float)) and not isinstance(_ov, bool):
+                rev0 = float(_ov)
         try:
-            _validate_judgment(cfg, mode, rev0=rev0, fcf_margin=fcfm, band=band)
+            _validate_judgment(cfg, mode, rev0=rev0, fcf_margin=fcfm, band=band,
+                               hist_fcf_margin=hist_fcfm)
             print(f"{ticker:8s} {mode:11s} {depth:10s} PASS")
         except Exception as e:                      # noqa: BLE001 — 校验层抛什么都算拦截
             fails += 1

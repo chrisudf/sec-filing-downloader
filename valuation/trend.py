@@ -67,8 +67,11 @@ def main():
                 print(f"跳过 {p}：标的是 {val.get('ticker')} 不是 {T}")
                 continue
             # 回填时按 engine 输出的红旗判定 gate_clean，与服务端在线判定口径一致
-            reds = sum(1 for s in val.get("scenarios", {}).values()
-                       for lv, _ in s.get("warnings", []) if lv == "red")
+            reds = (sum(1 for s in val.get("scenarios", {}).values()
+                        for lv, _ in s.get("warnings", []) if lv == "red")
+                    # 全局通道（0015）与情景通道同权计入 gate_clean，口径与服务端一致
+                    + sum(1 for lv, _ in val.get("warnings_global") or []
+                          if lv == "red"))
             f = vintages.record(val, gate_clean=(reds == 0))
             print(f"归档 {Path(p).name} -> {f}" if f
                   else f"跳过 {Path(p).name}：无 meta.vintage.report_end（缺 manifest）")

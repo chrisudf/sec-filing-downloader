@@ -234,8 +234,14 @@ if MODE == "financials":
     put(ws, "A1", f"{d['name']} / {T} 估值分析（金融股模式）", TITLE, border=False)
     put(ws, "A2", f"sec-filing-downloader + SEC XBRL · {d['date']} · 分析工具输出，不构成投资建议",
         GREEN, border=False)
+    # 语义描述随版本走：fin v3 起有跨情景排序 + 亏损协议，再写死"沿用 v1"会对
+    # 新报告说谎；渲染旧 valuation.json（≤v2）时保留旧提示
     caliber = ("方法：PE 法 + P/TBV 法（金融股不适用 FCFF DCF）"
-               "；口径注意：金融股模式沿用 v1 情景语义（情景盈利×情景倍数，无 v2 一致性联动）")
+               + ("；口径：fin v3 情景语义（g/nm/pe/ptbv 跨情景排序 + 亏损协议——"
+                  "亏损/微利情景 PE 腿 n.m. 退出综合）"
+                  if (d.get("semantics_version") or 1) >= 3 else
+                  "；口径注意：本份为 fin v3 之前的旧语义（情景盈利×情景倍数，"
+                  "无一致性联动）"))
     if M.get("adr_multiple", 1.0) != 1.0:
         caliber += f"；价格为 ADR（1 ADR = {M['adr_multiple']:g} 普通股，股本已折算）"
     if M.get("currency", "USD") != "USD":
@@ -292,19 +298,29 @@ if MODE == "financials":
     for j, h in enumerate(["投资情景", "PE 法目标价", "P/TBV 法目标价",
                            "综合目标价", "距现价", "一年后目标价"]):
         put(ws, f"{get_column_letter(1+j)}20", h, BOLD, fill=HDRFILL)
-    scen_rows = [("🚀 乐观 (Bull)", "D"), ("⚖️ 合理 (Base)", "C"), ("🛡️ 悲观 (Bear)", "B")]
+    scen_rows = [("🚀 乐观 (Bull)", "D", "bull"), ("⚖️ 合理 (Base)", "C", "base"),
+                 ("🛡️ 悲观 (Bear)", "B", "bear")]
     r = 21   # 行号：bull=21 base=22 bear=23
-    for label, ac in scen_rows:
+    _nm_rows = []
+    for label, ac, key in scen_rows:
         put(ws, f"A{r}", label, BOLD)
         put(ws, f"B{r}", f"='情景假设'!${ac}$28", GREEN, fmt=FM_PX)
         put(ws, f"C{r}", f"='情景假设'!${ac}$31", GREEN, fmt=FM_PX)
+        # 综合公式必须与引擎的 blend_methods 同构（fin v3 起亏损/微利情景 PE 腿
+        # n.m.）：写死 AVERAGE(B:C) 会让 verify_report 的交叉核对假 FAIL。
+        # 老 valuation.json（≤v2）无该键，回退旧行为（两腿全入）
+        _bm = d["scenarios"][key].get("blend_methods") or ["pe", "ptbv"]
+        _pairs = [(m, c_) for m, c_ in (("pe", "B"), ("ptbv", "C")) if m in _bm]
+        _cells = [f"{c_}{r}" for _, c_ in _pairs]
+        if "pe" not in _bm:
+            _nm_rows.append(label)
         _bw = d.get("blend_weights") or {}
-        if any(abs(_bw.get(m, 1) - 1) > 1e-9 for m in ("pe", "ptbv")):
-            _den = _bw.get("pe", 1) + _bw.get("ptbv", 1)
-            _f = (f"=(B{r}*{_bw.get('pe', 1):g}+C{r}*{_bw.get('ptbv', 1):g})/{_den:g}"
-                  if _den > 0 else f"=AVERAGE(B{r}:C{r})")
+        if any(abs(_bw.get(m, 1) - 1) > 1e-9 for m, _ in _pairs):
+            _den = sum(_bw.get(m, 1) for m, _ in _pairs)
+            _num = "+".join(f"{c_}{r}*{_bw.get(m, 1):g}" for m, c_ in _pairs)
+            _f = f"=({_num})/{_den:g}" if _den > 0 else f"=AVERAGE({','.join(_cells)})"
         else:
-            _f = f"=AVERAGE(B{r}:C{r})"
+            _f = f"=AVERAGE({','.join(_cells)})"
         c = put(ws, f"D{r}", _f, BLACK, fmt=FM_PX)
         c.fill = GREENFILL if r != 23 else REDFILL
         c.font = Font(name="Arial", bold=True, size=10)
@@ -318,17 +334,22 @@ if MODE == "financials":
     ws.conditional_formatting.add(
         "E21:E23", CellIsRule(operator="greaterThan", formula=["0"],
                               font=Font(name="Arial", color="008000", bold=True)))
-    put(ws, "A24", "注：一年后目标价 = 综合目标价 × (1+该情景 WACC)；justified P/TBV 为交叉参考不入综合",
-        GREEN, border=False)
+    _note24 = "注：一年后目标价 = 综合目标价 × (1+该情景 WACC)；justified P/TBV 为交叉参考不入综合"
+    if _nm_rows:
+        _note24 += ("；" + "、".join(_nm_rows)
+                    + " 的 PE 法 n.m. 不入综合（亏损/微利守卫，该情景综合 = P/TBV 单腿）")
+    put(ws, "A24", _note24, GREEN, border=False)
     _spread = " / ".join(f"{sc} {d['scenarios'][sc].get('method_spread') or '—'}x"
                          for sc in ("bear", "base", "bull"))
     put(ws, "A25", f"方法离散度（PE法 vs P/TBV法 max/min）：{_spread}——离散大时两法分歧大，"
                    "综合可信度降低", GREEN, border=False)
     # 诊断红旗区（0057 起 financials 有 warnings 通道：P/TBV 带检查）——与 standard
-    # 相同的纪律：警告必须和 headline 数字同表出现，不能只活在引擎 stdout 里
+    # 相同的纪律：警告必须和 headline 数字同表出现，不能只活在引擎 stdout 里。
+    # 全局块（0015）排最前：时效/期后事件是数据事实，读者先看它再看情景假设旗
     _row = 26
-    _flags = [(sc, lv, msg) for sc in ("bear", "base", "bull")
-              for lv, msg in d["scenarios"][sc].get("warnings", [])]
+    _flags = ([("全局", lv, msg) for lv, msg in d.get("warnings_global") or []]
+              + [(sc, lv, msg) for sc in ("bear", "base", "bull")
+                 for lv, msg in d["scenarios"][sc].get("warnings", [])])
     if _flags:
         put(ws, f"A{_row}", "合理性红旗（engine diagnostics）：",
             Font(name="Arial", color="CC0000", bold=True, size=10), border=False)
@@ -408,7 +429,11 @@ put(ws, "B14", d["meta"]["fwd_shares"], BLUE, fmt="#,##0", fill=YELLOW)
 put(ws, "E14", "回购小幅缩减；三情景共用", GREEN)
 put(ws, "A15", "年化其他收益 ($M)", BOLD)
 put(ws, "B15", d["other_income"], BLUE, fmt=FM_M, fill=YELLOW)
-put(ws, "E15", "净利息及其他（正常化）；三情景共用", GREEN)
+# other_income_note（0015）：校验层硬要求的推导口径（取自哪一行/剔了哪些一次性/
+# 如何年化）此前被这里的通用文案顶掉——三处里唯一有出处的那句进不了报告。
+# 老 valuation.json 无该字段时回退旧文案（与 rev0_note 的兼容手法一致）
+put(ws, "E15", d.get("other_income_note") or "净利息及其他（正常化）；三情景共用",
+    GREEN, wrap=True)
 put(ws, "A16", "主分部利润占比", BOLD)
 put(ws, "B16", d["meta"]["seg1_share"], BLUE, fmt=FM_PCT, fill=YELLOW)
 put(ws, "E16", f"主分部={d['meta']['seg1']}；次分部={d['meta']['seg2']}", GREEN)
@@ -802,6 +827,14 @@ if _tr:
         GREEN, border=False)
     _row += 1
 
+    # ---- regime 失效红线（0010）：带外 + 滞后 >250 天时，区间的均值回归前提
+    # 可能已失效（ISRG 实测 546~675 vs 现价 367 无任何警示）。红字置于区间块内，
+    # 数字不改——注意不得动上方 27~30 行的布局契约（verify_report 钉着 {列}30）----
+    if _tr.get("regime_note"):
+        put(ws, f"A{_row}", "⛔ " + _tr["regime_note"],
+            Font(name="Arial", color="CC0000", bold=True, size=10), border=False)
+        _row += 1
+
     # ---- 现价当前位置 + 倍数回归归因（活公式：改现价/base EPS 即联动）----
     # 这是本块此前缺的另一半：目标 PE 锚在 P50 不代表便宜，市场当前付多少倍同样是
     # 事实。而且区间中位相对现价的涨幅按构造恒等于倍数回归幅度（EPS 消掉了）。
@@ -865,9 +898,12 @@ if _tr:
     _row += 1
 
 # v2 诊断红旗区：engine diagnostics 的 red/yellow 警告逐条落进摘要——
-# 警告和 headline 数字必须出现在同一张表上，不能只活在引擎 stdout 里
-_flags = [(sc, lv, msg) for sc in ("bear", "base", "bull")
-          for lv, msg in d["scenarios"][sc].get("warnings", [])]
+# 警告和 headline 数字必须出现在同一张表上，不能只活在引擎 stdout 里。
+# 全局块（0015）排最前：时效/期后事件/带滞后是三情景共有的数据事实，
+# 此前全挂 base 下，bear/bull 读起来"干净"——九个评审 agent 共同点名的误导
+_flags = ([("全局", lv, msg) for lv, msg in d.get("warnings_global") or []]
+          + [(sc, lv, msg) for sc in ("bear", "base", "bull")
+             for lv, msg in d["scenarios"][sc].get("warnings", [])])
 if _flags:
     put(ws, f"A{_row}", "合理性红旗（engine v2 diagnostics——red 项判断层已复审一次，仍越界则代表其坚持该假设）：",
         Font(name="Arial", color="CC0000", bold=True, size=10), border=False)
@@ -894,8 +930,16 @@ sources = [
     ("TTM 口径", "损益类=最近四个离散季度加总（Q4=年度-前三季）；现金流类=最新年度+本财年YTD-上年同期YTD（10-Q现金流表为累计口径）"),
     ("调整后净利", d["adj_note"]),
     ("净现金", d["net_cash_note"]),
+    # 与 adj_note/net_cash_note 同级的推导出处（0015）——老 valuation.json 缺字段时回退通用口径
+    ("年化其他收益", d.get("other_income_note") or "净利息及其他（正常化）；三情景共用"),
     ("估值语义版本", (f"semantics_version={d.get('semantics_version', 1)}"
-                     + ("（v3, 2026-08-14：v2 之上 base 目标 PE 默认锚历史 NTM 带"
+                     + ("（v4, 2026-09-06：v3 之上服务器前置注入十年 FCF 锚表、"
+                        "OI&E 组件与税前−营业利润残差行、期后 filing 索引——"
+                        "终值 margins 与 other_income 的锚来源改变；"
+                        f"config 声明版本 v{d.get('config_semantics_version', 1)}；"
+                        "注入前(≤v3)与注入后(v4) 样本不可直接混聚）"
+                        if d.get("semantics_version", 1) >= 4 else
+                        "（v3, 2026-08-14：v2 之上 base 目标 PE 默认锚历史 NTM 带"
                         "近3年子窗 P50、偏离 ±15% 须给证据；"
                         f"config 声明版本 v{d.get('config_semantics_version', 1)}；"
                         "锚前(≤v2)与锚后(v3) 的倍数假设与目标价水平不可直接对比）"

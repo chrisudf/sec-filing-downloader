@@ -280,3 +280,157 @@ def test_fill_ytd_differencing_only_for_ytd_flow_items():
                              ("2026-01-01", "2026-06-30", 25e6, "2026-07-30"))}
     _, q = assemble_series(facts, "net_income")
     assert "2026-06-30" not in q or q["2026-06-30"] == 25e6
+
+
+# =====================================================================
+# 营业利润推导回退 + 券商路由（0021）
+# COHR：op_income 停报（0020 只把报错分类修对），rev/cogs/rnd/sga 同窗齐全时
+# 自下而上推导救回整票；HOOD：券商利润表「总收入−总运营费用→税前」，两个既有
+# 签名（RNIE / 新鲜 OperatingIncomeLoss）都不认，误落 standard 判不适配。
+# =====================================================================
+
+import pytest
+
+_W = ["2025-09-30", "2025-12-31", "2026-03-31", "2026-06-30"]
+
+
+def _cohr_out(**over):
+    """COHR 形态：营收 TTM 7,118.2M，组件四季合计 cogs 4,449.1 / rnd 723.0 /
+    sga 1,044.6（$M，按原始美元喂）。"""
+    def q(total):
+        return {k: total * 1e6 / 4 for k in _W}
+    d = {"cogs_quarterly": q(4449.1), "rnd_quarterly": q(723.0),
+         "sga_quarterly": q(1044.6)}
+    d.update(over)
+    return d
+
+
+def test_derive_op_income_cohr_shape():
+    from valuation.fetch_facts import _derive_op_income_ttm
+    ttm = {"revenue": {"value": 7118.2e6, "quarters": list(_W)},
+           "op_income": {"value": None, "error": "口径滞后：最新期 2024-06-30"}}
+    _derive_op_income_ttm(_cohr_out(), ttm)
+    op = ttm["op_income"]
+    assert op["value"] == pytest.approx(901.5e6)
+    assert op["derived"] is True and op["quarters"] == list(_W)
+    assert "推导值" in op["note"] and "摊销/重组" in op["note"]
+
+
+def test_derive_op_income_missing_component_hard_fails():
+    """sga 缺窗口内一季：不推导、原 error 原样保留——宁缺勿错。"""
+    from valuation.fetch_facts import _derive_op_income_ttm
+    out = _cohr_out()
+    del out["sga_quarterly"]["2026-06-30"]
+    ttm = {"revenue": {"value": 7118.2e6, "quarters": list(_W)},
+           "op_income": {"value": None, "error": "口径滞后：最新期 2024-06-30"}}
+    _derive_op_income_ttm(out, ttm)
+    assert ttm["op_income"] == {"value": None, "error": "口径滞后：最新期 2024-06-30"}
+
+
+def test_derive_op_income_untouched_when_reported():
+    from valuation.fetch_facts import _derive_op_income_ttm
+    ttm = {"revenue": {"value": 7118.2e6, "quarters": list(_W)},
+           "op_income": {"value": 900e6, "quarters": list(_W)}}
+    _derive_op_income_ttm(_cohr_out(), ttm)
+    assert ttm["op_income"]["value"] == 900e6
+    assert "derived" not in ttm["op_income"]   # 申报值不许被盖
+
+
+def test_derive_op_income_wired_into_build_facts():
+    import inspect
+    from valuation.fetch_facts import build_facts
+    assert "_derive_op_income_ttm(out, ttm)" in inspect.getsource(build_facts)
+
+
+def _tag(end):
+    return {"units": {"USD": [{"end": end}]}}
+
+
+def test_detect_mode_broker_routes_financials():
+    """HOOD 形态：Revenues+税前新鲜、无 OperatingIncomeLoss、券商标签在场。"""
+    from valuation.fetch_facts import _detect_mode
+    facts = {"Revenues": _tag("2026-06-30"),
+             "IncomeLossFromContinuingOperationsBeforeIncomeTaxesExtraordinaryItemsNoncontrollingInterest":
+                 _tag("2026-06-30"),
+             "InterestAndDividendIncomeOperating": _tag("2026-06-30")}
+    mode, _spec = _detect_mode(facts, "us-gaap")
+    assert mode == "financials"
+
+
+def test_detect_mode_stopped_op_income_without_broker_tags_stays_standard():
+    """COHR 形态：营业利润停报但不是券商——留在 standard 吃推导回退。"""
+    from valuation.fetch_facts import _detect_mode
+    facts = {"Revenues": _tag("2026-06-30"),
+             "OperatingIncomeLoss": _tag("2024-06-30"),
+             "IncomeLossFromContinuingOperationsBeforeIncomeTaxesExtraordinaryItemsNoncontrollingInterest":
+                 _tag("2026-06-30")}
+    assert _detect_mode(facts, "us-gaap")[0] == "standard"
+
+
+def test_detect_mode_fresh_op_income_with_broker_tag_stays_standard():
+    """经营性公司带上券商类标签（罕见）也不误路由：营业利润新鲜即 standard。"""
+    from valuation.fetch_facts import _detect_mode
+    facts = {"Revenues": _tag("2026-06-30"),
+             "OperatingIncomeLoss": _tag("2026-06-30"),
+             "IncomeLossFromContinuingOperationsBeforeIncomeTaxesExtraordinaryItemsNoncontrollingInterest":
+                 _tag("2026-06-30"),
+             "InterestIncomeExpenseNet": _tag("2026-06-30")}
+    assert _detect_mode(facts, "us-gaap")[0] == "standard"
+
+
+def test_detect_mode_bank_signature_unchanged():
+    from valuation.fetch_facts import _detect_mode
+    facts = {"RevenuesNetOfInterestExpense": _tag("2026-06-30")}
+    assert _detect_mode(facts, "us-gaap")[0] == "financials"
+
+
+def test_detect_mode_broker_stale_pretax_stays_standard():
+    """税前利润也停报的票不路由：fin 模式核心科目照样缺，换模式救不了。"""
+    from valuation.fetch_facts import _detect_mode
+    facts = {"Revenues": _tag("2026-06-30"),
+             "IncomeLossFromContinuingOperationsBeforeIncomeTaxesExtraordinaryItemsNoncontrollingInterest":
+                 _tag("2024-06-30"),
+             "InterestAndDividendIncomeOperating": _tag("2026-06-30")}
+    assert _detect_mode(facts, "us-gaap")[0] == "standard"
+
+
+def test_detect_mode_stale_broker_tag_stays_standard():
+    """0022 C17：UHT 型经营性公司带一枚陈年 broker tag（历史上出现过、早已停报）。
+    presence-anywhere 判据下，它一旦改列报停掉 OperatingIncomeLoss 就会被静默
+    按银行估值（P/TBV 框架、fin prompt、CFO/capex 全压掉）——broker tag 必须与
+    旁边的 rev/pretax/op 条件同一时效闸（距营收锚 <=400 天）。"""
+    from valuation.fetch_facts import _detect_mode
+    facts = {"Revenues": _tag("2026-06-30"),
+             "IncomeLossFromContinuingOperationsBeforeIncomeTaxesExtraordinaryItemsNoncontrollingInterest":
+                 _tag("2026-06-30"),
+             "InterestIncomeExpenseNet": _tag("2018-09-30")}
+    assert _detect_mode(facts, "us-gaap")[0] == "standard"
+
+
+def test_detect_mode_fresh_components_rescue_takes_precedence():
+    """0022 C17：COHR 型（停报营业利润）+ 恰好带一枚新鲜 broker tag：
+    rev/cogs/rnd/sga 全新鲜说明利润表仍是经营性列报（券商不报 cogs），必须留在
+    standard 吃 _derive_op_income_ttm 救援——_detect_mode 跑在救援之前，
+    路由 financials 会结构性关掉它。"""
+    from valuation.fetch_facts import _detect_mode
+    facts = {"Revenues": _tag("2026-06-30"),
+             "IncomeLossFromContinuingOperationsBeforeIncomeTaxesExtraordinaryItemsNoncontrollingInterest":
+                 _tag("2026-06-30"),
+             "InterestIncomeExpenseNet": _tag("2026-06-30"),
+             "OperatingIncomeLoss": _tag("2024-06-30"),
+             "CostOfGoodsAndServicesSold": _tag("2026-06-30"),
+             "ResearchAndDevelopmentExpense": _tag("2026-06-30"),
+             "SellingGeneralAndAdministrativeExpense": _tag("2026-06-30")}
+    assert _detect_mode(facts, "us-gaap")[0] == "standard"
+
+
+def test_detect_mode_broker_with_stale_components_still_financials():
+    """真券商改列报（HOOD 型）不受救援优先影响：cogs/rnd/sga 缺或陈旧时
+    推导救援本就无从谈起，broker 路由照走。"""
+    from valuation.fetch_facts import _detect_mode
+    facts = {"Revenues": _tag("2026-06-30"),
+             "IncomeLossFromContinuingOperationsBeforeIncomeTaxesExtraordinaryItemsNoncontrollingInterest":
+                 _tag("2026-06-30"),
+             "InterestAndDividendIncomeOperating": _tag("2026-06-30"),
+             "CostOfGoodsAndServicesSold": _tag("2019-12-31")}
+    assert _detect_mode(facts, "us-gaap")[0] == "financials"

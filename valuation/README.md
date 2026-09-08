@@ -37,7 +37,7 @@ python valuation\verify_report.py valuation.json reports\NVDA_valuation_2026-07-
                                            // 前瞻期恒为 NTM 而非财年（见 valuation_service.fwd_window）
                                            // 手写 config 时照此格式给一个说明性标签即可
   "seg1": "主分部名", "seg2": "次分部名", "seg1_share": 0.95,
-  "semantics_version": 3,                  // v3（2026-08-14）：v2 之上 base PE 锚历史 NTM 带子窗 P50
+  "semantics_version": 4,                  // v4（2026-09-06）：v3 之上服务器前置注入 FCF 锚表/OI&E 残差/期后 filing 索引
   "scenarios": {
     "bear|base|bull": {
       "g": 0.32,          // 前瞻期(NTM)营收增速 vs TTM
@@ -62,9 +62,10 @@ python valuation\verify_report.py valuation.json reports\NVDA_valuation_2026-07-
 bear \$37-\$87，根因是判断层对连续参数的独立采样叠加"情景倍数×同情景盈利"的
 周期双重计数。v2 改动：
 
-- **一致性校验**（valuation_service）：单参数边界、跨情景排序（g/opm/pe/m1 须
-  bear<=base<=bull）、反双重计数（盈利收缩>20% 时 pe/m1 >= 0.6×base；扩张>25% 时
-  <= 1.4×base）、margins 谷底 >= 0.4×TTM FCF 利润率；`permanent_impairment=true`
+- **一致性校验**（valuation_service）：单参数边界、跨情景排序（g/opm/pe/m1/m2 须
+  bear<=base<=bull）、反双重计数（盈利收缩>20% 时 pe/m1/m2 >= 0.6×base；扩张>25% 时
+  <= 1.4×base；m2 仅真双分部参与，被亏损协议强制 0 的 m1/m2 不参与）、
+  margins 谷底 >= 0.4×TTM FCF 利润率；`permanent_impairment=true`
   + `impairment_note` 可豁免（永久受损判断下低盈利×低倍数自洽）
 - **SOTP 降级**（engine）：seg1_share >= 0.85 时 SOTP 只作参考不入综合
   （与 PE 法同一笔盈利计两次），综合 = PE/DCF 均值
@@ -122,6 +123,66 @@ bear \$37-\$87，根因是判断层对连续参数的独立采样叠加"情景�
   元数据与摘要——高倍数值不值得给的对照标尺，不执法
 - **financials v2（2026-08-14）**：base P/TBV 默认锚历史带（时点流通股分母）锚窗 P50
   ±15% 证据纪律；financials 情景开通 warnings 通道（P/TBV 带检查）
+
+## v4 语义（semantics_version=4，2026-09-06）
+
+- **数据前置注入**（valuation_service，只改注入不改引擎计算）：此前 prompt 许诺的
+  数据服务器有却不给，判断层徒手拼数、引擎事后打旗。v4 起 FACTS 摘要注入：
+  1. **年度 FCF 利润率表**（与 engine.hist_fcf_margins 同口径，含峰值/中位与
+     实际覆盖财年、缺口逐年点名）——终值 margins 的锚
+  2. **OI&E 组件矩阵 + 逐季「税前−营业利润」残差行**（只列实际存在的序列，
+     缺失的显式点名）——other_income 的推导基
+  3. **期后 filing 索引**（报告期后提交的 424B*/S-*/8-K/SC 13*/10-*，服务器实查
+     EDGAR submissions、不下载文档）——post_period_capital_events 核对的线索；
+     取数失败降级为显式"索引不可用"，绝不连累估值任务
+- 锚的来源改变 = 语义改变（与 v2→v3 同构）：注入前(≤v3)/注入后(v4) 样本在
+  trend/compare 里按版本隔离，连续性锚跨版本自动失效重建一次（预期行为）。
+  financials 模式不随 v4 动（其补课单独走 fin v3，见下节）。
+
+### 分部对照（0023，2026-09-08，**不占语义号**）
+
+管道此前从不取分部数据（facts.json 里一条分部字段都没有），判断层凭 SECTIONS
+正文自拍 `seg1_share`，而它 `>= 0.85` 会让引擎把 SOTP 腿降级为参考项——
+「本公司是单一业务」一句自我声明就能悄悄关掉一整条估值腿，校验层还只查 `0<=x<=1`。
+MSFT 2026-09-08 实测就是这个形态（判断层 `seg1_share=1.0` 零理由，发行人按三分部
+申报 44%/42%/14%）。
+
+- **注入**：`build_segments` 取发行人自己申报的分部营收结构，作为「# 分部（发行人
+  XBRL 申报）」块进 prompt（standard 模式）。取数失败/超时降级为显式的"无可用分部
+  申报"，绝不连累估值任务——与期后 filing 索引同规格。
+- **举证闸**（`_check_seg1_share`）：发行人多分部 + 最大分部营收占比 < 85% + 判断层
+  给 `seg1_share >= 85%` + `rationale.sotp` 为空 → 拒收。**不做数值等式检查**：
+  seg1_share 是营业利润占比、对照物是营收占比，两者合法地不同；要的是理由不是对齐。
+- **呈现**（`engine.seg_share_crosscheck`）：两个口径差 >25pp 时进 `warnings_global`
+  黄旗，并点明 SOTP 腿在不在综合里。
+
+**为什么不升语义号**：v3/v4 改的是**每一个**标的的锚来源，而这条只在判断层原本
+就与发行人申报矛盾时才改变输出（NVDA 94% vs 91.8%、AMZN 58% vs 57.9% 逐位不变）。
+形态与 0018 幽灵 ADR 同类——修的是缺陷而非口径，同样不占语义号。真改变了综合腿集合
+的那些运行，`compare.py` 的逐情景 `blend_methods` 警告本就会报。
+
+## financials v3 语义（fin semantics_version=3，2026-09-06）
+
+SOFI 实测一次 financials 运行零警告发货——standard 在 v2 就补的护栏 financials
+一条都没有。fin v3 补课：
+
+- **跨情景排序**（_validate_judgment_financials）：g / nm / pe / ptbv 须
+  bear<=base<=bull——此前 bear.pe > bull.pe、倒挂的 g 全部放行（正是 v2 给
+  standard 修掉的漂移放大器）
+- **亏损协议**：nm 下界从 0 放宽到 -0.5；nm<=0 的情景必须 pe=0。旧下界让
+  「刚扭亏 fintech 的 P20 bear 现实上是亏损」无法表达，prompt 还推着模型
+  『压到微利』——假微利 × 15-30x PE 静默进综合（standard 的 COIN 微利除法
+  事故同型）。引擎把 nm<=0 / eps1<=0 的 PE 腿标 n.m. 剔出综合（blend_methods
+  记录），综合退化为 P/TBV 单腿；**微利守卫**：0<nm<1% 同样 n.m.（黄旗）
+- Excel 综合公式与引擎 blend_methods 同构（PE 腿 n.m. 时 verify_report 不假 FAIL）
+- **基线护栏补齐**（engine fin 分支此前在所有 base 级护栏之前 return）：
+  时效检查（vintage_warnings——银行/券商/fintech 恰是 10-Q 滞后重灾区，fin 无
+  net_cash，锚退到 TBV 口径）、base 综合偏离现价 ±35% 黄旗、方法离散度 >2x 黄旗、
+  目标 PE 的历史带比对（pe_band 对 fin facts 本就生成，此前只查了 P/TBV 腿）
+- **连续性锚持久化**：写路径去掉 mode=="standard" 门禁（load 路径早就支持 fin
+  语义，写路径不写=fin 自动连续性结构性 no-op），gate-clean 判据不变
+- 综合目标价的产生方式结构性改变：fin v2 样本与 v3 在 trend/compare 里按版本
+  隔离，连续性锚跨版本自动失效重建一次（预期行为）
 
 ## 判断层检查清单（写 config 前必做）
 

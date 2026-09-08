@@ -21,10 +21,11 @@ _SEG = [ast.get_source_segment(_SRC, n) for n in ast.parse(_SRC).body
         if isinstance(n, ast.FunctionDef)
         and n.name in ("_isnum", "vintage_warnings", "band_lag_warnings",
                        "other_income_crosscheck", "hist_fcf_margins",
-                       "terminal_margin_warnings", "terminal_sensitivity")]
+                       "terminal_margin_warnings", "terminal_sensitivity",
+                       "dcf", "dcf_diag_warnings", "ps_reference")]
 # _isnum 是这些函数共用的模块级谓词（排除 bool），必须一起抽——
 # 否则 exec 出来的命名空间里没有它，全部 NameError
-assert len(_SEG) == 7, _SEG
+assert len(_SEG) == 10, _SEG
 _NS = {}
 exec(chr(10).join(_SEG), _NS)
 _isnum = _NS["_isnum"]
@@ -34,6 +35,9 @@ other_income_crosscheck = _NS["other_income_crosscheck"]
 hist_fcf_margins = _NS["hist_fcf_margins"]
 terminal_margin_warnings = _NS["terminal_margin_warnings"]
 terminal_sensitivity = _NS["terminal_sensitivity"]
+dcf = _NS["dcf"]
+dcf_diag_warnings = _NS["dcf_diag_warnings"]
+ps_reference = _NS["ps_reference"]
 
 
 def _mk(**over):
@@ -202,13 +206,16 @@ def test_declared_events_netted():
 # ---- 股数/现金自相矛盾：可机械证明的那条 ----
 
 def test_buyback_modeled_but_cash_not_flags_overvaluation():
-    """AAPL 实测形态：股数侧减了 155M（建模回购），net_cash 停在报告期没扣。"""
+    """股数侧建模了重手回购（3.1%，回购趋势/SBC 外推到不了的量级），net_cash
+    停在报告期没扣。v4 前用 AAPL 的 1.05%（155M）触发——那个量级现归入常规
+    前瞻建模、由分红盲区条覆盖（见下 test_routine_buyback_drift_*）。"""
     (lv, msg), = vintage_warnings(
-        _cfg(shares=14715.0, fwd_shares=14560.0, net_cash=62173.0,
+        _cfg(shares=14715.0, fwd_shares=14260.0, net_cash=62173.0,
              post_period_capital_events=[]), _vt(age=65))
     assert lv == "yellow"
     assert "时点不一致" in msg and "已建模净回购" in msg
     assert "系统性**高估**" in msg
+    assert "1.5%" in msg          # 触发时文案要写明阈值
     assert "声明为空，与股数侧的假设矛盾" in msg
 
 
@@ -223,19 +230,41 @@ def test_issuance_modeled_but_cash_not_flags_undervaluation():
 
 def test_empty_declaration_does_not_silence_inconsistency():
     """声明 [] 不是静默开关 —— 这正是第一版设计的洞（AAPL 抓到）。"""
-    c = _cfg(shares=14715.0, fwd_shares=14560.0, post_period_capital_events=[])
+    c = _cfg(shares=14715.0, fwd_shares=14260.0, post_period_capital_events=[])
     assert vintage_warnings(c, _vt(age=65)) != []
 
 
 @pytest.mark.parametrize("fwd,fires", [
     (1000.0, False),   # 无差
-    (995.0, False),    # 差 0.5%，阈值是**严格大于**，不触发
-    (994.9, True),     # 刚过阈值
-    (1005.1, True),    # 增发方向同样过阈值
+    (995.0, False),    # 差 0.5%
+    (986.0, False),    # 差 1.4%——SBC 摊薄/回购趋势的常规前瞻建模量级（TSLA +0.8% 实测噪声）
+    (985.0, False),    # 恰 1.5%，阈值是**严格大于**，不触发
+    (984.9, True),     # 刚过阈值
+    (1015.1, True),    # 增发方向同样过阈值
+    (970.0, True),     # 3%——离散期后事件的量级
 ])
 def test_share_delta_threshold(fwd, fires):
     (_, msg), = vintage_warnings(_cfg(fwd_shares=fwd), _vt(age=60))
     assert ("时点不一致" in msg) is fires
+
+
+def test_routine_buyback_drift_covered_by_dividend_blindspot():
+    """AAPL 实测形态（v4 后）：1.05% 回购漂移不再触发机械矛盾条，但 AAPL 分红
+    ——分红盲区条照常提示，不是彻底静默。"""
+    (lv, msg), = vintage_warnings(
+        _cfg(shares=14715.0, fwd_shares=14560.0, net_cash=62173.0,
+             post_period_capital_events=[]), _vt(age=65), DIVQ)
+    assert lv == "yellow"
+    assert "时点不一致" not in msg and "分红不改股数" in msg
+
+
+def test_sbc_creep_not_flagged_as_issuance():
+    """TSLA 实测形态：fwd_shares +1.4% 是 SBC 摊薄的常规外推，不是期后现金增发。"""
+    (_, msg), = vintage_warnings(
+        _cfg(shares=1000.0, fwd_shares=1014.0, post_period_capital_events=[]),
+        _vt(age=60), {})
+    assert "时点不一致" not in msg and "现金流入未计入" not in msg
+    assert "未见分红记录" in msg          # 落到剩余项提示，不是静默
 
 
 def test_zero_shares_no_zerodiv():
@@ -499,11 +528,37 @@ def test_oi_relative_gate_protects_high_eps_names():
     assert other_income_crosscheck(f, 1300, 8.0, 1000.0) == []
 
 
-def test_oi_no_eps1_or_shares_is_silent():
-    """PE 腿 n.m. 时 eps1 可能为 None —— 不能拿它做除数。"""
+def test_oi_no_shares_silent_but_no_eps1_still_warns():
+    """fwd_shares 缺失时差额换算不成 EPS 口径，只能沉默；eps1=None（PE 腿
+    n.m.）**不再沉默**——差额仍是真实信息，只是不给占比（与 eps1=0.0 的
+    ZeroDivisionError 修复同一批行为变化，见下）。"""
     f = _q(interest_income=1000, interest_expense_nonop=0, other_nonop=0)
-    assert other_income_crosscheck(f, 90000, None, 1000.0) == []
     assert other_income_crosscheck(f, 90000, 8.0, 0) == []
+    (lv, msg), = other_income_crosscheck(f, 90000, None, 1000.0)
+    assert lv == "yellow"
+    assert "EPS +89.00" in msg and "占前瞻 EPS" not in msg
+
+
+def test_oi_eps1_zero_warns_without_ratio_not_crash():
+    """运行时复现：近盈亏平衡标的（正是 pe_nm 人群）base eps1=round(ni1/
+    fwd_shares, 2) 把 |eps1|<0.005 抹成 0.0 —— 相对门槛 rel_gate×0=0 放行，
+    材料级差额一路走到占比除法 ZeroDivisionError，在全部 LLM 花费之后炸掉
+    整个 engine 子进程。修法=去掉占比子句而非跳过对照。"""
+    f = _q(interest_income=1000, interest_expense_nonop=0, other_nonop=0)
+    for z in (0.0, -0.0):
+        (lv, msg), = other_income_crosscheck(f, 1900, z, 1000.0)   # EPS 差 0.90
+        assert lv == "yellow"
+        assert "+900M" in msg and "EPS +0.90" in msg
+        assert "占前瞻 EPS" not in msg and "占比无意义" in msg
+    # 绝对门槛对零 EPS 标的照常生效：0.04 < 0.05 不出旗
+    assert other_income_crosscheck(f, 1040, 0.0, 1000.0) == []
+
+
+def test_oi_eps1_truthy_keeps_ratio_wording():
+    """eps1 正常时占比子句必须保留 —— 修复只针对假值分支。"""
+    f = _q(interest_income=1000, interest_expense_nonop=0, other_nonop=0)
+    (_, msg), = other_income_crosscheck(f, 1900, 1.50, 1000.0)
+    assert "占前瞻 EPS 60%" in msg
 
 
 def test_oi_never_red():
@@ -618,6 +673,31 @@ def test_terminal_sensitivity_silent_without_base_ps():
     m = [0.0] * 9 + [0.09]
     assert terminal_sensitivity(lambda mm: 100.0, 0.9, m, None) == []
     assert terminal_sensitivity(lambda mm: None, 0.9, m, 161.0) == []
+
+
+def test_terminal_sensitivity_lambda_shares_base_matches_dcf_ps():
+    """运行时复现：调用点的敏感性 lambda 曾传 cfg["fwd_shares"]，而它包夹的
+    base dcf_ps（与其余全部 dcf() 调用）用 cfg["shares"] —— lo/base/hi 三元组
+    混两个股本基，+4.9% 增发把 "36/43/50（±16%）" 印成 "34/43/48（±20%）"，
+    敏感性被增发/回购幅度污染。
+    从生产源码抽出调用点 lambda 本体，在 shares≠fwd_shares 的 cfg 下执行：
+    margins 不动时它必须与 cfg["shares"] 基的 base dcf_ps 一致 ——
+    谁把 fwd_shares 塞回去谁挂。"""
+    calls = [n for n in ast.walk(ast.parse(_SRC))
+             if isinstance(n, ast.Call) and isinstance(n.func, ast.Name)
+             and n.func.id == "terminal_sensitivity"]
+    assert len(calls) == 1, "terminal_sensitivity 调用点应唯一"
+    lam_src = ast.get_source_segment(_SRC, calls[0].args[0])
+    margins = [0.05] * 9 + [0.09]
+    ns = dict(
+        dcf=dcf, rev0=1000.0,
+        _bcfg=dict(g0=0.06, gN=0.03, wacc=0.10, tg=0.025),
+        cfg=dict(net_cash=500.0, shares=1000.0, fwd_shares=1049.0),  # +4.9% 增发
+    )
+    lam = eval(lam_src, ns)      # 调用点换了变量名会 NameError —— 响亮失败，别兜
+    base_ps = dcf(1000.0, 0.06, 0.03, margins, 0.10, 0.025, 500.0,
+                  ns["cfg"]["shares"])[0]
+    assert lam(margins) == pytest.approx(base_ps, rel=1e-12)
 
 
 # ---- margins 谷底护栏：负 FCF 时退到历史中位，而不是整条跳过 ----
@@ -801,3 +881,492 @@ def test_hist_fcf_margins_skips_bool_years():
 def test_terminal_margin_bool_terminal_ignored():
     hist = [("20%02d-12-31" % i, 0.05) for i in range(10)]
     assert terminal_margin_warnings(hist, {"base": {"margins": [0.0] * 9 + [True]}}) == []
+
+
+# =====================================================================
+# v4（2026-09-06）：ppce 泄压阀——reflected_in_net_cash 逐笔确认后降级 info
+# =====================================================================
+
+def test_ppce_all_reflected_discharges_to_info():
+    """AAPL/MSFT 实测：net_cash_note 已对完账，"请确认已计入"黄旗照样响、
+    无法解除。逐笔 reflected_in_net_cash=true 后降级为 info 留痕行。"""
+    evs = [dict(EVENT, net_cash_impact_musd=19700.0, reflected_in_net_cash=True)]
+    (lv, msg), = vintage_warnings(_cfg(post_period_capital_events=evs), _vt(age=64))
+    assert lv == "info"
+    assert "已声明并逐笔确认计入" in msg and "2026-08-18 增发 +19,700M" in msg
+    assert "请确认" not in msg
+
+
+def test_ppce_partial_reflected_keeps_yellow():
+    """任何一笔有金额的事件缺确认 → 黄旗照旧，不许打折。"""
+    evs = [dict(EVENT, net_cash_impact_musd=19700.0, reflected_in_net_cash=True),
+           dict(EVENT, kind="回购", amount_musd=-5000.0, net_cash_impact_musd=-5000.0)]
+    (lv, msg), = vintage_warnings(_cfg(post_period_capital_events=evs), _vt(age=64))
+    assert lv == "yellow" and "请确认" in msg
+
+
+def test_ppce_string_true_does_not_discharge():
+    """引擎只认布尔 True——字符串 "true" 不算（校验层另行拒绝，这里是引擎侧兜底）。"""
+    evs = [dict(EVENT, net_cash_impact_musd=19700.0, reflected_in_net_cash="true")]
+    (lv, _), = vintage_warnings(_cfg(post_period_capital_events=evs), _vt(age=64))
+    assert lv == "yellow"
+
+
+def test_ppce_pure_contingent_needs_no_confirmation():
+    """NVDA 形态：$105B 担保承诺无现金流（amount=0）——不该被"请确认计入"缠住；
+    与已确认的有金额事件同列时整体仍可降级。"""
+    evs = [{"date": "2026-08-01", "kind": "担保或有", "amount_musd": 0.0,
+            "note": "10-Q 承诺与或有：$105B 供应承诺担保"},
+           dict(EVENT, net_cash_impact_musd=19700.0, reflected_in_net_cash=True)]
+    (lv, msg), = vintage_warnings(_cfg(post_period_capital_events=evs), _vt(age=64))
+    assert lv == "info" and "担保或有" in msg
+
+
+def test_ppce_note_appended_to_info_line():
+    evs = [dict(EVENT, net_cash_impact_musd=19700.0, reflected_in_net_cash=True)]
+    (_, msg), = vintage_warnings(
+        _cfg(post_period_capital_events=evs,
+             ppce_note="增发净额已并入 net_cash（见 net_cash_note 第 2 条）"),
+        _vt(age=64))
+    assert "增发净额已并入" in msg
+
+
+# ---- 校验层：新字段/新 kind ----
+
+def test_validator_rejects_non_bool_reflected():
+    bad = [dict(EV, reflected_in_net_cash="true")]
+    with pytest.raises(ValueError, match="reflected_in_net_cash"):
+        _validate_judgment(_mk(post_period_capital_events=bad), "standard")
+
+
+def test_validator_accepts_new_kinds_and_ppce_note():
+    """担保或有/股息宣告 是合法 kind（kind 无白名单，pin 住这一点防未来误加）；
+    ppce_note 字符串合法。"""
+    evs = [{"date": "2026-09-10", "kind": "股息宣告", "amount_musd": 0.0,
+            "net_cash_impact_musd": -6800.0, "reflected_in_net_cash": False,
+            "note": "8-K：宣告 9/10 季度股息 $6.8B，10 月支付"},
+           {"date": "2026-08-01", "kind": "担保或有", "amount_musd": 0.0,
+            "note": "10-Q：$105B 供应承诺担保"}]
+    _validate_judgment(_mk(post_period_capital_events=evs,
+                           ppce_note="股息宣告未付，net_cash 未扣"), "standard")
+
+
+def test_validator_rejects_non_str_ppce_note():
+    with pytest.raises(ValueError, match="ppce_note"):
+        _validate_judgment(_mk(ppce_note=123), "standard")
+
+
+# =====================================================================
+# 0009 诊断覆盖面：RKLB 型 pre-FCF 发行人把三道 DCF 护栏逼进静默/自相矛盾区
+#   ① 近窗无正 FCF 年 -> terminal_margin_warnings 逐情景 continue = 整条静默
+#   ② TV 占比 >75% red 对 TTM FCF<=0 结构必然，econ-review 打回逼判断层扭曲 margins
+#   ③ pv_explicit<=0 -> tv_pv_share=None，truthiness 闸门放走最坏形态
+#   ④ OCF 兜底措辞「非正」vs 闸门 <=2% 营收，0<FCF<=2% 时自相矛盾
+# =====================================================================
+
+def test_terminal_margin_no_positive_fcf_year_speaks():
+    """①：RKLB 型近十年年年 FCF 为负——修前 peak<=0 逐情景 continue，零输出。"""
+    hist = [(f"20{y}-12-31", -0.10 - y * 0.001) for y in range(16, 26)]
+    out = terminal_margin_warnings(hist, _scen())
+    assert len(out) == 1 and out[0][0] == "yellow"
+    assert "无正 FCF 年份" in out[0][1]
+    assert "rationale.dcf_margin" in out[0][1]
+
+
+def test_terminal_margin_positive_peak_path_unchanged():
+    """有正 FCF 年份时行为与措辞不变（AMZN 校准用例仍由上方老用例钉住）。"""
+    out = terminal_margin_warnings(AMZN_HIST, _scen())
+    assert len(out) == 2 and all("无正 FCF 年份" not in m for _, m in out)
+
+
+def _dd(**over):
+    d = {"yrN_rev_multiple": 2.0, "tv_pv_share": 0.70,
+         "pv_explicit": 300, "tv_pv": 700}
+    d.update(over)
+    return d
+
+
+def test_tv_share_red_for_fcf_positive_issuer():
+    dd = _dd(tv_pv_share=0.80)
+    out = dcf_diag_warnings(dd, 1000.0, 100.0, 1000.0, 200.0)   # FCF 10% 营收
+    assert ["red", *[m for lv, m in out if lv == "red"]][1].startswith("终值折现占 EV 80%")
+    assert dd["dcf_equity_over_ttm_fcf"] == 10.0
+
+
+def test_tv_share_downgraded_to_yellow_for_pre_fcf():
+    """②：TTM FCF<=0 时 >75% 是 wacc−tg 的数学必然，red 只会喂给 econ-review
+    去逼判断层扭曲 margins（RKLB 实测级联）——降级 yellow 并说明结构性。"""
+    dd = _dd(tv_pv_share=0.80)
+    out = dcf_diag_warnings(dd, 1000.0, -50.0, 1000.0, 200.0)
+    assert all(lv != "red" for lv, _ in out)
+    tv = [m for lv, m in out if "终值折现占 EV 80%" in m]
+    assert len(tv) == 1 and "结构性" in tv[0]
+    # OCF 兜底黄旗同时在场
+    assert any("OCF 锚 = 5.0x" in m for _, m in out)
+
+
+def test_tv_share_none_escape_now_reported():
+    """③：pv_explicit<=0 -> share=None 的最坏形态此前整条免检（RKLB bear）。"""
+    dd = _dd(tv_pv_share=None, pv_explicit=-120, tv_pv=900)
+    out = dcf_diag_warnings(dd, 1000.0, 100.0, 1000.0, 200.0)
+    hits = [(lv, m) for lv, m in out if "显式期 PV 非正" in m]
+    assert len(hits) == 1 and hits[0][0] == "red"
+    assert "估值全押终值" in hits[0][1]
+    # pre-FCF 时同样按 ② 降级
+    out2 = dcf_diag_warnings(_dd(tv_pv_share=None, pv_explicit=-120, tv_pv=900),
+                             1000.0, -50.0, 1000.0, None)
+    hit2 = [(lv, m) for lv, m in out2 if "显式期 PV 非正" in m]
+    assert len(hit2) == 1 and hit2[0][0] == "yellow"
+
+
+def test_tv_share_none_with_nonpositive_tv_stays_silent():
+    """tv_pv 也非正 = 整条 DCF <=0，由 dcf_ps<=0 的 red 护栏负责，这里不重复。"""
+    dd = _dd(tv_pv_share=None, pv_explicit=-500, tv_pv=-100)
+    out = dcf_diag_warnings(dd, 1000.0, 100.0, 1000.0, 200.0)
+    assert all("终值" not in m and "显式期" not in m for _, m in out)
+
+
+def test_ocf_fallback_wording_matches_gate():
+    """④：0 < FCF <= 2% 营收踩闸门但不「非正」——措辞必须如实反映闸门并给数。"""
+    dd = _dd()
+    out = dcf_diag_warnings(dd, 1000.0, 15.0, 1000.0, 200.0)    # 1.5% 营收
+    (msg,) = [m for lv, m in out if "护栏未生效" in m]
+    assert "非正或占营收 <=2%" in msg and "1.5%" in msg and "15M" in msg
+    assert "OCF 锚 = 5.0x" in msg
+    assert dd["dcf_equity_over_ttm_ocf"] == 5.0
+    # OCF 亦不可用时明说无备用锚
+    out2 = dcf_diag_warnings(_dd(), 1000.0, -30.0, 1000.0, None)
+    assert any("无备用锚" in m for _, m in out2)
+
+
+def test_p_fcf_red_path_unchanged():
+    dd = _dd()
+    out = dcf_diag_warnings(dd, 10000.0, 100.0, 1000.0, 200.0)  # P/FCF=100 界外
+    assert any(lv == "red" and "界外 [5,90]" in m for lv, m in out)
+
+
+def test_ps_reference_thin_band_gives_no_price():
+    """④'：thin_coverage 薄带（60 天）没有锚话语权——参考价不出、ddiag 不写。"""
+    dd = {}
+    txt = ps_reference({"thin_coverage": True, "days": 61, "basis": "ntm",
+                        "pctiles": {"50": 2.0}}, 1000.0, 100.0, "bear", dd)
+    assert "覆盖不足" in txt and "61" in txt
+    assert "ps_ref" not in dd and "≈" not in txt
+
+
+def test_ps_reference_normal_band_unchanged():
+    dd = {}
+    psb = {"basis": "ntm",
+           "recent": {"pctiles": {"25": 1.0, "50": 2.0, "75": 3.0}}}
+    txt = ps_reference(psb, 1000.0, 100.0, "bear", dd)
+    assert "P/S 参考（不入综合）" in txt and "2.00x" in txt and "≈ 20.0" in txt
+    assert dd["ps_ref"]["px"] == {"25": 10.0, "50": 20.0, "75": 30.0}
+    assert dd["ps_ref"]["window"] == "recent"
+
+
+def test_ps_reference_missing_p50_empty():
+    assert ps_reference({}, 1000.0, 100.0, "bear", {}) == ""
+    assert ps_reference(None, 1000.0, 100.0, "bear", {}) == ""
+
+
+# ---- 0014：standard 顶层字段类型墙（此前只查存在，字符串/null 会烧完 LLM 才崩）----
+
+@pytest.mark.parametrize("field,bad", [
+    ("net_cash", "约 5,000"), ("net_cash", None), ("net_cash", True),
+    ("adj_ni", "100"), ("adj_ni", False),
+])
+def test_std_numeric_toplevel_type_guard(field, bad):
+    """engine 拿 net_cash 进 dcf() 加法、adj_ni 做除法——字符串/bool/null 必须在
+    校验层拒绝（拒绝文案带字段名，retry 才修得动），不是在引擎阶段 TypeError。"""
+    with pytest.raises(ValueError, match=f"{field} 必须是数字"):
+        _validate_judgment(_mk(**{field: bad}), "standard")
+
+
+@pytest.mark.parametrize("field", ["net_cash_note", "adj_note"])
+@pytest.mark.parametrize("bad", [None, "", "  "])
+def test_std_note_fields_must_be_nonempty_str(field, bad):
+    """build_report 直接切片 adj_note[:40]、渲染 net_cash_note——null/空串提前拒
+    （镜像 other_income_note 的既有检查）。"""
+    with pytest.raises(ValueError, match=f"{field} 必填"):
+        _validate_judgment(_mk(**{field: bad}), "standard")
+
+
+def test_std_seg1_share_type_guard():
+    with pytest.raises(ValueError, match="seg1_share"):
+        _validate_judgment(_mk(seg1_share="0.9"), "standard")
+    with pytest.raises(ValueError, match="seg1_share"):
+        _validate_judgment(_mk(seg1_share=True), "standard")
+
+
+# =====================================================================
+# 连续性基准字段集（0017）—— other_income/seg* 曾缺席 prev_core：
+# 8/31 补 other_income_note 的动机正是它的 -33% 跨运行漂移（AMZN），
+# 连续性注入却不带这个字段，漂移从连续性通道原样漏回来。
+# =====================================================================
+
+def test_prev_core_includes_other_income_and_segments():
+    from app.valuation_service import _prev_core
+    prev = dict(_mk(), date="2026-09-01", ticker="AMZN", price=200.0,
+                semantics_version=4, manifest_latest="2026-06-30")
+    core = _prev_core(prev)
+    for k in ("other_income", "other_income_note", "seg1", "seg2", "seg1_share",
+              "date", "adj_ni", "net_cash", "fwd_shares", "scenarios", "rationale"):
+        assert k in core, k
+    # 非基准字段（price/ticker/manifest_latest）不进注入——prompt 里已单独注入现价
+    assert "price" not in core and "ticker" not in core
+
+
+def test_prev_core_filters_absent_keys():
+    """financials 配置没有 other_income/seg*——null 不许冒充『上次的假设』。"""
+    from app.valuation_service import _prev_core
+    prev = {"date": "2026-09-01", "adj_ni": 100.0, "fwd_shares": 1000.0,
+            "scenarios": {}, "rationale": {}}
+    core = _prev_core(prev)
+    assert "other_income" not in core and "seg1" not in core
+    assert "net_cash" not in core          # fin 无该字段，旧写法会注入 null
+    assert None not in core.values()
+
+
+# =====================================================================
+# ADR 比例标定（0018）—— TSLA 实测 adr_multiple=0.8963 原样发货：
+# yfinance 市值隐含股数与 XBRL TTM 加权稀释股数差 10.4%，落在 1±8% snap 外、
+# 整数 snap（>=2）下，于是美股普通票挂上「1 ADR=0.896 普通股」的假口径，
+# shares 被 rebase、带子与每股值口径混掉。真实 ADR 比例只有整数或简单半数。
+# =====================================================================
+
+def _adr(raw):
+    """构造 price/mcap/shares 使 price÷(mcap÷股数) = raw。"""
+    from app.valuation_service import _adr_calibration
+    return _adr_calibration(price=1000.0 * raw, mcap=1e12, shares_ord_m=1000.0)
+
+
+def test_adr_noise_falls_back_to_one_with_mismatch():
+    m, mismatch = _adr(0.8963)
+    assert m == 1.0
+    assert mismatch == pytest.approx(0.1037, abs=1e-4)
+
+
+def test_adr_half_ratio_snaps():
+    assert _adr(0.502) == (0.5, None)
+    assert _adr(0.48) == (0.5, None)
+
+
+def test_adr_integer_snap_preserved():
+    assert _adr(3.03) == (3.0, None)
+    assert _adr(5.02) == (5.0, None)   # TSM 1:5
+
+
+def test_adr_near_one_snap_preserved():
+    assert _adr(1.05) == (1.0, None)
+
+
+def test_adr_noise_upper_side():
+    m, mismatch = _adr(1.30)
+    assert m == 1.0 and mismatch == pytest.approx(0.30)
+
+
+def test_adr_outside_tightened_range_unchanged():
+    # (0, 0.5] 外圈维持原行为：既不 snap 也不回退（收紧范围只有 (0.5, 2)）
+    m, mismatch = _adr(0.30)
+    assert m == pytest.approx(0.30) and mismatch is None
+
+
+def test_adr_zero_mcap_defaults_to_one():
+    from app.valuation_service import _adr_calibration
+    assert _adr_calibration(100.0, 0.0, 1000.0) == (1.0, None)
+
+
+# =====================================================================
+# override 的口径闸（0019）—— TSM 实测：ttm_revenue_override 只换营收基准，
+# TTM cfo/capex 还停在旧 XBRL 窗口（FCF 率 19.6% 旧 vs 25.8% 真），margins
+# 谷底下限（0.4×当前）与上界（1.2×当前）都锚在过期分母上。偏离 >10% 时
+# 校验层改锚历史年度中位（fcf_margin=None 的既有回退路径）。
+# =====================================================================
+
+def test_fcfm_gate_large_deviation_returns_none():
+    from app.valuation_service import _fcfm_for_validation
+    # override 120,000 vs 旧 TTM 100,000 = +20% —— 现金流锚过期，弃用
+    assert _fcfm_for_validation(0.196, 120_000.0, 100_000.0) is None
+
+
+def test_fcfm_gate_small_deviation_passthrough():
+    from app.valuation_service import _fcfm_for_validation
+    # +8% 属正常季度滚动，当前 TTM 照用
+    assert _fcfm_for_validation(0.196, 108_000.0, 100_000.0) == 0.196
+
+
+def test_fcfm_gate_no_override_passthrough():
+    from app.valuation_service import _fcfm_for_validation
+    assert _fcfm_for_validation(0.196, None, 100_000.0) == 0.196
+
+
+def test_fcfm_gate_garbage_override_passthrough():
+    """垃圾 override 不在这里拒——_check_rev_override 负责，闸门不许崩。"""
+    from app.valuation_service import _fcfm_for_validation
+    assert _fcfm_for_validation(0.196, "约 120,000", 100_000.0) == 0.196
+    assert _fcfm_for_validation(0.196, True, 100_000.0) == 0.196
+
+
+def test_fcfm_gate_none_fcfm_stays_none():
+    from app.valuation_service import _fcfm_for_validation
+    assert _fcfm_for_validation(None, 120_000.0, 100_000.0) is None
+
+
+def test_fcfm_gate_wired_into_both_call_sites():
+    """接线哨兵：首轮校验与经济复审两处都必须过这道闸——只改一处，复审通道
+    会拿陈旧锚拒掉合法输出（与 0016 之前的注入/拒收不同源死循环同型）。"""
+    from pathlib import Path as _P
+    src = (_P(__file__).resolve().parent.parent / "app"
+           / "valuation_service.py").read_text(encoding="utf-8")
+    assert src.count("fcf_margin=_fcfm_for_validation(") == 2
+
+
+# =====================================================================
+# 0022 评审修复批
+# =====================================================================
+
+# ---- C2/C12：margins 上界与谷底同步换锚（fcf_margin=None 时退历史中位）----
+
+_HI_MARGINS = dict(bear={"margins": [0.60] * 10}, base={"margins": [0.65] * 10},
+                   bull={"margins": [0.70] * 10})
+
+
+def test_margins_cap_reanchors_to_hist_median_when_gate_fires():
+    """高 FCF 率票（真实中位 0.70）在 override >10% 偏差闸下（fcf_margin=None）：
+    上界改锚 1.2×历史中位=0.84——「维持现状」[0.70]*10 必须放行。修前上界
+    静默塌回 0.65，谷底下限却换了锚，两次 retry 撞同一堵墙后硬失败。"""
+    _validate_judgment(_mk(**_HI_MARGINS), "standard",
+                       fcf_margin=None, hist_fcf_margin=0.70)
+
+
+def test_margins_cap_static_when_hist_absent():
+    """两个锚都不可用：维持既有静态 0.65（不放宽也不收紧）。"""
+    with pytest.raises(ValueError, match="静态 0.65"):
+        _validate_judgment(_mk(**_HI_MARGINS), "standard",
+                           fcf_margin=None, hist_fcf_margin=None)
+
+
+def test_margins_cap_rejection_names_hist_anchor():
+    """拒绝文案点名上界锚（C12）：自愿 override 的换锚在 prompt 期不可知，
+    retry 只能从拒绝文案得知本次上界是怎么来的。"""
+    d = _mk(bear={"margins": [0.60] * 10}, base={"margins": [0.65] * 10},
+            bull={"margins": [0.90] * 10})   # > 1.2×0.70=0.84
+    with pytest.raises(ValueError, match="上界锚=历史年度 FCF 利润率中位"):
+        _validate_judgment(d, "standard", fcf_margin=None, hist_fcf_margin=0.70)
+
+
+def test_margins_cap_negative_fcfm_stays_static():
+    """烧钱标的（TTM FCF<0）不换锚：prompt 契约明写「<=0 固定 0.65」——
+    换锚只对 None（口径闸/缺 facts）生效。"""
+    with pytest.raises(ValueError, match="静态 0.65"):
+        _validate_judgment(_mk(**_HI_MARGINS), "standard",
+                           fcf_margin=-0.48, hist_fcf_margin=0.70)
+
+
+def test_margins_cap_positive_fcfm_unchanged():
+    """TTM 锚可用时行为不变：1.2×0.85 钳到 0.9。"""
+    hi = dict(bear={"margins": [0.35] * 10}, base={"margins": [0.40] * 10},
+              bull={"margins": [0.5] * 9 + [0.9]})
+    _validate_judgment(_mk(**hi), "standard", fcf_margin=0.85)
+
+
+# ---- C3：亏损协议强制 0 的 m1/m2 不进反双重计数 ----
+
+def test_split_shape_forced_zero_m_not_double_count():
+    """0013 的 split 形态（营业亏损+大额利息收入→税前为正）：m1/m2 被亏损协议
+    钉死为 0、pe 照常规边界给。情景盈利收缩到 50% 时，反双重计数不得再命令
+    「请上调 bear.m1」——上调立刻被「营业利润为负，m1/m2 必须写 0」拒绝，
+    诚实配置无解、两次 retry 烧光后硬失败（0013 自己的契约测试恰好用了
+    other_income=1000 让收缩停在 20% 以内，漏掉了这个死锁）。"""
+    d = _mk(other_income=200.0,
+            bear={"opm": -0.05, "pe": 8, "m1": 0, "m2": 0})
+    # bear eps=(950×−0.05+200)×0.9=137.25 vs base=(1050×0.10+200)×0.9=274.5 → 50%
+    _validate_judgment(d, "standard", rev0=1000.0)
+
+
+def test_bull_side_skips_base_forced_zero_m1():
+    """base 被强制 m1=0 时，bull 的正 m1 > 1.4×0 恒真——比例检查对被协议钉死
+    的基准没有意义，跳过；pe 未被强制，照常执法。"""
+    d = _mk(other_income=300.0,
+            bear={"opm": -0.10, "pe": 8, "m1": 0, "m2": 0},
+            base={"opm": -0.05, "pe": 9, "m1": 0, "m2": 0},
+            bull={"pe": 12, "m1": 15})
+    _validate_judgment(d, "standard", rev0=1000.0)
+
+
+def test_true_multiple_collapse_still_rejected():
+    """守恒检查：bear 营业利润为正（m1 不被协议强制）时，盈利收缩叠加倍数塌方
+    照旧是双重计数。"""
+    with pytest.raises(ValueError, match="bear 双重计数"):
+        _validate_judgment(_mk(bear={"m1": 5}), "standard", rev0=1000.0)
+
+
+# ---- C5：纯或有 ppce 的 info 行不得谎称「已确认计入」----
+
+_CONTINGENT = {"date": "2026-08-15", "kind": "担保或有", "amount_musd": 0.0,
+               "note": "10-Q 承诺与或有"}
+
+
+def test_ppce_contingent_only_no_false_confirmation():
+    """material 全空时 all([]) 空真——旧 info 行谎称「已声明并逐笔确认计入
+    net_cash」，而事件根本没有确认字段、也无现金可对账。"""
+    (lv, msg), = vintage_warnings(
+        _cfg(post_period_capital_events=[_CONTINGENT]), _vt(age=64))
+    assert lv == "info"
+    assert "无现金可对账" in msg and "担保或有" in msg
+    assert "已声明并逐笔确认计入" not in msg
+
+
+def test_ppce_contingent_only_explicit_false_still_honest():
+    """更强形态：显式 reflected_in_net_cash=false 也曾被空真说成「已确认」。"""
+    ev = dict(_CONTINGENT, reflected_in_net_cash=False)
+    (lv, msg), = vintage_warnings(_cfg(post_period_capital_events=[ev]), _vt(age=64))
+    assert lv == "info" and "逐笔确认" not in msg
+
+
+def test_ppce_contingent_only_note_appended():
+    (_, msg), = vintage_warnings(
+        _cfg(post_period_capital_events=[_CONTINGENT],
+             ppce_note="担保上限 $105B，无现金流"), _vt(age=64))
+    assert "担保上限" in msg
+
+
+def test_ppce_mixed_contingent_and_confirmed_unchanged():
+    """混合清单（或有 + 已确认的有金额事件）仍走既有 info 措辞——C5 只改纯或有。"""
+    evs = [_CONTINGENT,
+           dict(EVENT, net_cash_impact_musd=19700.0, reflected_in_net_cash=True)]
+    (lv, msg), = vintage_warnings(_cfg(post_period_capital_events=evs), _vt(age=64))
+    assert lv == "info" and "已声明并逐笔确认计入" in msg
+
+
+# ---- C6：fin（无 net_cash 的 cfg）的补救指令不得指向 fin schema 没有的字段 ----
+
+def _fin_cfg_min(fwd_shares):
+    # fin cfg 没有 net_cash 键——vintage_warnings 以此判定 bs_name=TBV
+    return {"shares": 1000.0, "fwd_shares": fwd_shares, "mcap": 10000.0}
+
+
+def test_fin_mismatch_tail_points_to_notes_and_tbv():
+    """时点不一致条（增发形态）：fin 的补救不指 net_cash、不叫填 fin schema 里
+    不存在的 post_period_capital_events——改指 notes 与 TBV 口径。"""
+    (_, msg), = vintage_warnings(_fin_cfg_min(1050.0), _vt(age=60))
+    assert "时点不一致" in msg and "未计入 TBV" in msg
+    assert "net_cash" not in msg
+    assert "notes 里" in msg and "TBV 是否已反映最终值" in msg
+
+
+def test_std_mismatch_tail_verbatim_unchanged():
+    (_, msg), = vintage_warnings(_cfg(fwd_shares=1050.0), _vt(age=60))
+    assert msg.endswith("请在 post_period_capital_events 里声明并让 net_cash 反映最终值")
+
+
+def test_fin_age_tail_does_not_ask_to_fill_ppce():
+    """纯时效条（股数差 0.5% 不触发机械检查）：fin 不叫「填写」ppce，改指 notes。"""
+    (_, msg), = vintage_warnings(_fin_cfg_min(1005.0), _vt(age=60))
+    assert "报告期末已 60 天" in msg
+    assert "net_cash" not in msg and "notes 里说明" in msg
+
+
+def test_std_age_tail_verbatim_unchanged():
+    (_, msg), = vintage_warnings(_cfg(), _vt(age=60))
+    assert "期后资本事件未声明，请核对增发/回购/并购/分拆/分红后填写" in msg

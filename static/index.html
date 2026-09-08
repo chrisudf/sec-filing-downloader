@@ -132,6 +132,9 @@
   .status.err { color: var(--err); }
   .status.ok { color: var(--ok); }
   .status.busy { color: var(--muted); }
+  /* regime 失效红线（engine trading_range.regime_note）：完成态里唯一的红字，
+     必须与绿色的 ok 行拉开——区间数字照出，但均值回归前提可能已失效 */
+  .status .regime-note { color: var(--err); }
   /* 状态区里的行内动作按钮（登录/重试）——不抢主按钮的视觉权重 */
   .inline-act {
     display: inline-block; margin: 8px 8px 0 0; padding: 6px 12px;
@@ -444,6 +447,10 @@ async function runValuation() {
               trTxt += `，中位涨幅 ${(tr.mult_reversion * 100).toFixed(0)}% 是纯倍数差距（同一 base EPS 下）`;
             }
           }
+        } else if (st.trading_range_note) {
+          // 区间缺席原因（0008 的载荷字段，此前网页端从未渲染）：为什么没有区间
+          //（fin 模式/带子缺失/覆盖不足/PE 腿 n.m.）必须跟着缺席出现，不许留白
+          trTxt = `；交易区间：无——${st.trading_range_note}`;
         }
         const resultRes = await fetch(`/api/valuation/${job_id}/result`);
         if (!resultRes.ok) throw new Error(`下载报告失败（HTTP ${resultRes.status}）`);
@@ -453,7 +460,16 @@ async function runValuation() {
         a.download = `${ticker}_valuation_bundle.zip`;
         a.click();
         URL.revokeObjectURL(a.href);
-        setValStatus("ok", `完成！综合目标价：${parts.join("， ")}${trTxt}。已下载 zip（报告+财报+假设留档）`);
+        const doneEl = setValStatus("ok", `完成！综合目标价：${parts.join("， ")}${trTxt}。已下载 zip（报告+财报+假设留档）`);
+        // regime 失效红线（0010）：区间数字照出，但均值回归前提可能已失效——
+        // xlsx 红旗区有这条（build_report ⛔ 行），网页一行摘要不给就是把已被
+        // 引擎标记失效的区间当健康区间展示（ISRG 型）。textContent，不当 HTML 解析
+        if (tr && tr.regime_note) {
+          const rn = document.createElement("div");
+          rn.className = "hint regime-note";
+          rn.textContent = `⛔ ${tr.regime_note}`;
+          doneEl.appendChild(rn);
+        }
         break;
       }
       setValStatus("busy", st.step_label || st.step);

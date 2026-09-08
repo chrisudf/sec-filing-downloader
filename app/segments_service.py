@@ -270,6 +270,13 @@ async def segments(
     if skipped:
         warning = (f"{len(skipped)} 份申报缺 XBRL instance 已跳过"
                    f"（{skipped[0][0]} 等），对应期间可能缺柱")
+    # 白名单外的 iXBRL transform 丢弃计数同样如实上浮：注册表演进时
+    # 这是「柱在但可能缺数」的唯一可见信号
+    dropped = data.get("dropped_transforms") or {}
+    if dropped:
+        note = (f"{sum(dropped.values())} 个数值事实因未识别的 iXBRL transform"
+                f"（{'/'.join(sorted(dropped))}）被丢弃，相关期间可能缺数")
+        warning = f"{warning}；{note}" if warning else note
     return {"ticker": ticker, "name": info.get("name") or "",
             "freq": freq, "years": years, "axes": axes,
             "concentration": concentration, "warning": warning}
