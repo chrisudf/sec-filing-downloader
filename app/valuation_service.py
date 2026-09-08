@@ -29,6 +29,10 @@ from pydantic import BaseModel
 from . import edgar
 
 ROOT = Path(__file__).resolve().parent.parent
+if str(ROOT) not in sys.path:
+    sys.path.insert(0, str(ROOT))
+from valuation.fetch_segments import build_segments  # noqa: E402 —— 同 segments_service 的摆法
+
 VAL = ROOT / "valuation"
 JOBS = ROOT / "jobs"
 # 连续性锚存放处（v2）——不能放 jobs/：_cleanup_jobs 按 mtime rmtree，锚活不过 3 天
@@ -189,7 +193,8 @@ def _validate_judgment(d: dict, mode: str = "standard",
                        rev0: float | None = None,
                        fcf_margin: float | None = None,
                        band: dict | None = None,
-                       hist_fcf_margin: float | None = None) -> None:
+                       hist_fcf_margin: float | None = None,
+                       seg_facts: dict | None = None) -> None:
     """LLM 输出的硬校验：结构、边界、margins 长度。不合格直接拒绝重试。
 
     v2（semantics_version=2, 2026-07-22）新增：
@@ -284,6 +289,9 @@ def _validate_judgment(d: dict, mode: str = "standard",
             raise ValueError(f"rationale 缺少 {k}")
     if not isinstance(d["notes"], list) or not d["notes"]:
         raise ValueError("notes 必须是非空数组")
+    # 分部对照闸（0023）：放在 rationale 结构校验之后——本闸的出路就是让判断层
+    # 往 rationale.sotp 里写理由，rationale 还不是 dict 时先报那个更根本的错
+    _check_seg1_share(d, seg_facts)
     _check_rev_override(d)
     # pe 下限的 band 证据放行：锚纪律命令 base 默认锚子窗 P50，而历史 P50×1.15 < 8
     # 的低倍数票（汽车/能源类，GM/F 历史 NTM P50 约 4.5~7）上，[8,60] 静态下限与锚
@@ -1234,6 +1242,107 @@ def _postperiod_filing_index(rows: list[dict], periodic_end: str, cap: int = 30)
     return head + "\n" + "\n".join(lines)
 
 
+# SOTP 降级线：必须与 engine.py 的 SOTP_SEG1_CAP 逐位一致（seg1_share >= 它就把
+# SOTP 腿踢出综合）。两处各写一份会让"校验层放行的 config 在引擎里静默关腿"，
+# test_seg_crosscheck 从 engine 源码里抠出常量把两边钉在一起。
+SOTP_SEG1_CAP = 0.85
+
+
+def _segment_facts(seg: dict | None) -> dict | None:
+    """segments payload -> 最新一期分部营收结构。纯函数（可直接单测）。
+
+    取 axes.segment 里最新的那一期（优先季度，缺则年度）。返回 None 表示
+    "没有可用的分部申报"——单一分部发行人与取数失败都归到这里，两者对下游的
+    处置相同：没有对照物就不判罚（不能拿缺数当证据反过来指控判断层）。
+    """
+    axis = ((seg or {}).get("axes") or {}).get("segment") or {}
+    for freq in ("quarterly", "annual"):
+        rows = axis.get(freq) or {}
+        if not rows:
+            continue
+        k = max(rows)
+        members = {m: v for m, v in ((rows[k].get("members") or {}).items())
+                   if _isnum(v) and v > 0}
+        # 单成员不算分部结构（有些发行人只标一个 member 占位）
+        if len(members) < 2:
+            continue
+        total = sum(members.values())
+        if not total:
+            continue
+        return {"period": k, "freq": freq, "total": total, "n": len(members),
+                "top_share": max(members.values()) / total,
+                "members": sorted(members.items(), key=lambda x: -x[1])}
+    return None
+
+
+def _seg_label(m: str) -> str:
+    """XBRL 分部成员名 -> 可读标签：剥 Member 后缀 + 驼峰拆词。只做展示层美化，
+    原 token 一并给出——判断层要能拿它回财报里核对。"""
+    s = re.sub(r"(Segment)?Member$", "", str(m))
+    return re.sub(r"(?<=[a-z])(?=[A-Z])", " ", s) or str(m)
+
+
+def _segment_lines(sf: dict | None) -> str:
+    """分部事实 -> 注入 prompt 的块。纯函数。
+
+    判断层此前只能从 SECTIONS 正文里翻分部表，而 seg1_share >= 0.85 会让引擎把
+    SOTP 腿降级为参考项——「本公司是单一业务」这一句自我声明就能悄悄关掉一整条
+    估值腿，校验层还只查 0<=x<=1。MSFT 2026-09-08 实测正是这个形态：判断层给
+    seg1="Microsoft 整体（软件/云一体化）"、seg1_share=1.0、rationale 里零理由，
+    而发行人自己按三个分部申报（Intelligent Cloud 43.7% / Productivity 42.0% /
+    More Personal Computing 14.3%）。修法与 PE 锚同构：先注入发行人自己申报的
+    事实，再要求偏离给证据。
+    """
+    if not sf:
+        return ("# 分部（发行人 XBRL 申报）\n"
+                "本票无可用的分部营收申报（单一分部发行人，或分部数据取数失败）"
+                "——seg1/seg2/seg1_share 按 SECTIONS 的分部表判断\n\n")
+    lines = [f"# 分部（发行人 XBRL 申报，{sf['period']} "
+             f"{'季度' if sf['freq'] == 'quarterly' else '年度'}营收，$M）",
+             f"发行人自己按 {sf['n']} 个分部申报，营收占比："]
+    for m, v in sf["members"]:
+        lines.append(f"  {_seg_label(m)} [{m}]: {v / 1e6:,.0f}  {v / sf['total']:.1%}")
+    lines.append(f"  ← 最大分部营收占比 {sf['top_share']:.1%}。**这是营收口径**，而 "
+                 "seg1_share 要的是**营业利润**占比——两者可以显著不同（低利润率"
+                 "分部拉低利润占比是常态），所以这张表是参照不是答案。")
+    if sf["top_share"] < SOTP_SEG1_CAP:
+        lines.append(
+            f"  ⚠ 发行人按多分部申报且最大分部营收占比 {sf['top_share']:.1%} < "
+            f"{SOTP_SEG1_CAP:.0%}。若你仍给出 seg1_share >= {SOTP_SEG1_CAP:.0%}"
+            "（这会让引擎把 SOTP 腿降级为参考项、整条腿退出综合），**必须在 "
+            "rationale.sotp 里写明利润为何比营收更集中**（分部营业利润率差异、"
+            "总部费用分摊口径等，给财报出处）——无理由的高集中度声明会被校验层拒收。")
+    return "\n".join(lines) + "\n\n"
+
+
+def _check_seg1_share(d: dict, sf: dict | None) -> None:
+    """seg1_share 与发行人 XBRL 分部申报的对照闸（0023）。
+
+    只拦一种形态：发行人按多分部申报、最大分部营收占比低于 SOTP 降级线，而判断层
+    声明 seg1_share >= 降级线且**不给任何理由**——此时 SOTP 腿被静默踢出综合，
+    而校验层原先只查 0<=x<=1，一个字的证据都不要。
+
+    不做数值等式检查：seg1_share 是营业利润占比、这张表是营收占比，两者合法地不同
+    （MSFT 的 More Personal Computing 利润率远低于 Intelligent Cloud）。要的是
+    **理由**，不是逼判断层去对齐一个口径不同的数。反方向（声明的集中度显著低于
+    营收集中度）不拦——那只会让 SOTP 留在综合里，多一条腿是保守方向，由引擎的
+    黄旗呈现即可。
+    """
+    if not sf or sf["top_share"] >= SOTP_SEG1_CAP or d["seg1_share"] < SOTP_SEG1_CAP:
+        return
+    if str((d.get("rationale") or {}).get("sotp") or "").strip():
+        return
+    raise ValueError(
+        f"seg1_share={d['seg1_share']:.0%} >= {SOTP_SEG1_CAP:.0%} 会把 SOTP 腿降级为"
+        f"参考项（退出综合），但发行人按 {sf['n']} 个分部申报、最大分部营收占比只有 "
+        f"{sf['top_share']:.1%}（{sf['period']}）："
+        + "、".join(f"{_seg_label(m)} {v / sf['total']:.0%}"
+                    for m, v in sf["members"][:4])
+        + "。利润集中度高于营收集中度是可能的，但必须在 rationale.sotp 里写明依据"
+          "（分部营业利润率差异、总部费用分摊口径等，给财报出处）；"
+          "否则请按实际分部结构给 seg1_share 与 seg2。")
+
+
 # 连续性基准注入的字段集（0017）：假设 + 事实类锚。other_income/other_income_note
 # 与 seg1/seg2/seg1_share 曾缺席——8/31 补 other_income_note 的动机正是 AMZN 同日
 # 同输入两次运行 other_income 漂 -33%，而连续性注入偏偏不带这个字段：判断层看不到
@@ -1348,6 +1457,17 @@ async def _pipeline(job: dict, ticker: str, email: str) -> None:
         except Exception as e:  # noqa: BLE001 —— 线索取不到要说清原因，但不许杀任务
             filing_idx = (f"期后 filing 索引不可用（{type(e).__name__}: {e}），"
                           "按 MANIFEST 与 SECTIONS 摘录判断")
+    # 分部申报（0023）：judgment 此前凭 SECTIONS 正文自拍 seg1_share，而它 >=0.85
+    # 就会把 SOTP 腿踢出综合——注入发行人自己的分部营收结构当对照物。与 filing 索引
+    # 同规格的降级：取不到就是 None（判断层照旧按 SECTIONS 判断、校验层不判罚），
+    # 绝不连累估值任务。超时兜底：SEC 卡住不能拖死唯一的任务槽
+    seg_facts = None
+    try:
+        seg_facts = _segment_facts(await asyncio.wait_for(
+            asyncio.to_thread(build_segments, ticker, email, info["cik"], 3),
+            timeout=240))
+    except Exception as e:  # noqa: BLE001 —— 对照物缺失只降级为"不查"，不杀任务
+        job["detail"] = f"分部对照不可用（{type(e).__name__}: {e!r:.80}），本次不做 seg1_share 对照"
 
     job["step"] = "sections"
     await _run([PY, str(VAL / "extract_sections.py"), str(wd / "sections.json"), *htms], wd)
@@ -1508,7 +1628,10 @@ async def _pipeline(job: dict, ticker: str, email: str) -> None:
               f"# FACTS（SEC XBRL）\n{_compact_facts(facts)}\n\n"
               f"# MANIFEST（本次分析的财报文件）\n{manifest}\n\n"
               f"{filing_meta}"
-              f"# SECTIONS（财报关键章节摘录 JSON）\n{sections}{prev_section}\n")
+              # 分部对照（0023）紧邻 SECTIONS：判断层做 seg1/seg2/seg1_share 时
+              # 两边要能对照着看——发行人的 XBRL 申报 vs 财报正文的分部表
+              + (_segment_lines(seg_facts) if mode == "standard" else "")
+              + f"# SECTIONS（财报关键章节摘录 JSON）\n{sections}{prev_section}\n")
     # v2 一致性规则的事实输入：情景 EPS 用的营收基准与 TTM FCF 利润率
     rev0_m = ttm["revenue"]["value"] / 1e6
     fcfm = None
@@ -1539,7 +1662,10 @@ async def _pipeline(job: dict, ticker: str, email: str) -> None:
                                fcf_margin=_fcfm_for_validation(
                                    fcfm, judgment.get("ttm_revenue_override"), rev0_m),
                                band=facts.get("pe_band"),
-                               hist_fcf_margin=hist_fcfm)
+                               hist_fcf_margin=hist_fcfm,
+                               # 分部对照闸（0023）：两个调用点同源，复审换了
+                               # seg1_share 也要按同一条规矩重查
+                               seg_facts=seg_facts)
             # 陈旧 XBRL（外国发行人 6-K 无季度框架）下，没有原文重锚的 TTM 会让
             # 全部情景锚在多年前的营收基准上——硬性要求判断层给 override。
             # PENDING_10Q（业绩 8-K 已出、10-Q 未交）同理：不重锚等于用上季度
@@ -1588,6 +1714,11 @@ async def _pipeline(job: dict, ticker: str, email: str) -> None:
                  # 覆盖的季度（fwd_window 已 +3 个月），否则这次运行会归进旧
                  # report_end 的格子，趋势视图把"最新业绩下的估值"错当旧季度样本
                  pending_10q=bool(pending_8k))
+        # 发行人分部营收集中度（0023）：引擎据此对 seg1_share 的利润集中度声明
+        # 打全局黄旗。同 share_count_mismatch 的摆法——只在拿到对照物时写键
+        if seg_facts:
+            c["segment_revenue_share"] = round(seg_facts["top_share"], 4)
+            c["segment_count"] = seg_facts["n"]
         # ADR 标定回退（0018）留下的股数口径失配：引擎据此打全局黄旗。只在失配时
         # 写键——不给历史 config 无端加一个恒 null 字段
         if adr_mismatch is not None:
@@ -1645,7 +1776,10 @@ async def _pipeline(job: dict, ticker: str, email: str) -> None:
                                fcf_margin=_fcfm_for_validation(
                                    fcfm, revised.get("ttm_revenue_override"), rev0_m),
                                band=facts.get("pe_band"),
-                               hist_fcf_margin=hist_fcfm)
+                               hist_fcf_margin=hist_fcfm,
+                               # 分部对照闸（0023）：两个调用点同源，复审换了
+                               # seg1_share 也要按同一条规矩重查
+                               seg_facts=seg_facts)
             # 陈旧 XBRL / PENDING_10Q 的强制 override 在复审通道同样成立——revised
             # 整体替换 judgment，若复审输出丢掉 override，全部情景会锚回旧营收基准
             if ((stale_days > 550 or pending_8k)

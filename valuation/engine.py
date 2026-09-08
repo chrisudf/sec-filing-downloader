@@ -362,6 +362,36 @@ def other_income_crosscheck(facts, other_income, eps1, fwd_shares,
              "差额来自一次性项目属正常——引擎不自动采纳原始行（股权重估/衍生品"
              "重估/减值常混在这一行里），但 other_income_note 必须能解释它"]]
 
+
+def seg_share_crosscheck(seg1_share, seg_rev_share, n_seg, sotp_in_blend,
+                         gate=0.25):
+    """seg1_share（判断层的利润集中度）vs 发行人 XBRL 分部营收集中度 -> [[lv, msg]]。
+
+    呈现层的对照（0023）。校验层（valuation_service._check_seg1_share）只拦
+    「关掉 SOTP 腿又不给理由」这一种形态，其余偏离一律放行——利润集中度本来就
+    可以显著高于/低于营收集中度。但放行不等于不说：两个口径差多少、SOTP 腿因此
+    在不在综合里，读者必须能在报表上看见，否则「这票为什么只有两条腿」无处可查。
+
+    分两档措辞：SOTP 已被降级时点明「整条腿退出综合」（这是有后果的那一种），
+    否则只作口径提示。缺对照物（单一分部发行人 / 分部取数失败）时不出旗——
+    没有对照就没有对照结论。
+    """
+    if not _isnum(seg1_share) or not _isnum(seg_rev_share) or not n_seg:
+        return []
+    gap = seg1_share - seg_rev_share
+    if abs(gap) < gate:
+        return []
+    head = (f"分部口径差 {gap:+.0%}：判断层给的主分部**利润**占比 {seg1_share:.0%}，"
+            f"而发行人按 {n_seg} 个分部申报的主分部**营收**占比是 {seg_rev_share:.0%}")
+    if not sotp_in_blend:
+        return [["yellow", head + f"——因 seg1_share >= {SOTP_SEG1_CAP:.0%}，"
+                                  "SOTP 腿已降级为参考项、**整条腿退出综合**"
+                                  "（综合 = PE/DCF 两法）。利润比营收更集中是可能的，"
+                                  "依据见 rationale.sotp"]]
+    return [["yellow", head + "——两个口径不同（低利润率分部拉低利润占比是常态），"
+                              "SOTP 腿照常入综合；此处只作口径提示"]]
+
+
 def hist_fcf_margins(facts):
     """历年 FCF 利润率（年度 CFO−capex / 营收）-> [(财年末, 利润率), ...] 按年排序。
 
@@ -1024,6 +1054,9 @@ if cfg.get("share_count_mismatch"):
         ["yellow", f"市值隐含股数与 XBRL 稀释股数差 {cfg['share_count_mismatch']:.1%}"
                    "——两侧口径不一致（yfinance 市值 vs XBRL 加权稀释股数），"
                    "net_cash/每股值按 XBRL 股数口径"])
+out["warnings_global"] += seg_share_crosscheck(
+    cfg.get("seg1_share"), cfg.get("segment_revenue_share"),
+    cfg.get("segment_count"), sotp_in_blend)
 out["scenarios"]["base"]["warnings"] += other_income_crosscheck(
     facts, cfg["other_income"], out["scenarios"]["base"]["eps1"], cfg["fwd_shares"])
 
