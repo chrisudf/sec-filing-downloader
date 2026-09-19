@@ -59,12 +59,24 @@
 |---|---|
 | 判断层 | opm 可为负；该情景 NTM 税前为负 → `tax = 0`、`pe = 0`；NTM 营业利润为负 → `m1 = m2 = 0`（prompt 已写明，校验层强制） |
 | 校验层 | 亏损情景跳过 pe/m1/m2 的常规区间与反双重计数（倍数按规定为 0，否则每次必误报） |
-| 引擎 | 近零利润守卫（`eps1<=0` 或 `opm<2%`）剔 PE 腿、`op1<=0` 剔 SOTP 腿，记入 `scenarios[*].blend_methods`；综合退化为 DCF；`fwd_pe = null`；跳过历史 PE 带比对；base PE 腿 n.m. 时不出「价值交易区间」块（改指向 P/S 参考）；每条被剔的腿打一条 🟡 |
+| 引擎 | 近零利润守卫（`eps1<=0` 或 `opm<2%`）剔 PE 腿、`op1<=0` 剔 SOTP 腿、`dcf_nm_check` 剔 DCF 腿（TTM FCF <= 2% 营收 / `dcf_ps<=0` / 显式期现值非正），记入 `scenarios[*].blend_methods`；`fwd_pe = null`；跳过历史 PE 带比对；base PE 腿 n.m. 时不出「价值交易区间」块（改指向 P/S 参考）；每条被剔的腿打一条 🟡 |
 | 报告 | 「综合目标价」公式**按情景**只取 `blend_methods` 对应单元格（不再是整表一个 range），A25 注明逐档口径；Forward PE / PEG / EV-EBIT 在分母为负时显示 `n.m.` 而不是负数 |
 
-含义：这类标的的目标价**全部重量在 DCF**，对 g0/gN 与 margins 路径极敏感，
+含义：亏损标的的目标价重量压在剩下的腿上，对 g0/gN 与 margins 路径极敏感，
 且必然伴随「终值占 EV > 75%」红旗——这是事实而非缺陷，读报告时以红旗区为主。
 DCF 腿本身也算出 <=0 时会打 red 打回判断层（综合已无有效支撑腿）。
+
+**0023 起 DCF 腿不再是兜底腿。** 此前 `"dcf"` 在 `blend_methods` 里硬编码恒在，
+是三条腿里唯一没有 n.m. 通道的——对 TTM FCF 为负的发行人恰好反了：现金流锚都
+没有的那条腿拿满额投票权。AMZN 2026-09-19 实测三档 DCF 腿 73.6/159.6/257.9，把
+base 综合从 PE 腿的 256.6（= 自身交易区间中位 257.5）拖到 201.8（−20%）。
+闸门只用**不可被假设层反向调节**的判据（reported TTM FCF / dcf_ps 符号 /
+显式期现值符号）——刻意不含 `tv_pv_share > 0.75`，那个量由 margins 路径决定、
+已有 red 通道，再叠一道 n.m. 等于双重处罚，也会给判断层"调 margins 换投票权"
+的激励。同日 META（FCF 率 18%）三档输出逐位不变，闸门不误伤。
+
+三条腿全 n.m. 时综合退回 DCF 单腿**仅为占位**并打 red：让"无腿可用"显式失败
+一次，好过静默 `None` 流进 Excel 公式与 compare/trend。
 
 ---
 
@@ -107,7 +119,7 @@ yellow 级只在摘要红旗区展示。**红旗不阻断出报告，但会阻�
 | 旋钮 | 现值 | 位置 | 什么时候调 |
 |---|---|---|---|
 | `VALUATION_MODEL` | **opus**（v2 起的默认） | `_claude()` | sonnet 同输入 4 次采样 base 全距 25.7%，opus CV≈3.5%。判断层是全链智力瓶颈，不建议为省额度换回；赶时间可临时 `VALUATION_MODEL=sonnet` |
-| `VALUATION_BLEND_W_PE`/`_DCF`/`_SOTP`/`_PTBV` | 全 1（等权 = 历史行为逐位不变） | `engine.py` BLEND_W | ★数字须按自己的纪律定。「95% 用倍数」的立场可加 PE 腿权重，但 DCF 腿的红旗（终值占比/tv_pv）不受权重影响照常工作。改权重=改口径：权重进 valuation.json/Excel 公式，compare 会警、trend 按权重签名隔离分组——先有 house view 再动，别当采样旋钮 |
+| `VALUATION_BLEND_W_PE`/`_DCF`/`_SOTP`/`_PTBV` | 全 1（等权 = 历史行为逐位不变；权重只作用于**通过 n.m. 闸的腿**） | `engine.py` BLEND_W | ★数字须按自己的纪律定。「95% 用倍数」的立场可加 PE 腿权重，但 DCF 腿的红旗（终值占比/tv_pv）不受权重影响照常工作。改权重=改口径：权重进 valuation.json/Excel 公式，compare 会警、trend 按权重签名隔离分组——先有 house view 再动，别当采样旋钮 |
 | `CLAUDE_TIMEOUT` | 600s | 模块常量 `CLAUDE_TIMEOUT` | opus 在 ~45k 字符 prompt 上更慢。超时会让整个任务报废 |
 | 单次运行总调用 | ≤ 3（首次 + schema retry 1 + 经济复审 1） | — | 刻意不做"拒绝就重采样"的循环——硬 gate 循环会教模型贴边过关，制造边界聚集偏差 |
 | 章节预算 | 45k 总量，按文件平分；fact 通道优先于 risk | `extract_sections.py` | 判断层 notes 反复说"摘录未含 XX"时加预算（代价=更长 prompt）。极端关键词密集的文档理论上会把 risk 通道挤空，真实 NVDA 10-K/10-Q 实测 risk 仍拿到 3+4 条 |

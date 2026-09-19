@@ -738,9 +738,9 @@ for label, ac, key, dcf_f, sotp_f in scen_rows:
     _pairs = [(m, c_) for m, c_ in (("pe", "B"), ("dcf", "C"), ("sotp", "D")) if m in _bm]
     _cells = [f"{c_}{r}" for _, c_ in _pairs]
     # 注释要如实说出哪条腿缺席：亏损情景 SOTP 腿也会被剔（op1<=0），只写"PE 腿"
-    # 会让读表的人对不上 E 列公式
-    _gone = [n_ for m, n_ in (("pe", "PE 法"), ("sotp", "SOTP")) if m not in _bm
-             and (m != "sotp" or _sotp_in)]
+    # 会让读表的人对不上 E 列公式。DCF 腿自 0023 起同样有 n.m. 通道（无现金流锚）
+    _gone = [n_ for m, n_ in (("pe", "PE 法"), ("dcf", "DCF"), ("sotp", "SOTP"))
+             if m not in _bm and (m != "sotp" or _sotp_in)]
     if _gone:
         _nm_rows.append(f"{label} 的 {'/'.join(_gone)}")
     # 权重非默认时综合=显式加权公式（与引擎 BLEND_W 同构），默认等权保持 AVERAGE
@@ -770,13 +770,21 @@ if not _sotp_in:
     _note25 += f"；SOTP 不入综合（主分部利润占比 {d['meta']['seg1_share']:.0%} >= 85%，与 PE 法为同一笔盈利）"
 if _nm_rows:
     _note25 += ("；" + "、".join(_nm_rows)
-                + " n.m. 不入综合（近零/负利润守卫，综合口径逐档不同，见红旗区 P/S 参考）")
+                + " n.m. 不入综合（近零/负利润守卫、或 DCF 无现金流锚，"
+                  "综合口径逐档不同，见红旗区）")
 put(ws, "A25", _note25, GREEN, border=False)
 _mth = "三法" if _sotp_in else "PE/DCF 两法"
-_spread = " / ".join(f"{sc} {d['scenarios'][sc].get('method_spread') or '—'}x"
-                     for sc in ("bear", "base", "bull"))
-put(ws, "A26", f"方法离散度（同情景{_mth} max/min）：{_spread}——离散大说明各法分歧大，"
-               "综合目标价可信度降低，应分别看各法并参考反向 DCF", GREEN, border=False)
+# 离散度后面跟上参与综合的腿区间（0023）：只报一个 max/min 比值，读者还是会把
+# E 列那个点估计当精度读
+_spread = " / ".join(
+    f"{sc} {d['scenarios'][sc].get('method_spread') or '—'}x"
+    + (f"（{d['scenarios'][sc]['blend_range'][0]:.1f}~"
+       f"{d['scenarios'][sc]['blend_range'][1]:.1f}）"
+       if d["scenarios"][sc].get("blend_range") else "")
+    for sc in ("bear", "base", "bull"))
+put(ws, "A26", f"方法离散度（同情景{_mth} max/min，括号内为参与综合的腿区间）：{_spread}"
+               "——离散大说明各法分歧大，综合目标价可信度降低，"
+               "应分别看各法并参考反向 DCF", GREEN, border=False)
 
 # 价值交易区间：历史已实现 NTM PE 分位 × base 前瞻 EPS——与上方三情景互为对照
 # （情景=基本面情景各自的公允价，bear 是 EPS↓×PE↓ 双压；这块回答「按该票自己的

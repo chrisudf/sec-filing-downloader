@@ -22,10 +22,11 @@ _SEG = [ast.get_source_segment(_SRC, n) for n in ast.parse(_SRC).body
         and n.name in ("_isnum", "vintage_warnings", "band_lag_warnings",
                        "other_income_crosscheck", "hist_fcf_margins",
                        "terminal_margin_warnings", "terminal_sensitivity",
-                       "dcf", "dcf_diag_warnings", "ps_reference")]
+                       "dcf", "dcf_diag_warnings", "ps_reference",
+                       "dcf_nm_check", "leg_multiple_crosscheck", "blend_legs")]
 # _isnum 是这些函数共用的模块级谓词（排除 bool），必须一起抽——
 # 否则 exec 出来的命名空间里没有它，全部 NameError
-assert len(_SEG) == 10, _SEG
+assert len(_SEG) == 13, _SEG
 _NS = {}
 exec(chr(10).join(_SEG), _NS)
 _isnum = _NS["_isnum"]
@@ -38,6 +39,9 @@ terminal_sensitivity = _NS["terminal_sensitivity"]
 dcf = _NS["dcf"]
 dcf_diag_warnings = _NS["dcf_diag_warnings"]
 ps_reference = _NS["ps_reference"]
+dcf_nm_check = _NS["dcf_nm_check"]
+leg_multiple_crosscheck = _NS["leg_multiple_crosscheck"]
+blend_legs = _NS["blend_legs"]
 
 
 def _mk(**over):
@@ -1370,3 +1374,106 @@ def test_fin_age_tail_does_not_ask_to_fill_ppce():
 def test_std_age_tail_verbatim_unchanged():
     (_, msg), = vintage_warnings(_cfg(), _vt(age=60))
     assert "期后资本事件未声明，请核对增发/回购/并购/分拆/分红后填写" in msg
+
+# ===================== 0023：DCF 腿 n.m. / 腿间互校 / 综合区间 =====================
+# 回归对象是 AMZN vs META 2026-09-19 那两次真实运行：AMZN TTM FCF -11,625M
+# （-1.5% 营收），三档 DCF 腿 73.6/159.6/257.9 拿满额权重把 base 综合从 PE 腿的
+# 256.6（= 自身交易区间中位 257.5）拖到 201.8（-20%）；META 同日 FCF 率 18%，
+# DCF 腿合法，不该被这次改动碰到。两个方向都要钉住。
+
+def test_dcf_nm_amzn_pre_fcf_negative():
+    """AMZN 形态：TTM FCF 为负 -> DCF 腿 n.m.，理由点出护栏无法生效。"""
+    nm, why = dcf_nm_check({"tv_pv_share": 0.723, "tv_pv": 1280030,
+                            "pv_explicit": 490341},
+                           dcf_ps=159.6, fcf_base=-11625, rev0=775680)
+    assert nm is True
+    assert "护栏无法生效" in why and "-1.5%" in why
+
+
+def test_dcf_nm_meta_healthy_fcf_stays_in():
+    """META 形态：FCF 率 18% + TV 占比 70% -> DCF 腿留在综合里。
+
+    TV 占比高不进 n.m. 闸是刻意的：那个量由 margins 路径决定、可被假设层调节，
+    且已有 red 通道。这条测试就是钉住"不要顺手把它加进闸门"。
+    """
+    nm, why = dcf_nm_check({"tv_pv_share": 0.6966, "tv_pv": 1765924,
+                            "pv_explicit": 769161},
+                           dcf_ps=990.5, fcf_base=40976, rev0=228248)
+    assert nm is False and why is None
+
+
+def test_dcf_nm_tv_share_above_75_alone_does_not_gate():
+    """>75% TV 占比 + 健康 FCF：仍留在综合（该形态归 red 通道，不双重处罚）。"""
+    nm, _ = dcf_nm_check({"tv_pv_share": 0.81, "tv_pv": 100.0, "pv_explicit": 23.0},
+                         dcf_ps=50.0, fcf_base=40976, rev0=228248)
+    assert nm is False
+
+
+def test_dcf_nm_boundary_two_pct_of_revenue():
+    """闸门与 dcf_diag_warnings 的 pre_fcf 必须同一条：> 2% 营收才算有锚。"""
+    assert dcf_nm_check({}, 10.0, 2.0001, 100.0)[0] is False
+    assert dcf_nm_check({}, 10.0, 2.0, 100.0)[0] is True
+
+
+def test_dcf_nm_nonpositive_and_degenerate_pv():
+    assert dcf_nm_check({}, -3.0, 50000, 100000)[0] is True
+    nm, why = dcf_nm_check({"tv_pv_share": None, "tv_pv": 900.0, "pv_explicit": -12.0},
+                           dcf_ps=8.0, fcf_base=50000, rev0=100000)
+    assert nm is True and "100% 押终值" in why
+
+
+def test_leg_crosscheck_fires_on_amzn_base():
+    """AMZN base：PE 腿隐含 24.8x vs SOTP 设定 18.2x -> +36%，黄旗。"""
+    (lv, msg), = leg_multiple_crosscheck(
+        pe_target=256.6, fwd_shares=10980, net_cash=-30500, op1=114956,
+        seg1_share=0.58, m1=22, m2=13)
+    assert lv == "yellow"
+    assert "24.8x" in msg and "18.2x" in msg and "+36%" in msg
+
+
+def test_leg_crosscheck_silent_on_meta_base():
+    """META base：18.0x vs 16.7x = +8%，校准过的 config 不该被打扰。"""
+    assert leg_multiple_crosscheck(
+        pe_target=664.3, fwd_shares=2560, net_cash=6596, op1=94266,
+        seg1_share=0.98, m1=17, m2=0) == []
+
+
+def test_leg_crosscheck_skips_degenerate_inputs():
+    """亏损情景（op1<=0）与 m1=m2=0 的约定值不该产出噪声黄旗。"""
+    assert leg_multiple_crosscheck(100, 1000, 0, -5, 0.9, 10, 5) == []
+    assert leg_multiple_crosscheck(100, 1000, 0, 500, 0.9, 0, 0) == []
+
+
+def test_blend_legs_drops_dcf_and_reports_range():
+    """AMZN base 去掉 DCF 腿后：综合 223.0，区间钉在两条腿上。"""
+    vals = {"pe": 256.6, "dcf": 159.6, "sotp": 189.3}
+    w = {"pe": 1.0, "dcf": 1.0, "sotp": 1.0}
+    blend, spread, rng = blend_legs(vals, ["pe", "sotp"], w)
+    assert round(blend, 1) == 223.0
+    assert rng == [189.3, 256.6]
+    # 原三腿等权口径作对照：这就是被修掉的那个 201.8
+    assert round(blend_legs(vals, ["pe", "dcf", "sotp"], w)[0], 1) == 201.8
+
+
+def test_blend_legs_single_leg_has_no_range():
+    blend, spread, rng = blend_legs({"pe": 10.0, "dcf": 5.0, "sotp": 1.0},
+                                    ["pe"], {"pe": 1.0, "dcf": 1.0, "sotp": 1.0})
+    assert blend == 10.0 and spread is None and rng is None
+
+
+def test_blend_legs_respects_weights():
+    vals = {"pe": 100.0, "dcf": 200.0, "sotp": 0.0}
+    blend, _, _ = blend_legs(vals, ["pe", "dcf"], {"pe": 3.0, "dcf": 1.0, "sotp": 1.0})
+    assert blend == 125.0
+
+
+def test_blend_legs_zero_weight_sum_falls_back_to_equal():
+    vals = {"pe": 100.0, "dcf": 200.0, "sotp": 0.0}
+    blend, _, _ = blend_legs(vals, ["pe", "dcf"], {"pe": 0.0, "dcf": 0.0, "sotp": 0.0})
+    assert blend == 150.0
+
+
+def test_blend_legs_empty_methods_returns_none():
+    """三腿全 n.m. 时返回 None——引擎据此走 red 占位分支，不静默发 0。"""
+    assert blend_legs({"pe": 1.0, "dcf": 2.0, "sotp": 3.0}, [],
+                      {"pe": 1.0, "dcf": 1.0, "sotp": 1.0}) == (None, None, None)
