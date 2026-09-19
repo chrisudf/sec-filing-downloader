@@ -624,6 +624,59 @@ def pe_band_check(scenario_name, pe, band, ddiag, label="PE", diag_key="pe_vs_hi
     return []
 
 
+def fcf_caliber_warnings(facts, gap_pp_gate=0.5):
+    """历史 FCF 利润率表的口径对照 -> ([[level, msg]], diag|None)。
+
+    hist_fcf_margins 用 `CFO − capex`，而 **融资租赁取得的设备不进 capex**
+    （ASC 842 下是非现金投资活动），本金偿付走筹资活动。于是租得越多，这张表
+    看起来越好 —— 而它正是 DCF 终值 margins 的锚，一条腿的大头压在上面。
+
+    发行人自己的口径常把它减掉。META 10-K 的 FCF 调节表原文就是
+    `115,800 − 69,691 − 2,524 = 43,585`，而引擎算 46,109，差 1.25pp。
+
+    两只票 2026-09-19 实测（融资租赁本金，$M）：
+        META  850 → 1,058 → 1,969 → 2,524   逐年扩大
+        AMZN  7,941 → 4,384 → 2,043 → 1,557 逐年缩小
+    **AMZN 那个方向更坏**：偏差随时间衰减，会在表里凭空造出一条"FCF 率逐年
+    恶化"的假趋势 —— 恒定偏差至少不改变形状。
+
+    只对照不覆盖（同 other_income_crosscheck / post_period_capital_events）：
+    「FCF 该怎么定义」是判断，自动化不了；这里只把差额顶到台面上。缺标签
+    不打旗 —— ASC 842 要求有融资租赁就得标，缺失基本等于真的没有，为此刷一条
+    黄旗是噪声；但把对照结果写进 diag，让"跑过且没找到"与"没跑"可区分。
+    """
+    facts = facts or {}
+    rev, cfo = facts.get("revenue_annual") or {}, facts.get("cfo_annual") or {}
+    cap = facts.get("capex_annual") or {}
+    flp = facts.get("finance_lease_principal_annual") or {}
+    rows = []
+    for k in sorted(rev):
+        r, c, x, f = rev.get(k), cfo.get(k), cap.get(k), flp.get(k)
+        if all(_isnum(v) for v in (r, c, x)) and r and _isnum(f):
+            # facts 存原始美元，展示一律 $M —— 比率两边约掉没事，绝对额必须换算。
+            # 首版就漏了这一步，把 2,524M 印成 "2,524,000,000M"，与
+            # other_income_crosscheck 的 docstring 里记着的那个坑一字不差。
+            rows.append((k, (c - x) / r, (c - x - abs(f)) / r, abs(f) / 1e6))
+    if not rows:
+        return [], None
+    k, eng, adj, f = rows[-1]
+    diag = {"latest_fy": k, "engine_fcf_margin": round(eng, 4),
+            "issuer_caliber_margin": round(adj, 4),
+            "finance_lease_principal": round(f),
+            "gap_pp": round((eng - adj) * 100, 2),
+            "series": [[a, round((b - c) * 100, 2)] for a, b, c, _ in rows[-4:]]}
+    if (eng - adj) * 100 < gap_pp_gate:
+        return [], diag
+    _tail = "、".join(f"{a[:4]} {b:.2f}pp" for a, b in diag["series"])
+    return [["yellow",
+             f"历史 FCF 利润率表口径偏高：{k[:4]} 财年融资租赁本金 {f:,.0f}M 未从 "
+             f"CFO−capex 中扣除，本表 {eng:.1%} vs 发行人常用口径 {adj:.1%}"
+             f"（差 {(eng - adj) * 100:.2f}pp，>{gap_pp_gate}pp）。融资租赁取得的设备"
+             "不进 capex，租得越多这张表越好看 —— 而它是 DCF 终值 margins 的锚。"
+             f"近四年差额：{_tail}；差额若逐年变化，表里的 FCF 率趋势有一部分是"
+             "口径漂移不是经营变化"]], diag
+
+
 def dcf_nm_check(ddiag, dcf_ps, fcf_base, rev0):
     """DCF 腿的 n.m. 闸（对称补齐 pe_nm / sotp_nm）-> (nm: bool, reason: str|None)。
 
@@ -1180,6 +1233,11 @@ out["warnings_global"] += seg_share_crosscheck(
     cfg.get("segment_count"), sotp_in_blend)
 out["scenarios"]["base"]["warnings"] += other_income_crosscheck(
     facts, cfg["other_income"], out["scenarios"]["base"]["eps1"], cfg["fwd_shares"])
+# FCF 口径对照（0024）：走全局通道——它说的是那张历史年度表本身的口径，与情景
+# 假设无关。diag 无条件落盘，"跑过且没找到融资租赁"与"没跑"要能区分。
+_fcfw, _fcfd = fcf_caliber_warnings(facts)
+out["warnings_global"] += _fcfw
+out["fcf_caliber"] = _fcfd
 
 # ---- DCF 终值护栏（2026-08-31）：终值那一个数字撑起 DCF 的大头，却是整份
 # 假设里最不受约束的——原有三道护栏（第10年营收 >8x / 终值占比 >75% /

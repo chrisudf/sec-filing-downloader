@@ -85,6 +85,15 @@ SPEC = {
     "capex": _item(["PaymentsToAcquirePropertyPlantAndEquipment",
                     "PaymentsToAcquirePropertyPlantAndEquipmentAndIntangibleAssets",
                     "PaymentsToAcquireProductiveAssets"], y=True),
+    # 融资租赁本金偿付（0024）：DCF 终值锚的那张历史 FCF 利润率表用的是
+    # CFO-capex，而融资租赁取得的设备**不进 capex**（非现金投资活动），本金
+    # 偿付走筹资活动 —— 于是租得越多，FCF 看起来越好。发行人自己的口径常把它
+    # 减掉：META 10-K 的 FCF 调节表就是 CFO - capex - 本项，2025 年差 2,524M
+    # = 1.25pp FCF 率。取来只做对照不改口径（同 other_income_crosscheck）。
+    # 老准则期（ASC 842 前）标 RepaymentsOfLongTermCapitalLeaseObligations。
+    "finance_lease_principal": _item(
+        ["FinanceLeasePrincipalPayments",
+         "RepaymentsOfLongTermCapitalLeaseObligations"], y=True),
     # 股东回报与股权激励（图表端；现金流量表科目，10-Q 为累计口径）
     "buyback": _item(["PaymentsForRepurchaseOfCommonStock"], y=True),
     # PaymentsOfOrdinaryDividends 走 fill（只补缺不覆盖）：PFE **只**用这个标签，

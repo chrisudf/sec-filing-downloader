@@ -270,6 +270,37 @@ PE 法 268.4 vs 285.8/304.6，三个目标价不可比。MSFT 因报告期恰是
 - [ ] 正式化：`VALUATION_PROVIDER` 配置（claude-cli | openai-compatible | 自定义命令）+
       前端模型下拉框；不同判断层跑同一公司做质量对比（重点看一次性项目识别能力）
 
+## 🔍 v0.4.1 — 「XBRL 算得出、附注才解释得清」的盲区（2026-09-19 立项）
+
+起因见 LESSONS 的两条 2026-09-19 条目。核心判据：**一个比率能算 ≠ 能用**——
+折旧年限、租赁分类、应付时点、分部费用归属都改变了标准比率的分子或分母，
+而没有一样有 XBRL 标签。已做 (a)(b)，留 (c)(d) 与本轮新发现的 (e)。
+
+- [x] (a) `extract_sections.KEYWORDS` 加 `useful li` / `accounting estimate` /
+      `free cash flow`，且**排在 fact 通道前段**（列表顺序 = 预算优先级）
+- [x] (b) `engine.fcf_caliber_warnings`：融资租赁本金未从 `CFO−capex` 扣除时打黄旗
+      （META 2025 差 1.26pp，且逐年扩大 0.73→1.26pp；AMZN 反向衰减 7,941→1,557M）
+      + `fetch_facts` 加 `finance_lease_principal` 标签
+- [ ] **(c) 一次性探测器从 `净利 vs 营业利润` 扩到 opm 阶跃。** 现判据是两条损益行的
+      比值，**只能看见营业线以下的东西**；营业线之内的（折旧年限变更、诉讼和解费用、
+      重组）按构造隐形。AMZN FY2025 营业利润里就含 Q3'25 的 $2.5B 和解费用 +
+      Q4 实体店租赁费用（主要打在 NA 分部 → 抬高 `seg1_share`，直接影响 SOTP 的
+      m1/m2 权重）。待定：阈值（季度 opm 相对前四季中位偏离多少 bp）、会不会把
+      正常的季节性打成噪声。**要先评估对存量标的的黄旗增量。**
+- [ ] **(d) judgment_prompt 加必答项：** 资本密集型标的必须声明锚窗口内有无折旧年限/
+      会计估计变更及其披露的 EPS 影响。走 `post_period_capital_events` 那套"必填字段"
+      机制——必填才逼得出"没有"这个回答。待定：怎么界定"资本密集型"（capex/营收阈值？
+      还是一律必填）、会不会拖长本已很长的 prompt。
+- [ ] **(e)【本轮新发现，可能优先于 c/d】SECTIONS 预算早已饱和，而且一直是静默的。**
+      给截断加了可见提示（`_budget` 条目）之后立刻暴露：META 两份财报里
+      `Subsequent to` / `Subsequent Event` **被截断**——而 KEYWORDS_SUBSEQ 的注释
+      白纸黑字写着它是必填字段 `post_period_capital_events` 的唯一来源；整个 risk
+      通道尾部（restructuring / going concern / material weakness / covenant）
+      两份文件都**一次都没扫过**。`free cash flow` 同样进不来。
+      这不是本轮改动造成的，是本轮改动**让它可见了**。
+      待评估：抬 `MAX_TOTAL`（代价=prompt 变长/变贵）、按通道重新分配配额、
+      还是把 MAX_HITS 从 3 降到 2 换取更多关键词覆盖。
+
 ## 🚀 v0.5 — 部署与产品化
 
 - [ ] 部署到 Railway / Fly.io（参考站即 Railway）

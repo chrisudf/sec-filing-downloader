@@ -23,10 +23,11 @@ _SEG = [ast.get_source_segment(_SRC, n) for n in ast.parse(_SRC).body
                        "other_income_crosscheck", "hist_fcf_margins",
                        "terminal_margin_warnings", "terminal_sensitivity",
                        "dcf", "dcf_diag_warnings", "ps_reference",
-                       "dcf_nm_check", "leg_multiple_crosscheck", "blend_legs")]
+                       "dcf_nm_check", "leg_multiple_crosscheck", "blend_legs",
+                       "fcf_caliber_warnings")]
 # _isnum 是这些函数共用的模块级谓词（排除 bool），必须一起抽——
 # 否则 exec 出来的命名空间里没有它，全部 NameError
-assert len(_SEG) == 13, _SEG
+assert len(_SEG) == 14, _SEG
 _NS = {}
 exec(chr(10).join(_SEG), _NS)
 _isnum = _NS["_isnum"]
@@ -42,6 +43,7 @@ ps_reference = _NS["ps_reference"]
 dcf_nm_check = _NS["dcf_nm_check"]
 leg_multiple_crosscheck = _NS["leg_multiple_crosscheck"]
 blend_legs = _NS["blend_legs"]
+fcf_caliber_warnings = _NS["fcf_caliber_warnings"]
 
 
 def _mk(**over):
@@ -1477,3 +1479,70 @@ def test_blend_legs_empty_methods_returns_none():
     """三腿全 n.m. 时返回 None——引擎据此走 red 占位分支，不静默发 0。"""
     assert blend_legs({"pe": 1.0, "dcf": 2.0, "sotp": 3.0}, [],
                       {"pe": 1.0, "dcf": 1.0, "sotp": 1.0}) == (None, None, None)
+
+# ===================== 0024：FCF 口径对照 =====================
+# 回归对象是 META 2026-09-19：10-K 自己的 FCF 调节表是
+# 115,800 - 69,691 - 2,524 = 43,585，而 hist_fcf_margins 算 46,109（差 1.26pp）。
+# 那张表是 DCF 终值 margins 的锚，而 META 的 DCF 腿是进综合的。
+
+def _facts_fl(flp):
+    """两只票的真实年度序列（原始美元，与 facts.json 同口径）。"""
+    rev = {"2022-12-31": 116609e6, "2023-12-31": 134902e6,
+           "2024-12-31": 164501e6, "2025-12-31": 200966e6}
+    cfo = {"2022-12-31": 50475e6, "2023-12-31": 71113e6,
+           "2024-12-31": 91328e6, "2025-12-31": 115800e6}
+    cap = {"2022-12-31": 31186e6, "2023-12-31": 27045e6,
+           "2024-12-31": 37256e6, "2025-12-31": 69691e6}
+    return {"revenue_annual": rev, "cfo_annual": cfo, "capex_annual": cap,
+            "finance_lease_principal_annual": flp}
+
+
+def test_fcf_caliber_fires_on_meta():
+    w, d = fcf_caliber_warnings(_facts_fl(
+        {"2022-12-31": 850e6, "2023-12-31": 1058e6,
+         "2024-12-31": 1969e6, "2025-12-31": 2524e6}))
+    (lv, msg), = w
+    assert lv == "yellow"
+    assert d["gap_pp"] == 1.26
+    assert round(d["engine_fcf_margin"], 3) == 0.229
+    assert round(d["issuer_caliber_margin"], 3) == 0.217
+    # 金额必须是 $M —— 首版把原始美元直接印成 "2,524,000,000M"
+    assert "2,524M" in msg and "2,524,000,000" not in msg
+    # 逐年差额要能看出漂移方向（0.73 -> 1.26）
+    assert [x[1] for x in d["series"]] == [0.73, 0.78, 1.20, 1.26]
+
+
+def test_fcf_caliber_silent_on_amzn_scale():
+    """AMZN 2025 融资租赁本金 1,557M / 营收 716,924M = 0.22pp，在闸门下。"""
+    w, d = fcf_caliber_warnings({
+        "revenue_annual": {"2025-12-31": 716924e6},
+        "cfo_annual": {"2025-12-31": 139514e6},
+        "capex_annual": {"2025-12-31": 131819e6},
+        "finance_lease_principal_annual": {"2025-12-31": 1557e6}})
+    assert w == [] and d is not None and d["gap_pp"] == 0.22
+
+
+def test_fcf_caliber_no_tag_is_silent_but_diag_none():
+    """缺标签不打旗（ASC 842 下缺失≈真没有），但 diag 为 None 以区分'没跑'。"""
+    w, d = fcf_caliber_warnings({
+        "revenue_annual": {"2025-12-31": 100e6},
+        "cfo_annual": {"2025-12-31": 20e6},
+        "capex_annual": {"2025-12-31": 5e6}})
+    assert w == [] and d is None
+    assert fcf_caliber_warnings(None) == ([], None)
+    assert fcf_caliber_warnings({}) == ([], None)
+
+
+def test_fcf_caliber_uses_latest_common_year():
+    """四条序列 key 不齐时只用共同年份，不拿错年做判据。"""
+    f = _facts_fl({"2024-12-31": 1969e6})   # 只有 2024 有融资租赁
+    w, d = fcf_caliber_warnings(f)
+    assert d["latest_fy"] == "2024-12-31" and d["gap_pp"] == 1.20
+
+
+def test_fcf_caliber_gate_is_configurable_and_sign_safe():
+    f = _facts_fl({"2025-12-31": 2524e6})
+    assert fcf_caliber_warnings(f, gap_pp_gate=2.0)[0] == []
+    # 标签给负值（部分发行人按流出记负）时取绝对值，不能算成"口径偏低"
+    fneg = _facts_fl({"2025-12-31": -2524e6})
+    assert fcf_caliber_warnings(fneg)[1]["gap_pp"] == 1.26

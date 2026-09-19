@@ -19,6 +19,20 @@ from bs4 import BeautifulSoup
 KEYWORDS = [
     "Segment income", "reportable segments", "income (loss) from operations by segment",
     "effective tax rate", "one-time", "Other income (expense), net",
+    # 0024：以下三条补的是「XBRL 算得出、附注才解释得清」的盲区，**必须排在
+    # 靠前位置** —— fact 通道按列表顺序消耗预算，排在尾部的关键词会被前面的
+    # 挤掉（首版就放在末尾，实测 META 只有 useful li 挤进来，另两条 0 命中）。
+    # 会计估计变更（尤其服务器折旧年限）既不动 ni/op 比值（在营业线之内）、
+    # 也不动 FCF（非现金），一次性探测器与 ANOM_K 季度离群检测**两个都看不见**
+    # ——它是永久平滑的 run-rate 位移，每季等量，没有哪一季偏离中位。
+    # 2026-09-19 实测同一个月两只票反向：AMZN 服务器 6→5 年（FY25 折旧 +1.4B、
+    # 净利 -1.0B，"primarily impacted our AWS segment"）、META →5.5 年
+    # （折旧 -2.92B、净利 +2.59B = +1.00/股 ≈ FY25 EPS 的 4.3%）。
+    # 用 "accounting estimate" 不用 "change in estimate"：ASC 250 的标准标题是
+    # "Change in Accounting Estimate"，后者匹配不上（首版实测 0 命中）。
+    # "free cash flow" 抓发行人自己的 FCF 调节表（口径常与 CFO−capex 不同，
+    # 引擎侧的对照见 engine.fcf_caliber_warnings）。
+    "useful li", "accounting estimate", "free cash flow",
     "capital expenditures", "Cash, cash equivalents, and marketable securities",
     "Cash and marketable investments", "repurchase", "guidance", "expect revenue",
 ]
@@ -88,6 +102,19 @@ def collect_hits(text, per_file):
                 hits.append({"keyword": kw, "channel": channel, "text": snippet})
                 file_total += len(snippet)
             if full:
+                # 预算打满时**后面的关键词一个字都没扫过**，而此前这里直接 break、
+                # 判断层只看到"这些关键词没命中"——与"真的没有这段披露"不可分辨
+                # （0024 实测：新加的三条排在末尾，META 只挤进来一条）。把未扫的
+                # 关键词作为一条 hit 写回去，让缺口可见。用 hits 而不是改返回签名，
+                # 是因为判断层读的就是 hits，且 9 处调用点/测试都按二元组解包。
+                _rest = kws[kws.index(kw):]
+                if _rest:
+                    hits.append({
+                        "keyword": "_budget", "channel": channel,
+                        "text": f"[预算截断] {channel} 通道用满 {budget:,} 字符，"
+                                f"以下关键词未扫描：{', '.join(_rest)}。"
+                                "命中为空不代表财报里没有这段披露——"
+                                "需要时请直接在原文检索。"})
                 break
         # 用满某个通道自己的配额不代表整份预算用完——只有 risk（最后一个通道，
         # 配额就是 per_file）撑满才是真的到顶
