@@ -1575,6 +1575,20 @@ def test_estimate_evidence_silent_when_declared():
     assert estimate_change_evidence(json.dumps(_META_HIT), True) == []
 
 
+def test_estimate_evidence_ignores_useful_li_even_with_amount():
+    """GOOGL 2026-09-19 实测的假阳性：收购无形资产年限表碰巧挨着金额。
+
+    按关键词拆开的实测（四标的）：change in estimate 在 AMZN/META 各 1 次且都是
+    真变更、GOOGL/NVDA 各 0 次且确实没变更（精确率召回率满分）；useful li 贡献的
+    5 处全是噪声。抓取用宽关键词、判据用窄关键词。
+    """
+    googl = {"GOOGL_10-Q.htm": [{"keyword": "useful li", "channel": "fact",
+             "text": "Includes $ 660 million of acquired cash. Intangible assets "
+                     "acquired as of the acquisition date were as follows: Amount "
+                     "(in millions) Weighted-Average Useful Life"}]}
+    assert estimate_change_evidence(json.dumps(googl, ensure_ascii=False), False) == []
+
+
 def test_estimate_evidence_ignores_boilerplate_without_amount():
     """政策样板满篇都是 'useful lives of equipment'，不带金额不构成证据。"""
     boiler = {"f.htm": [{"keyword": "useful li", "channel": "fact",

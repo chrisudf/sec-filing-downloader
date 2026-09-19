@@ -666,8 +666,16 @@ def estimate_change_evidence(sections_raw, declared, max_show=2):
     ev = []
     for fn, hits in (secs or {}).items():
         for h in hits or []:
-            if h.get("keyword") in ("change in estimate", "useful li",
-                                    "accounting estimate") and money.search(h.get("text") or ""):
+            # 只认高特异性关键词（0025，四标的实测收紧）：首版把 useful li 也算
+            # 进证据，结果 AMZN 报 5 处里 4 处是政策样板碰巧挨着金额、GOOGL 报的
+            # 唯一一处是收购无形资产年限表（"Includes $660 million of acquired
+            # cash... Weighted-Average Useful Life"）——全是噪声。
+            # 按关键词拆开看：change in estimate 在 AMZN/META 各命中 1 次且都是
+            # 真变更、在 GOOGL/NVDA 各 0 次且它们确实没变更，**精确率与召回率都是
+            # 满分**；useful li 贡献的 5 处全错。
+            # useful li 仍留在 extract_sections 的抽取列表里（判断层要看政策上下文，
+            # 成本也低），只是不再驱动这条旗——**抓取用宽关键词、判据用窄关键词**。
+            if h.get("keyword") in ("change in estimate", "accounting estimate")                     and money.search(h.get("text") or ""):
                 ev.append((fn, (h.get("text") or "").strip()))
     if not ev:
         return []
