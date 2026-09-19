@@ -20,6 +20,7 @@ def _cfg(**over):
         ticker="TSMX", mode="standard",
         fwd_shares=1000.0, net_cash=0.0, net_cash_note="x",
         adj_ni=100.0, adj_note="x", other_income=0.0, other_income_note="x",
+        accounting_estimate_changes=[], accounting_estimate_note="x",
         seg1="A", seg2="B", seg1_share=0.9, notes=["x"],
         rationale={k: "x" for k in ("g", "opm", "pe", "m1", "rl", "wacc")},
         # 偏离 +25% > 10%：产线口径闸弃用陈旧 TTM FCF 锚（TSM 型 6-K 前滚留档）

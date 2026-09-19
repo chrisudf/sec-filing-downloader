@@ -14,6 +14,7 @@ import io
 import json
 import math
 import os
+import re
 import sys
 from datetime import date, timedelta
 
@@ -21,6 +22,15 @@ cfg = json.load(open(sys.argv[1], encoding="utf-8"))
 facts = json.load(open(sys.argv[2], encoding="utf-8"))
 OUT = sys.argv[3]
 manifest = open(sys.argv[4], encoding="utf-8").read() if len(sys.argv) > 4 else ""
+# argv[5]（0025，可选）：sections.json 路径。引擎此前看不到财报摘录，于是
+# accounting_estimate_changes 这类"必填字段"只能查形状、无法与原文对账。
+# 可选参数 = 老调用点（含全部测试）四参数照常工作。读不到就当没有，不阻断。
+SECTIONS_RAW = ""
+if len(sys.argv) > 5:
+    try:
+        SECTIONS_RAW = open(sys.argv[5], encoding="utf-8").read()
+    except OSError:
+        SECTIONS_RAW = ""
 
 MODE = cfg.get("mode", facts.get("mode", "standard"))
 
@@ -622,6 +632,51 @@ def pe_band_check(scenario_name, pe, band, ddiag, label="PE", diag_key="pe_vs_hi
                                f"{ANCHOR_TOL:.0%} 后为 [{lo_ok:.1f},{hi_ok:.1f}]x，"
                                f"全窗第 {rank:.0f} 百分位）{ctx}——base 应为中枢情景"]]
     return []
+
+
+def estimate_change_evidence(sections_raw, declared, max_show=2):
+    """SECTIONS 里的会计估计变更证据 vs config 的申报 -> [[level, msg]]。
+
+    让 `accounting_estimate_changes` 这个必填字段**可执行**，而不是自觉申报。
+    现有的 post_period_capital_events 也是必填，但校验层只查字段形状、从不与
+    原文对账（sections.json 只喂 prompt，不进 _validate_judgment）——写 [] 永远
+    能过。这条补上另一半：**原文里有带金额的变更披露而 config 写了 []，就打旗。**
+
+    能做成这样是 0024 关键词工作的直接结果：`change in estimate` 在 META/AMZN
+    全文各只出现 1 次，那一次就是量化那句，特异性够高才敢拿它当判据。
+
+    **yellow 不 red**（2026-09-19 裁决）：会计估计变更不止折旧年限（无形资产年限、
+    信用损失估计都会命中关键词），硬 reject 会让"命中的是别的估计变更"这种诚实
+    情形无解——正是 _forced_zero_keys（0022 C3）记着的那个病理：拒绝→上调→又被
+    另一条拒绝→烧光重试→硬失败。判断层必须**回应**（schema 强制 note 非空），
+    但可以回应"命中的与折旧无关"。
+
+    只在**有金额**的命中上打旗：政策样板段落（"useful lives of equipment" 之类）
+    满篇都是，不带金额的不构成"有变更未申报"的证据。
+    """
+    if declared:                      # 已申报，不必再提示
+        return []
+    if not sections_raw:
+        return []
+    try:
+        secs = json.loads(sections_raw) if isinstance(sections_raw, str) else sections_raw
+    except (ValueError, TypeError):
+        return []
+    money = re.compile(r"\$\s?[\d,.]+\s?(?:billion|million)", re.I)
+    ev = []
+    for fn, hits in (secs or {}).items():
+        for h in hits or []:
+            if h.get("keyword") in ("change in estimate", "useful li",
+                                    "accounting estimate") and money.search(h.get("text") or ""):
+                ev.append((fn, (h.get("text") or "").strip()))
+    if not ev:
+        return []
+    _q = "；".join(f"{fn}: …{t[:160]}…" for fn, t in ev[:max_show])
+    return [["yellow",
+             f"accounting_estimate_changes 申报为空，但 SECTIONS 里有 {len(ev)} 处"
+             "带金额的会计估计变更摘录——这类变更改 opm 与 EPS 却不动净利/营业利润"
+             "比值，机械探测器看不见。请确认是真的没有，还是命中的属于无形资产年限/"
+             f"信用损失等与折旧无关的变更（后者也应申报并在 note 说明）。证据：{_q}"]]
 
 
 def fcf_caliber_warnings(facts, gap_pp_gate=0.5):
@@ -1238,6 +1293,9 @@ out["scenarios"]["base"]["warnings"] += other_income_crosscheck(
 _fcfw, _fcfd = fcf_caliber_warnings(facts)
 out["warnings_global"] += _fcfw
 out["fcf_caliber"] = _fcfd
+# 会计估计变更的申报 vs 原文证据（0025）：走全局通道——与情景假设无关
+out["warnings_global"] += estimate_change_evidence(
+    SECTIONS_RAW, bool(cfg.get("accounting_estimate_changes")))
 
 # ---- DCF 终值护栏（2026-08-31）：终值那一个数字撑起 DCF 的大头，却是整份
 # 假设里最不受约束的——原有三道护栏（第10年营收 >8x / 终值占比 >75% /

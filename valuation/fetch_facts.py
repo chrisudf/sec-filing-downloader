@@ -19,6 +19,7 @@ import json
 import os
 import sys
 import time
+import statistics
 from datetime import date, timedelta
 
 import httpx
@@ -645,6 +646,44 @@ def classify_core_gaps(out: dict) -> list[str]:
     return ["核心损益科目 TTM 无数据：" + ", ".join(missing) + "\n" + "\n".join(per)]
 
 
+def _opm_series(out: dict, n: int = 12) -> list:
+    """季度营业利润率 + 两种偏离口径 -> [{period_end, opm, dev_med_bp, dev_yoy_bp}, ...]。
+
+    补的是 0024 的盲区：判断层现有的一次性判据是「净利 vs 营业利润」，那是**两条
+    损益行的比值，只能看见营业线以下的东西**。营业线之内的（诉讼和解、重组、出口
+    管制减记、折旧年限变更）比值根本不动。四标的实测：
+
+        NVDA 2025-04-27  ni/op 0.87（正常） opm −1309bp   H20 出口管制减记
+        META 2026-06-30  ni/op 0.84（正常） opm −1009bp   AI 投入 + 遣散费
+
+    两条都被现有判据完全漏掉。
+
+    **刻意只出数据、不出黄旗**（2026-09-19 裁决）：高增长标的的正常利润率爬坡
+    幅度远大于一次性项目——同一批数据里 NVDA 2023Q3 是 +3223bp、META 2023Q3
+    +1743bp，全是真实经营扩张。任何固定 bp 阈值在这类标的上都是噪声发生器。
+    判据留给判断层：prompt 要求它对异常季度去 SECTIONS 找解释，与 ni/op 同一套
+    做法。**这条序列的价值是"让它看得见"，不是"替它判"。**
+
+    同时给两个口径，因为它们漏的东西不同：
+      dev_med_bp  相对前四季中位——抓突变，但会被季节性打扰
+      dev_yoy_bp  相对去年同季——季节性自消，但会被去年的一次性污染
+    两个都异常才值得看；只有一个异常多半是季节性或基期问题。
+    """
+    rev, op = out.get("revenue_quarterly") or {}, out.get("op_income_quarterly") or {}
+    ks = [k for k in sorted(rev) if k in op and rev[k]]
+    ser = []
+    for j, k in enumerate(ks):
+        m = op[k] / rev[k]
+        prev = [op[x] / rev[x] for x in ks[max(0, j - 4):j] if rev[x]]
+        row = {"period_end": k, "opm": round(m, 4)}
+        if len(prev) >= 3:
+            row["dev_med_bp"] = round((m - statistics.median(prev)) * 10000)
+        if j >= 4 and rev[ks[j - 4]]:
+            row["dev_yoy_bp"] = round((m - op[ks[j - 4]] / rev[ks[j - 4]]) * 10000)
+        ser.append(row)
+    return ser[-n:]
+
+
 def _rule_of_40(out: dict, ttm: dict) -> dict:
     """Rule of 40：营收增速 + 利润率，「高倍数值不值得给」的标尺（软件/平台业
     惯例：>40 分算优秀——增速是在换未来利润还是单纯烧钱）。营收增速 = TTM vs
@@ -786,6 +825,13 @@ def build_facts(ticker: str, email: str, cik: int | None = None) -> dict:
         ro40 = _rule_of_40(out, ttm)
         if ro40:
             out["rule_of_40"] = ro40
+    # opm 序列与 rule_of_40 同属"派生给判断层看"的量，算不出就留空不阻断取数
+    try:
+        _os = _opm_series(out)
+        if _os:
+            out["opm_quarterly"] = _os
+    except Exception as e:                                   # noqa: BLE001
+        out["opm_quarterly_error"] = f"{type(e).__name__}: {e}"
     return out
 
 

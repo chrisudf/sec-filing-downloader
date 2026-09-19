@@ -212,6 +212,7 @@ def _mk(**over):
     d = dict(
         fwd_shares=1000.0, net_cash=0.0, net_cash_note="x",
         adj_ni=100.0, adj_note="x", other_income=0.0, other_income_note="x",
+        accounting_estimate_changes=[], accounting_estimate_note="x",
         seg1="A", seg2="B", seg1_share=0.9, rationale=_rat(), notes=["x"],
         scenarios=dict(
             bear=sc(-0.05, 0.05, 10, 10, [0.02, 0.03, 0.04, 0.05, 0.06,

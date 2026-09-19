@@ -281,13 +281,31 @@ PE 法 268.4 vs 285.8/304.6，三个目标价不可比。MSFT 因报告期恰是
 - [x] (b) `engine.fcf_caliber_warnings`：融资租赁本金未从 `CFO−capex` 扣除时打黄旗
       （META 2025 差 1.26pp，且逐年扩大 0.73→1.26pp；AMZN 反向衰减 7,941→1,557M）
       + `fetch_facts` 加 `finance_lease_principal` 标签
-- [ ] **(c) 一次性探测器从 `净利 vs 营业利润` 扩到 opm 阶跃。** 现判据是两条损益行的
+- [x] **(c) 已做，但形态与原设想不同：出数据不出告警。** 四标的实测否决了阈值方案——
+      高增长标的的正常利润率爬坡幅度远大于一次性项目（NVDA 2023Q3 +3223bp、
+      META 2023Q3 +1743bp 全是真实扩张），任何固定 bp 阈值都是噪声发生器；
+      而它仍然抓不到折旧年限变更（+100/+111bp，永久平滑位移）。
+      改为 `fetch_facts._opm_series` 把季度 opm + 两种偏离（vs 前四季中位 /
+      vs 去年同季）写进 FACTS，prompt 的必做检查 1 从一条判据扩成两条。
+      实测能被它抓到而 ni/op 完全看不见的：NVDA 2025Q1 H20 减记（ni/op 0.87、
+      opm −1309bp）、META 2026Q2 AI 投入+遣散（ni/op 0.84、opm −1009bp）。
+      ~~原文：一次性探测器从 `净利 vs 营业利润` 扩到 opm 阶跃。~~ 现判据是两条损益行的
       比值，**只能看见营业线以下的东西**；营业线之内的（折旧年限变更、诉讼和解费用、
       重组）按构造隐形。AMZN FY2025 营业利润里就含 Q3'25 的 $2.5B 和解费用 +
       Q4 实体店租赁费用（主要打在 NA 分部 → 抬高 `seg1_share`，直接影响 SOTP 的
       m1/m2 权重）。待定：阈值（季度 opm 相对前四季中位偏离多少 bp）、会不会把
       正常的季节性打成噪声。**要先评估对存量标的的黄旗增量。**
-- [ ] **(d) judgment_prompt 加必答项：** 资本密集型标的必须声明锚窗口内有无折旧年限/
+- [x] **(d) 已做，且做成了可执行的。** `accounting_estimate_changes` 必填
+      （含写 `[]`）+ `accounting_estimate_note` 必填（写 `[]` 时它是"查过"的唯一凭据）；
+      `engine.estimate_change_evidence` 拿 SECTIONS 里**带金额**的估计变更摘录与申报
+      对账，申报为空而原文有证据 → 黄旗并引用原文。sections.json 作为引擎第五个
+      可选参数传入（此前摘录只喂 prompt，引擎看不到原文，所以现有的
+      `post_period_capital_events` 必填字段至今只能查形状、写 `[]` 永远能过）。
+      yellow 不 red：估计变更不止折旧年限，硬 reject 会让"命中的是无形资产年限"
+      这种诚实情形无解（0022 C3 的病理）。
+      仅 standard 模式；financials 走 `_validate_judgment_financials` 短路，
+      信用损失估计是同型问题，留作后续。
+      ~~原文：judgment_prompt 加必答项。~~ 资本密集型标的必须声明锚窗口内有无折旧年限/
       会计估计变更及其披露的 EPS 影响。走 `post_period_capital_events` 那套"必填字段"
       机制——必填才逼得出"没有"这个回答。待定：怎么界定"资本密集型"（capex/营收阈值？
       还是一律必填）、会不会拖长本已很长的 prompt。

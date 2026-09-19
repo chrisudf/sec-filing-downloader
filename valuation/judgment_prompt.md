@@ -56,9 +56,35 @@
   全程亏损叠加净现金深负——综合失去支撑腿）四类红旗要求你复审一次。
 
 必做检查清单：
-1. **一次性项目**：逐季对比净利 vs 营业利润（数据在 FACTS 里），异常季度到 SECTIONS 摘录里找原因
-   （税务法案、投资重估、减值、出口管制费用等），据此给出 adj_ni（TTM 调整后净利，$M）并在
+1. **一次性项目**：**两条判据都要看**，它们看见的东西不同——
+   (i) 逐季对比净利 vs 营业利润（FACTS 的季度序列）：抓**营业线以下**的
+       （税务法案、投资重估、AFS 重分类）。
+   (ii) FACTS 的 `opm_quarterly`（季度营业利润率 + 两种偏离：`dev_med_bp` 相对前四季
+       中位、`dev_yoy_bp` 相对去年同季）：抓**营业线以内**的（诉讼和解、重组、遣散、
+       出口管制减记、资产减值）。这类项目**完全不动**净利/营业利润比值——
+       实测 NVDA 2025Q1 的 H20 减记 ni/op=0.87 看着完全正常，opm 却 −1309bp；
+       META 2026Q2 ni/op=0.84，opm −1009bp。只看 (i) 会整类漏掉。
+   **两个偏离口径要一起看**：只有 `dev_med_bp` 异常多半是季节性，只有 `dev_yoy_bp`
+   异常多半是去年基期有一次性；两个同时异常才值得追。高增长标的的正常利润率爬坡
+   本身就能到几百甚至上千 bp（实测 NVDA 2023Q3 +3223bp 是真实经营扩张），
+   **所以这里没有固定阈值，要你结合量级和 SECTIONS 判断，不是机械比大小**。
+   异常季度到 SECTIONS 摘录里找原因，据此给出 adj_ni（TTM 调整后净利，$M）并在
    adj_note 写清调整口径；没有重大一次性项目就用报告净利并说明
+1b. **会计估计变更**（`accounting_estimate_changes`，**必填，无变更写 `[]`**）：
+   到 SECTIONS 找 `change in estimate` / `useful li` / `accounting estimate` 的摘录
+   （10-K 的 Summary of Significant Accounting Policies、Change in Accounting Estimate
+   小节；10-Q 对应附注）。服务器折旧年限是最典型的一类。
+   **为什么单列一条**：这类变更改变 opm 与 EPS，却**既不动**净利/营业利润比值
+   （在营业线之内）、**也不动** FCF（非现金），上面两条判据和 PE 带的季度离群
+   检测**三个都看不见**——它是永久平滑的 run-rate 位移，每季等量，没有哪一季
+   偏离中位。只能靠读附注。
+   实测同一个月两只票反向：AMZN 服务器 6→5 年（FY25 折旧 +1.4B、净利 −1.0B）、
+   META →5.5 年（折旧 −2.92B、净利 +2.59B = +1.00/股 ≈ FY25 EPS 的 4.3%）。
+   **拿这两家的 opm 或分部利润率做横向对比时，不校正就是在比两把不同的尺子。**
+   发行人通常会量化影响，抄进 depreciation_impact_musd / net_income_impact_musd /
+   eps_impact，并在 note 写出处。命中的若是无形资产年限、信用损失等与折旧无关的
+   估计变更，照样申报并在 note 里说明——**不要因为"与折旧无关"就写 []**。
+
 2. **分部**：从 SECTIONS 的分部表确定 seg1/seg2 名称和 seg1_share（主分部营业利润占比，0-1）。
    注入区的「# 分部（发行人 XBRL 申报）」给出了发行人自己申报的分部与**营收**占比——
    那是对照物不是答案（seg1_share 要的是**营业利润**占比，低利润率分部会让两者显著不同），
@@ -118,6 +144,16 @@
     推出的真实 TTM 营收 $M，g 的基准将以此为准>,
   "ttm_revenue_note": "<提供 override 时必填：推导口径与出处>",
   "net_cash": <净现金 $M>, "net_cash_note": "<口径与出处>",
+  "accounting_estimate_changes": [   // **必填**；确认无变更写 []
+    {"effective_date": "YYYY-MM-DD",
+     "subject": "<变更对象，如 servers and network assets 折旧年限 6→5 年>",
+     "depreciation_impact_musd": <可选：披露的折旧/摊销影响 $M，增加为正>,
+     "net_income_impact_musd": <可选：披露的净利影响 $M，增加为正>,
+     "eps_impact": "<可选：披露的每股影响原文，如 $1.00 per diluted share>",
+     "note": "<原文出处，必填>"}
+  ],
+  "accounting_estimate_note": "<**必填**：在哪份财报的哪一节核对的。写 [] 时这句是
+    '查过、确认没有'的唯一凭据——没有它，'没变更'和'没查'不可分辨>",
   "post_period_capital_events": [   // 可选但强烈建议；距报告期 >45 天时务必给出
     {"date": "YYYY-MM-DD", "kind": "增发|回购|并购|分拆|大额分红|发债|偿债|担保或有|股息宣告",
      "amount_musd": <**现金流向**：流入为正、流出为负，$M。担保或有（担保/或有承诺，

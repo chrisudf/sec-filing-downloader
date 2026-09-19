@@ -67,6 +67,7 @@ def _std_cfg(**over):
         net_cash=0.0, net_cash_note="10-Q 流动性章节：现金 0 − 债务 0",
         adj_ni=120.0, adj_note="无重大一次性项目，用报告净利",
         other_income=0.0, other_income_note=OI_NOTE,
+        accounting_estimate_changes=[], accounting_estimate_note="x",
         fwd_label="NTM 2026-07~2027-06",
         seg1="A", seg2="B", seg1_share=0.9, notes=["x"],
         rationale={k: "x" for k in ("g", "opm", "pe", "m1", "rl", "wacc")},

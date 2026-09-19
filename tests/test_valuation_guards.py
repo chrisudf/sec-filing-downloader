@@ -5,6 +5,8 @@
 红旗是假的 → gate 打回后判断层上修 bear.margins 越过 base → 自相矛盾的假设发货。
 """
 import ast
+import json
+import re
 import copy
 from pathlib import Path
 
@@ -24,11 +26,13 @@ _SEG = [ast.get_source_segment(_SRC, n) for n in ast.parse(_SRC).body
                        "terminal_margin_warnings", "terminal_sensitivity",
                        "dcf", "dcf_diag_warnings", "ps_reference",
                        "dcf_nm_check", "leg_multiple_crosscheck", "blend_legs",
-                       "fcf_caliber_warnings")]
+                       "fcf_caliber_warnings", "estimate_change_evidence")]
 # _isnum 是这些函数共用的模块级谓词（排除 bool），必须一起抽——
 # 否则 exec 出来的命名空间里没有它，全部 NameError
-assert len(_SEG) == 14, _SEG
-_NS = {}
+assert len(_SEG) == 15, _SEG
+# 抽出来的函数在裸命名空间里 exec —— 生产代码里的模块级 import 不会跟着来。
+# estimate_change_evidence 用了 json/re，不喂进去就是 NameError（实测）。
+_NS = {"json": json, "re": re}
 exec(chr(10).join(_SEG), _NS)
 _isnum = _NS["_isnum"]
 vintage_warnings = _NS["vintage_warnings"]
@@ -44,6 +48,7 @@ dcf_nm_check = _NS["dcf_nm_check"]
 leg_multiple_crosscheck = _NS["leg_multiple_crosscheck"]
 blend_legs = _NS["blend_legs"]
 fcf_caliber_warnings = _NS["fcf_caliber_warnings"]
+estimate_change_evidence = _NS["estimate_change_evidence"]
 
 
 def _mk(**over):
@@ -54,6 +59,7 @@ def _mk(**over):
     d = dict(
         fwd_shares=1000.0, net_cash=0.0, net_cash_note="x",
         adj_ni=100.0, adj_note="x", other_income=0.0, other_income_note="x",
+        accounting_estimate_changes=[], accounting_estimate_note="x",
         seg1="A", seg2="B", seg1_share=0.9,
         rationale={k: "x" for k in ("g", "opm", "pe", "m1", "rl", "wacc", "dcf_margin")},
         notes=["x"],
@@ -1546,3 +1552,49 @@ def test_fcf_caliber_gate_is_configurable_and_sign_safe():
     # 标签给负值（部分发行人按流出记负）时取绝对值，不能算成"口径偏低"
     fneg = _facts_fl({"2025-12-31": -2524e6})
     assert fcf_caliber_warnings(fneg)[1]["gap_pp"] == 1.26
+
+# ============ 0025：会计估计变更的申报 vs 原文证据 ============
+# 让必填字段可执行。现有的 post_period_capital_events 也必填，但校验层只查形状、
+# 从不与原文对账（sections.json 只喂 prompt），写 [] 永远能过。
+
+_META_HIT = {"META_10-K.htm": [
+    {"keyword": "change in estimate", "channel": "fact",
+     "text": "the financial impact of this change in estimate included a reduction in "
+             "depreciation expense of $ 2.92 billion and an increase in net income of "
+             "$ 2.59 billion, or $ 1.00 per diluted share"}]}
+
+
+def test_estimate_evidence_fires_when_declared_empty():
+    (lv, msg), = estimate_change_evidence(json.dumps(_META_HIT, ensure_ascii=False), False)
+    assert lv == "yellow"
+    assert "申报为空" in msg and "2.92 billion" in msg
+
+
+def test_estimate_evidence_silent_when_declared():
+    """已申报就不再提示——它的作用是补漏，不是每次都喊。"""
+    assert estimate_change_evidence(json.dumps(_META_HIT), True) == []
+
+
+def test_estimate_evidence_ignores_boilerplate_without_amount():
+    """政策样板满篇都是 'useful lives of equipment'，不带金额不构成证据。"""
+    boiler = {"f.htm": [{"keyword": "useful li", "channel": "fact",
+                         "text": "Estimates are used for, but not limited to, useful lives "
+                                 "of equipment, valuation of acquired intangibles"}]}
+    assert estimate_change_evidence(json.dumps(boiler), False) == []
+
+
+def test_estimate_evidence_ignores_other_keywords_with_money():
+    """别的关键词命中带金额不算数——只认这三条估计变更关键词。"""
+    other = {"f.htm": [{"keyword": "repurchase", "channel": "fact",
+                        "text": "repurchased $ 5.0 billion of common stock"}]}
+    assert estimate_change_evidence(json.dumps(other), False) == []
+
+
+def test_estimate_evidence_tolerates_bad_input():
+    """sections 缺失/损坏不阻断出报告——它是补充证据不是必需输入。"""
+    for bad in ("", None, "not json{", "[]"):
+        assert estimate_change_evidence(bad, False) == []
+
+
+def test_estimate_evidence_accepts_dict_not_only_str():
+    assert len(estimate_change_evidence(_META_HIT, False)) == 1
