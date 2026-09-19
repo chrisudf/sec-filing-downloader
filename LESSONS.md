@@ -389,8 +389,9 @@ PE 带的 `ANOM_K=1.25` 季度离群检测也救不了：年限变更是**永久
 
 - **(a)** `extract_sections.KEYWORDS` 加 `useful li` / `accounting estimate` /
   `free cash flow`。两个细节都是实测撞出来的：
-  - 首版写 `"change in estimate"`，**0 命中** —— ASC 250 的标准标题是
-    "Change in Accounting **Estimate**"，中间隔着一个词。
+  - 首版写 `"change in estimate"` 得到 **0 命中**，我判成拼写不匹配（"ASC 250 的
+    标准标题是 Change in Accounting Estimate"）并换成 `accounting estimate`。
+    **这个判断是错的**，见下一条。
   - 首版把三条放在列表**末尾**，META 只有一条挤进来 —— fact 通道按列表顺序消耗
     预算，**排在尾部 = 优先被饿死**。列表顺序就是优先级，这件事此前没写在任何地方。
 - **(b)** `engine.fcf_caliber_warnings`：融资租赁本金未从 `CFO−capex` 扣除且差额

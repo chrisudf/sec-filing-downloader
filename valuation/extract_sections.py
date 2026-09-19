@@ -28,11 +28,20 @@ KEYWORDS = [
     # 2026-09-19 实测同一个月两只票反向：AMZN 服务器 6→5 年（FY25 折旧 +1.4B、
     # 净利 -1.0B，"primarily impacted our AWS segment"）、META →5.5 年
     # （折旧 -2.92B、净利 +2.59B = +1.00/股 ≈ FY25 EPS 的 4.3%）。
-    # 用 "accounting estimate" 不用 "change in estimate"：ASC 250 的标准标题是
-    # "Change in Accounting Estimate"，后者匹配不上（首版实测 0 命中）。
-    # "free cash flow" 抓发行人自己的 FCF 调节表（口径常与 CFO−capex 不同，
-    # 引擎侧的对照见 engine.fcf_caliber_warnings）。
-    "useful li", "accounting estimate", "free cash flow",
+    # ⚠️ 关键词的**特异性**比预算重要得多，这一条是 2026-09-19 四标的实测出来的：
+    #   change in estimate   META 1 次 / AMZN 1 次 —— 那一次就是量化那句
+    #   accounting estimate  META 12 次 / AMZN 6 次（多为小节标题与样板）
+    #   useful li            META 32 次 / AMZN 16 次（绝大多数是政策样板）
+    # MAX_HITS 取的是**前 N 次出现**不是最相关的 N 次，而 META 的量化披露排在
+    # `useful li` 的第 8 次 —— 前 3 次全是交叉引用，一个数字都没有。实测：
+    #   只抬预算到 200k            -> 三个目标数字一个都拿不到
+    #   只按"含金额"给摘录排序      -> 拿到 1/3
+    #   加这一条特异关键词（+3 字符）-> 拿到 2/3，覆盖率还从 9.2 升到 9.8
+    # 结论：宽泛关键词靠预算砸不出量化披露，特异关键词一跳就到。加关键词时先数
+    # 它在全文里出现几次——次数越少越值钱。
+    # （首版误把 "change in estimate" 判成"匹配不上"并换成 "accounting estimate"，
+    #   实际是它被排在列表末尾饿死了，0 命中的原因是预算不是拼写。）
+    "change in estimate", "useful li", "accounting estimate", "free cash flow",
     "capital expenditures", "Cash, cash equivalents, and marketable securities",
     "Cash and marketable investments", "repurchase", "guidance", "expect revenue",
 ]
