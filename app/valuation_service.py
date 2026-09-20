@@ -278,6 +278,40 @@ def _validate_judgment(d: dict, mode: str = "standard",
                     "必须是布尔 true/false（不接受字符串）")
             if not str(e.get("note") or "").strip():
                 raise ValueError(f"post_period_capital_events[{i}].note 必填（原文出处）")
+    # accounting_estimate_changes（0025，**必填**）：会计估计变更（服务器折旧年限最
+    # 典型）既不动「净利 vs 营业利润」比值（在营业线之内）、也不动 FCF（非现金），
+    # 一次性探测器与 PE 带的 ANOM_K 季度离群检测**两个都看不见**——它是永久平滑的
+    # run-rate 位移，每季等量，没有哪一季偏离中位。只能靠读附注。
+    # 2026-09-19 实测同一个月两只票反向：AMZN 服务器 6→5 年（FY25 折旧 +1.4B、
+    # 净利 −1.0B）、META →5.5 年（折旧 −2.92B、净利 +2.59B = +1.00/股 ≈ FY25 EPS
+    # 的 4.3%）——而当时正拿两家 opm 并排比、拿 AWS 39% 利润率定 m1。
+    # 一律必填（含写 []）：一句"本期无变更"成本极低，而按 capex 强度设门槛既要先
+    # 定义门槛、又会漏掉非资本密集但改了估计的标的（保险/信用损失）。
+    aec = d.get("accounting_estimate_changes")
+    if aec is None:
+        raise ValueError(
+            "accounting_estimate_changes 必填（确认无变更则写 []，并在 "
+            "accounting_estimate_note 里说明查了哪里）——会计估计变更改变 opm 与 EPS "
+            "却不动净利/营业利润比值，机械探测器看不见，只能靠读附注")
+    if not isinstance(aec, list):
+        raise ValueError("accounting_estimate_changes 必须是数组（确认无变更则写 []）")
+    for i, e in enumerate(aec):
+        if not isinstance(e, dict) or not {"effective_date", "subject", "note"} <= set(e):
+            raise ValueError(
+                f"accounting_estimate_changes[{i}] 须含 effective_date/subject/note"
+                "（subject 如 'servers and network assets 折旧年限 6→5 年'）")
+        for k in ("depreciation_impact_musd", "net_income_impact_musd"):
+            if k in e and not _isnum(e[k]):
+                raise ValueError(f"accounting_estimate_changes[{i}].{k} 必须是数字（$M）")
+        if not str(e.get("note") or "").strip():
+            raise ValueError(f"accounting_estimate_changes[{i}].note 必填（原文出处）")
+    # note 无条件必填——写 [] 时它就是"查过、确认没有"的唯一凭据。没有它，
+    # "没变更"和"没查"不可分辨（与 net_cash_note / adj_note / other_income_note 同例）
+    if not str(d.get("accounting_estimate_note") or "").strip():
+        raise ValueError(
+            "accounting_estimate_note 必填：写明在哪份财报的哪一节核对了会计估计变更"
+            "（10-K 的 Summary of Significant Accounting Policies / Change in "
+            "Accounting Estimate、10-Q 对应附注）。写 [] 时这句是唯一凭据")
     # ppce_note（v4）可选：期后事件与 net_cash 的对账说明一句话，引擎附在 info 行后
     if "ppce_note" in d and not isinstance(d["ppce_note"], str):
         raise ValueError("ppce_note 必须是字符串（期后事件对账的一句话说明）")
@@ -1746,8 +1780,12 @@ async def _pipeline(job: dict, ticker: str, email: str) -> None:
         (wd / "config.json").write_text(json.dumps(cfg, ensure_ascii=False, indent=1),
                                         encoding="utf-8")
         job["step"] = "engine"
+        # sections.json 作为第五个参数传给引擎（0025）：此前摘录只喂 prompt，
+        # 引擎看不到原文，于是 accounting_estimate_changes 这类必填字段只能查
+        # 形状、无法与披露对账（写 [] 永远能过）。参数可选，老调用点不受影响。
         await _run([PY, str(VAL / "engine.py"), str(wd / "config.json"), str(wd / "facts.json"),
-                    str(wd / "valuation.json"), str(fdir / "manifest.csv")], wd)
+                    str(wd / "valuation.json"), str(fdir / "manifest.csv"),
+                    str(wd / "sections.json")], wd)
         val = json.loads((wd / "valuation.json").read_text(encoding="utf-8"))
         # 全局通道（0015）一并计入：按构造它今天只有 yellow（vintage/带滞后都是
         # 数据事实），但 red 统计漏一个通道 = 未来某个全局 red 会静默放行连续性锚

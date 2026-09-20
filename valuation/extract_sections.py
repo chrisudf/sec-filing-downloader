@@ -19,6 +19,29 @@ from bs4 import BeautifulSoup
 KEYWORDS = [
     "Segment income", "reportable segments", "income (loss) from operations by segment",
     "effective tax rate", "one-time", "Other income (expense), net",
+    # 0024：以下三条补的是「XBRL 算得出、附注才解释得清」的盲区，**必须排在
+    # 靠前位置** —— fact 通道按列表顺序消耗预算，排在尾部的关键词会被前面的
+    # 挤掉（首版就放在末尾，实测 META 只有 useful li 挤进来，另两条 0 命中）。
+    # 会计估计变更（尤其服务器折旧年限）既不动 ni/op 比值（在营业线之内）、
+    # 也不动 FCF（非现金），一次性探测器与 ANOM_K 季度离群检测**两个都看不见**
+    # ——它是永久平滑的 run-rate 位移，每季等量，没有哪一季偏离中位。
+    # 2026-09-19 实测同一个月两只票反向：AMZN 服务器 6→5 年（FY25 折旧 +1.4B、
+    # 净利 -1.0B，"primarily impacted our AWS segment"）、META →5.5 年
+    # （折旧 -2.92B、净利 +2.59B = +1.00/股 ≈ FY25 EPS 的 4.3%）。
+    # ⚠️ 关键词的**特异性**比预算重要得多，这一条是 2026-09-19 四标的实测出来的：
+    #   change in estimate   META 1 次 / AMZN 1 次 —— 那一次就是量化那句
+    #   accounting estimate  META 12 次 / AMZN 6 次（多为小节标题与样板）
+    #   useful li            META 32 次 / AMZN 16 次（绝大多数是政策样板）
+    # MAX_HITS 取的是**前 N 次出现**不是最相关的 N 次，而 META 的量化披露排在
+    # `useful li` 的第 8 次 —— 前 3 次全是交叉引用，一个数字都没有。实测：
+    #   只抬预算到 200k            -> 三个目标数字一个都拿不到
+    #   只按"含金额"给摘录排序      -> 拿到 1/3
+    #   加这一条特异关键词（+3 字符）-> 拿到 2/3，覆盖率还从 9.2 升到 9.8
+    # 结论：宽泛关键词靠预算砸不出量化披露，特异关键词一跳就到。加关键词时先数
+    # 它在全文里出现几次——次数越少越值钱。
+    # （首版误把 "change in estimate" 判成"匹配不上"并换成 "accounting estimate"，
+    #   实际是它被排在列表末尾饿死了，0 命中的原因是预算不是拼写。）
+    "change in estimate", "useful li", "accounting estimate", "free cash flow",
     "capital expenditures", "Cash, cash equivalents, and marketable securities",
     "Cash and marketable investments", "repurchase", "guidance", "expect revenue",
 ]
@@ -88,6 +111,19 @@ def collect_hits(text, per_file):
                 hits.append({"keyword": kw, "channel": channel, "text": snippet})
                 file_total += len(snippet)
             if full:
+                # 预算打满时**后面的关键词一个字都没扫过**，而此前这里直接 break、
+                # 判断层只看到"这些关键词没命中"——与"真的没有这段披露"不可分辨
+                # （0024 实测：新加的三条排在末尾，META 只挤进来一条）。把未扫的
+                # 关键词作为一条 hit 写回去，让缺口可见。用 hits 而不是改返回签名，
+                # 是因为判断层读的就是 hits，且 9 处调用点/测试都按二元组解包。
+                _rest = kws[kws.index(kw):]
+                if _rest:
+                    hits.append({
+                        "keyword": "_budget", "channel": channel,
+                        "text": f"[预算截断] {channel} 通道用满 {budget:,} 字符，"
+                                f"以下关键词未扫描：{', '.join(_rest)}。"
+                                "命中为空不代表财报里没有这段披露——"
+                                "需要时请直接在原文检索。"})
                 break
         # 用满某个通道自己的配额不代表整份预算用完——只有 risk（最后一个通道，
         # 配额就是 per_file）撑满才是真的到顶

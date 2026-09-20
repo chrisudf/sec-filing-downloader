@@ -14,6 +14,7 @@ import io
 import json
 import math
 import os
+import re
 import sys
 from datetime import date, timedelta
 
@@ -21,6 +22,15 @@ cfg = json.load(open(sys.argv[1], encoding="utf-8"))
 facts = json.load(open(sys.argv[2], encoding="utf-8"))
 OUT = sys.argv[3]
 manifest = open(sys.argv[4], encoding="utf-8").read() if len(sys.argv) > 4 else ""
+# argv[5]（0025，可选）：sections.json 路径。引擎此前看不到财报摘录，于是
+# accounting_estimate_changes 这类"必填字段"只能查形状、无法与原文对账。
+# 可选参数 = 老调用点（含全部测试）四参数照常工作。读不到就当没有，不阻断。
+SECTIONS_RAW = ""
+if len(sys.argv) > 5:
+    try:
+        SECTIONS_RAW = open(sys.argv[5], encoding="utf-8").read()
+    except OSError:
+        SECTIONS_RAW = ""
 
 MODE = cfg.get("mode", facts.get("mode", "standard"))
 
@@ -624,6 +634,202 @@ def pe_band_check(scenario_name, pe, band, ddiag, label="PE", diag_key="pe_vs_hi
     return []
 
 
+def estimate_change_evidence(sections_raw, declared, max_show=2):
+    """SECTIONS 里的会计估计变更证据 vs config 的申报 -> [[level, msg]]。
+
+    让 `accounting_estimate_changes` 这个必填字段**可执行**，而不是自觉申报。
+    现有的 post_period_capital_events 也是必填，但校验层只查字段形状、从不与
+    原文对账（sections.json 只喂 prompt，不进 _validate_judgment）——写 [] 永远
+    能过。这条补上另一半：**原文里有带金额的变更披露而 config 写了 []，就打旗。**
+
+    能做成这样是 0024 关键词工作的直接结果：`change in estimate` 在 META/AMZN
+    全文各只出现 1 次，那一次就是量化那句，特异性够高才敢拿它当判据。
+
+    **yellow 不 red**（2026-09-19 裁决）：会计估计变更不止折旧年限（无形资产年限、
+    信用损失估计都会命中关键词），硬 reject 会让"命中的是别的估计变更"这种诚实
+    情形无解——正是 _forced_zero_keys（0022 C3）记着的那个病理：拒绝→上调→又被
+    另一条拒绝→烧光重试→硬失败。判断层必须**回应**（schema 强制 note 非空），
+    但可以回应"命中的与折旧无关"。
+
+    只在**有金额**的命中上打旗：政策样板段落（"useful lives of equipment" 之类）
+    满篇都是，不带金额的不构成"有变更未申报"的证据。
+    """
+    if declared:                      # 已申报，不必再提示
+        return []
+    if not sections_raw:
+        return []
+    try:
+        secs = json.loads(sections_raw) if isinstance(sections_raw, str) else sections_raw
+    except (ValueError, TypeError):
+        return []
+    money = re.compile(r"\$\s?[\d,.]+\s?(?:billion|million)", re.I)
+    ev = []
+    for fn, hits in (secs or {}).items():
+        for h in hits or []:
+            # 只认高特异性关键词（0025，四标的实测收紧）：首版把 useful li 也算
+            # 进证据，结果 AMZN 报 5 处里 4 处是政策样板碰巧挨着金额、GOOGL 报的
+            # 唯一一处是收购无形资产年限表（"Includes $660 million of acquired
+            # cash... Weighted-Average Useful Life"）——全是噪声。
+            # 按关键词拆开看：change in estimate 在 AMZN/META 各命中 1 次且都是
+            # 真变更、在 GOOGL/NVDA 各 0 次且它们确实没变更，**精确率与召回率都是
+            # 满分**；useful li 贡献的 5 处全错。
+            # useful li 仍留在 extract_sections 的抽取列表里（判断层要看政策上下文，
+            # 成本也低），只是不再驱动这条旗——**抓取用宽关键词、判据用窄关键词**。
+            if h.get("keyword") in ("change in estimate", "accounting estimate")                     and money.search(h.get("text") or ""):
+                ev.append((fn, (h.get("text") or "").strip()))
+    if not ev:
+        return []
+    _q = "；".join(f"{fn}: …{t[:160]}…" for fn, t in ev[:max_show])
+    return [["yellow",
+             f"accounting_estimate_changes 申报为空，但 SECTIONS 里有 {len(ev)} 处"
+             "带金额的会计估计变更摘录——这类变更改 opm 与 EPS 却不动净利/营业利润"
+             "比值，机械探测器看不见。请确认是真的没有，还是命中的属于无形资产年限/"
+             f"信用损失等与折旧无关的变更（后者也应申报并在 note 说明）。证据：{_q}"]]
+
+
+def fcf_caliber_warnings(facts, gap_pp_gate=0.5):
+    """历史 FCF 利润率表的口径对照 -> ([[level, msg]], diag|None)。
+
+    hist_fcf_margins 用 `CFO − capex`，而 **融资租赁取得的设备不进 capex**
+    （ASC 842 下是非现金投资活动），本金偿付走筹资活动。于是租得越多，这张表
+    看起来越好 —— 而它正是 DCF 终值 margins 的锚，一条腿的大头压在上面。
+
+    发行人自己的口径常把它减掉。META 10-K 的 FCF 调节表原文就是
+    `115,800 − 69,691 − 2,524 = 43,585`，而引擎算 46,109，差 1.25pp。
+
+    两只票 2026-09-19 实测（融资租赁本金，$M）：
+        META  850 → 1,058 → 1,969 → 2,524   逐年扩大
+        AMZN  7,941 → 4,384 → 2,043 → 1,557 逐年缩小
+    **AMZN 那个方向更坏**：偏差随时间衰减，会在表里凭空造出一条"FCF 率逐年
+    恶化"的假趋势 —— 恒定偏差至少不改变形状。
+
+    只对照不覆盖（同 other_income_crosscheck / post_period_capital_events）：
+    「FCF 该怎么定义」是判断，自动化不了；这里只把差额顶到台面上。缺标签
+    不打旗 —— ASC 842 要求有融资租赁就得标，缺失基本等于真的没有，为此刷一条
+    黄旗是噪声；但把对照结果写进 diag，让"跑过且没找到"与"没跑"可区分。
+    """
+    facts = facts or {}
+    rev, cfo = facts.get("revenue_annual") or {}, facts.get("cfo_annual") or {}
+    cap = facts.get("capex_annual") or {}
+    flp = facts.get("finance_lease_principal_annual") or {}
+    rows = []
+    for k in sorted(rev):
+        r, c, x, f = rev.get(k), cfo.get(k), cap.get(k), flp.get(k)
+        if all(_isnum(v) for v in (r, c, x)) and r and _isnum(f):
+            # facts 存原始美元，展示一律 $M —— 比率两边约掉没事，绝对额必须换算。
+            # 首版就漏了这一步，把 2,524M 印成 "2,524,000,000M"，与
+            # other_income_crosscheck 的 docstring 里记着的那个坑一字不差。
+            rows.append((k, (c - x) / r, (c - x - abs(f)) / r, abs(f) / 1e6))
+    if not rows:
+        return [], None
+    k, eng, adj, f = rows[-1]
+    diag = {"latest_fy": k, "engine_fcf_margin": round(eng, 4),
+            "issuer_caliber_margin": round(adj, 4),
+            "finance_lease_principal": round(f),
+            "gap_pp": round((eng - adj) * 100, 2),
+            "series": [[a, round((b - c) * 100, 2)] for a, b, c, _ in rows[-4:]]}
+    if (eng - adj) * 100 < gap_pp_gate:
+        return [], diag
+    _tail = "、".join(f"{a[:4]} {b:.2f}pp" for a, b in diag["series"])
+    return [["yellow",
+             f"历史 FCF 利润率表口径偏高：{k[:4]} 财年融资租赁本金 {f:,.0f}M 未从 "
+             f"CFO−capex 中扣除，本表 {eng:.1%} vs 发行人常用口径 {adj:.1%}"
+             f"（差 {(eng - adj) * 100:.2f}pp，>{gap_pp_gate}pp）。融资租赁取得的设备"
+             "不进 capex，租得越多这张表越好看 —— 而它是 DCF 终值 margins 的锚。"
+             f"近四年差额：{_tail}；差额若逐年变化，表里的 FCF 率趋势有一部分是"
+             "口径漂移不是经营变化"]], diag
+
+
+def dcf_nm_check(ddiag, dcf_ps, fcf_base, rev0):
+    """DCF 腿的 n.m. 闸（对称补齐 pe_nm / sotp_nm）-> (nm: bool, reason: str|None)。
+
+    此前 PE 腿有 `pe_nm`、SOTP 腿有 `sotp_nm`，唯独 DCF 腿在 blend_methods 里
+    **硬编码恒在**，TUNING.md 还把它写成"综合退化为 DCF"的最后兜底腿。对一家
+    TTM FCF 为负的发行人这恰好反了：现金流锚都没有的那条腿拿到了满额投票权。
+
+    AMZN 2026-09-19 实测：TTM FCF -11,625M（-1.5% 营收），三档 DCF 腿分别
+    73.6/159.6/257.9，把 base 综合从 PE 腿的 256.6（= 自身交易区间中位 257.5）
+    拖到 201.8（-20%）；bear 的 73.6/股 = 全公司 802B，而 AWS 单分部 FY25 营业
+    利润就有 45,606M。这不是悲观情景，是终值那一个数字的算术产物。
+
+    闸门只用**不可被假设层反向调节**的判据——判断层改 margins 路径不能把自己
+    重新投票进来（否则就是 TUNING.md 警告的"扭曲假设消红旗"的镜像）：
+      ① pre_fcf：TTM FCF <= 2% 营收。与 dcf_diag_warnings 同一条谓词——那里
+         据此承认『DCF权益/TTM FCF』护栏"未生效"。**校验一条腿的护栏跑不起来
+         时，这条腿不该有投票权**，这是同一个事实的两半。判据取自 reported TTM，
+         与情景假设无关。
+      ② dcf_ps <= 0：负数进算术平均没有估值语义（今天已是 red，但仍留在综合里）。
+      ③ pv_explicit <= 0 的退化形态（tv_pv_share 为 None 而 tv_pv > 0）：显式期
+         现值非正 = 估值 100% 押终值，比 >75% 更极端。
+    刻意**不**把 tv_pv_share > 0.75 写进闸门：那个量由 margins 路径决定，是可被
+    假设层调节的，且今天已有 red 通道打回判断层，再叠一道 n.m. 等于双重处罚。
+
+    退出综合 ≠ 隐藏：dcf_ps 仍照算、照进 valuation.json 与报告 DCF 页。
+    """
+    if dcf_ps <= 0:
+        return True, f"DCF 每股价值 {dcf_ps:.1f} <= 0"
+    if not (fcf_base > 0.02 * rev0):
+        return True, (f"TTM FCF {fcf_base:,.0f}M 占营收 {fcf_base / rev0:.1%} "
+                      "(<=2%)，『DCF权益/TTM FCF』护栏无法生效")
+    if ddiag.get("tv_pv_share") is None and (ddiag.get("tv_pv") or 0) > 0:
+        return True, (f"显式期现值非正（{ddiag.get('pv_explicit') or 0:,.0f}M），"
+                      "估值 100% 押终值")
+    return False, None
+
+
+def leg_multiple_crosscheck(pe_target, fwd_shares, net_cash, op1,
+                            seg1_share, m1, m2, tol=0.25):
+    """PE 腿与 SOTP 腿的倍数自洽性 -> [[level, msg]]。
+
+    两条腿给同一家公司、同一情景的同一笔盈利定价，却分别从两套心证取倍数：
+    `pe` 来自历史 NTM 带 P50，`m1/m2` 来自分部可比——中间没有任何环节检查它们
+    是否指向同一个企业价值。把 PE 腿的目标权益值换算回 EV/EBIT 就能直接比。
+
+    AMZN 2026-09-19 实测 bear/base/bull = +53%/+36%/+21%（PE 腿 22.4/24.8/26.3x
+    vs SOTP 设定 14.6/18.2/21.8x）——同一情景里两条腿差三分之一还照样进算术平均；
+    META 同日 +5%/+8%/+9%，config 是校准过的。这条判据能干净地把两者分开。
+
+    yellow 不 red：这是给判断层的校准提示，让它**显式**决定该动 pe 还是动 m1/m2。
+    走 red 会触发 gate 打回，而打回的最省力解法是把倍数互相凑齐——那是假设洗白，
+    不是校准。
+    """
+    if op1 <= 0 or pe_target <= 0 or not fwd_shares:
+        return []
+    ev_ebit_pe = (pe_target * fwd_shares - net_cash) / op1
+    ev_ebit_sotp = seg1_share * m1 + (1 - seg1_share) * m2
+    if ev_ebit_sotp <= 0 or ev_ebit_pe <= 0:
+        return []
+    dev = ev_ebit_pe / ev_ebit_sotp - 1
+    if abs(dev) <= tol:
+        return []
+    return [["yellow", f"PE 腿隐含 EV/EBIT {ev_ebit_pe:.1f}x 与 SOTP 腿设定 "
+                       f"{ev_ebit_sotp:.1f}x 偏离 {dev:+.0%}（>±{tol:.0%}）——"
+                       "两条腿在给同一笔营业利润定两个价，请对齐 pe 与 m1/m2 的口径"]]
+
+
+def blend_legs(vals, blend_methods, weights):
+    """加权综合 + 离散度 + **腿值区间** -> (blend, spread, rng)。
+
+    rng 是本轮新增：`method_spread` 此前只打一条"各法分歧大"的黄旗，然后照样
+    输出算术平均——告警没有任何后果，读报告的人拿到的还是一个看起来很精确的
+    点估计。给出参与综合的腿的 [min, max]，点估计就没法被当成精度读了。
+
+    刻意不做的两件事：不改 spread 的 >2 阈值、不把它升 red。升 red 会走 gate
+    打回判断层，而清除它最省力的办法是把各腿假设互相凑拢——正是 TUNING.md
+    警告过的"扭曲假设消红旗"。区间是呈现层的约束，判断层无法靠调参绕开。
+    """
+    if not blend_methods:
+        return None, None, None
+    picked = [vals[m] for m in blend_methods]
+    wsum = sum(weights[m] for m in blend_methods)
+    blend = (sum(vals[m] * weights[m] for m in blend_methods) / wsum
+             if wsum > 0 else sum(picked) / len(picked))
+    spread = (round(max(picked) / min(picked), 2)
+              if len(picked) > 1 and min(picked) > 0 else None)
+    rng = [round(min(picked), 1), round(max(picked), 1)] if len(picked) > 1 else None
+    return blend, spread, rng
+
+
 def dcf_diag_warnings(ddiag, dcf_eq, fcf_base, rev0, ocf):
     """DCF 三道巡航护栏（第10年营收倍数 / 终值占比 / P/FCF 界外）-> [[level, msg]]。
 
@@ -975,16 +1181,21 @@ for name, s in cfg["scenarios"].items():
     # 亏损情景写 m1=m2=0，那样 sotp_ps 退化成"每股净现金"，一个纯现金数字冒充估值腿
     # 混进综合，同样不是估值。
     sotp_nm = op1 <= 0
-    blend_methods = ((["pe"] if not pe_nm else []) + ["dcf"]
+    # DCF 腿同理（0023）：此前 "dcf" 在下面这行里硬编码恒在，是三条腿里唯一
+    # 没有 n.m. 通道的。判据见 dcf_nm_check——只用 reported TTM FCF 一类不可被
+    # 假设层反向调节的量。
+    dcf_nm, dcf_nm_reason = dcf_nm_check(ddiag, dcf_ps, fcf_base, rev0)
+    blend_methods = ((["pe"] if not pe_nm else [])
+                     + ([] if dcf_nm else ["dcf"])
                      + (["sotp"] if sotp_in_blend and not sotp_nm else []))
-    methods = ([] if pe_nm else [pe_target]) + [dcf_ps] \
-        + ([sotp_ps] if sotp_in_blend and not sotp_nm else [])
     _vals = {"pe": pe_target, "dcf": dcf_ps, "sotp": sotp_ps}
-    _wsum = sum(BLEND_W[m] for m in blend_methods)
-    blend = (sum(_vals[m] * BLEND_W[m] for m in blend_methods) / _wsum
-             if _wsum > 0 else sum(methods) / len(methods))
-    spread = (round(max(methods) / min(methods), 2)
-              if len(methods) > 1 and min(methods) > 0 else None)
+    # 三条腿全 n.m. 时不能交出空综合：退回 DCF 单腿并在下面打 red。让"无腿可用"
+    # 显式失败一次，好过静默 None 流进 Excel 公式与 compare/trend
+    _all_nm = not blend_methods
+    if _all_nm:
+        blend_methods = ["dcf"]
+    blend, spread, blend_range = blend_legs(_vals, blend_methods, BLEND_W)
+    methods = [_vals[m] for m in blend_methods]
 
     # ---- v2 经济合理性诊断（red=假设可修复，服务层可据此打回判断层一次；
     #      yellow=呈现层警示。全部随报告红旗区展示，不静默）----
@@ -997,7 +1208,20 @@ for name, s in cfg["scenarios"].items():
         if not 6 <= p_ni <= 60:
             warnings.append(["yellow", f"综合目标价隐含 P/调整后净利 {p_ni:.1f}x（界外 [6,60]）"])
     if spread and spread > 2:
-        warnings.append(["yellow", f"方法离散度 {spread}x（>2x）——各法分歧大，综合可信度降低"])
+        # 区间随文案给出（0023）：此前这条黄旗的唯一后果就是它自己，点估计照发。
+        warnings.append(["yellow", f"方法离散度 {spread}x（>2x）——各法分歧大，综合可信度降低；"
+                                   f"参与综合的腿落在 {blend_range[0]:.1f}~{blend_range[1]:.1f}，"
+                                   "综合值请按区间读，不要当点估计"])
+    if dcf_nm:
+        warnings.append(["yellow",
+                         f"{name} DCF 腿 n.m.（{dcf_nm_reason}）——现金流锚缺失时"
+                         "十年 FCFF 的每一分钱都来自 margins 路径与终值假设，已剔出综合；"
+                         "综合仅取 " + "+".join(m.upper() for m in blend_methods)
+                         + f"（DCF 每股 {dcf_ps:.1f} 仍在报告 DCF 页备查）"])
+    if _all_nm:
+        warnings.append(["red", f"{name} 三条腿全部 n.m.（PE/SOTP 已剔、DCF 亦无现金流锚），"
+                                "综合退回 DCF 单腿仅为占位——该情景没有可用的估值支撑，"
+                                "请复核假设或声明该标的不适用本框架"])
     if dcf_ps <= 0 and "dcf" in blend_methods:
         # margins 全程深负 + 净现金为负时 DCF 腿可以合法算出 <=0——PE 腿又被守卫
         # 退出时，负数会独腿成为"综合目标价"无声进产线。red：打回判断层复审
@@ -1022,6 +1246,17 @@ for name, s in cfg["scenarios"].items():
     # 只会产出必然的「该票历史上从未出现过」黄旗
     if not pe_nm:
         warnings += pe_band_check(name, s["pe"], facts.get("pe_band"), ddiag)
+    # PE 腿 vs SOTP 腿的倍数自洽（0023）。降级为参考项的 SOTP 也照查——它不进
+    # 综合不代表 m1/m2 可以随便填，报告 SOTP 页仍然按它出数
+    if not pe_nm and not sotp_nm:
+        _xc = leg_multiple_crosscheck(pe_target, cfg["fwd_shares"], cfg["net_cash"],
+                                      op1, cfg["seg1_share"], s["m1"], s["m2"])
+        if _xc:
+            ddiag["ev_ebit_pe"] = round(
+                (pe_target * cfg["fwd_shares"] - cfg["net_cash"]) / op1, 1)
+            ddiag["ev_ebit_sotp"] = round(
+                cfg["seg1_share"] * s["m1"] + (1 - cfg["seg1_share"]) * s["m2"], 1)
+        warnings += _xc
 
     out["scenarios"][name] = dict(
         assumptions=s, rev1=round(rev1), op1=round(op1), ni1=round(ni1),
@@ -1033,6 +1268,8 @@ for name, s in cfg["scenarios"].items():
         # blend 由哪几条腿构成——build_report 的综合公式必须与引擎同构，
         # 否则 verify_report 的交叉核对会在 PE 腿 n.m. 时假 FAIL
         blend_methods=blend_methods,
+        # 参与综合的腿的 [min,max]（0023）：离散度大时点估计不该被当精度读
+        blend_range=blend_range,
         method_spread=spread, diagnostics=ddiag, warnings=warnings,
     )
 
@@ -1059,6 +1296,14 @@ out["warnings_global"] += seg_share_crosscheck(
     cfg.get("segment_count"), sotp_in_blend)
 out["scenarios"]["base"]["warnings"] += other_income_crosscheck(
     facts, cfg["other_income"], out["scenarios"]["base"]["eps1"], cfg["fwd_shares"])
+# FCF 口径对照（0024）：走全局通道——它说的是那张历史年度表本身的口径，与情景
+# 假设无关。diag 无条件落盘，"跑过且没找到融资租赁"与"没跑"要能区分。
+_fcfw, _fcfd = fcf_caliber_warnings(facts)
+out["warnings_global"] += _fcfw
+out["fcf_caliber"] = _fcfd
+# 会计估计变更的申报 vs 原文证据（0025）：走全局通道——与情景假设无关
+out["warnings_global"] += estimate_change_evidence(
+    SECTIONS_RAW, bool(cfg.get("accounting_estimate_changes")))
 
 # ---- DCF 终值护栏（2026-08-31）：终值那一个数字撑起 DCF 的大头，却是整份
 # 假设里最不受约束的——原有三道护栏（第10年营收 >8x / 终值占比 >75% /
@@ -1301,9 +1546,11 @@ for n, v in out["scenarios"].items():
     _bm = v["blend_methods"]
     print(f"{n:5s}| EPS1 {v['eps1']:8.2f} | "
           f"PE法 {v['pe_target']:9.1f}{' ' if 'pe' in _bm else 'x'}| "
-          f"DCF {v['dcf_ps']:9.1f} | "
+          f"DCF {v['dcf_ps']:9.1f}{' ' if 'dcf' in _bm else 'x'}| "
           f"SOTP {v['sotp_ps']:9.1f}"
           f"{'*' if not sotp_in_blend else (' ' if 'sotp' in _bm else 'x')}| "
-          f"综合 {v['blend']:9.1f} | {v['upside']:+.1%}")
+          f"综合 {v['blend']:9.1f} | {v['upside']:+.1%}"
+          + (f" | 腿区间 {v['blend_range'][0]:.1f}~{v['blend_range'][1]:.1f}"
+             if v.get("blend_range") else ""))
     for lv, msg in v["warnings"]:
         print(f"      {'⛔' if lv == 'red' else '⚠️'} {msg}")

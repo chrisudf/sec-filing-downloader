@@ -5,6 +5,8 @@
 红旗是假的 → gate 打回后判断层上修 bear.margins 越过 base → 自相矛盾的假设发货。
 """
 import ast
+import json
+import re
 import copy
 from pathlib import Path
 
@@ -22,11 +24,15 @@ _SEG = [ast.get_source_segment(_SRC, n) for n in ast.parse(_SRC).body
         and n.name in ("_isnum", "vintage_warnings", "band_lag_warnings",
                        "other_income_crosscheck", "hist_fcf_margins",
                        "terminal_margin_warnings", "terminal_sensitivity",
-                       "dcf", "dcf_diag_warnings", "ps_reference")]
+                       "dcf", "dcf_diag_warnings", "ps_reference",
+                       "dcf_nm_check", "leg_multiple_crosscheck", "blend_legs",
+                       "fcf_caliber_warnings", "estimate_change_evidence")]
 # _isnum 是这些函数共用的模块级谓词（排除 bool），必须一起抽——
 # 否则 exec 出来的命名空间里没有它，全部 NameError
-assert len(_SEG) == 10, _SEG
-_NS = {}
+assert len(_SEG) == 15, _SEG
+# 抽出来的函数在裸命名空间里 exec —— 生产代码里的模块级 import 不会跟着来。
+# estimate_change_evidence 用了 json/re，不喂进去就是 NameError（实测）。
+_NS = {"json": json, "re": re}
 exec(chr(10).join(_SEG), _NS)
 _isnum = _NS["_isnum"]
 vintage_warnings = _NS["vintage_warnings"]
@@ -38,6 +44,11 @@ terminal_sensitivity = _NS["terminal_sensitivity"]
 dcf = _NS["dcf"]
 dcf_diag_warnings = _NS["dcf_diag_warnings"]
 ps_reference = _NS["ps_reference"]
+dcf_nm_check = _NS["dcf_nm_check"]
+leg_multiple_crosscheck = _NS["leg_multiple_crosscheck"]
+blend_legs = _NS["blend_legs"]
+fcf_caliber_warnings = _NS["fcf_caliber_warnings"]
+estimate_change_evidence = _NS["estimate_change_evidence"]
 
 
 def _mk(**over):
@@ -48,6 +59,7 @@ def _mk(**over):
     d = dict(
         fwd_shares=1000.0, net_cash=0.0, net_cash_note="x",
         adj_ni=100.0, adj_note="x", other_income=0.0, other_income_note="x",
+        accounting_estimate_changes=[], accounting_estimate_note="x",
         seg1="A", seg2="B", seg1_share=0.9,
         rationale={k: "x" for k in ("g", "opm", "pe", "m1", "rl", "wacc", "dcf_margin")},
         notes=["x"],
@@ -1370,3 +1382,233 @@ def test_fin_age_tail_does_not_ask_to_fill_ppce():
 def test_std_age_tail_verbatim_unchanged():
     (_, msg), = vintage_warnings(_cfg(), _vt(age=60))
     assert "期后资本事件未声明，请核对增发/回购/并购/分拆/分红后填写" in msg
+
+# ===================== 0023：DCF 腿 n.m. / 腿间互校 / 综合区间 =====================
+# 回归对象是 AMZN vs META 2026-09-19 那两次真实运行：AMZN TTM FCF -11,625M
+# （-1.5% 营收），三档 DCF 腿 73.6/159.6/257.9 拿满额权重把 base 综合从 PE 腿的
+# 256.6（= 自身交易区间中位 257.5）拖到 201.8（-20%）；META 同日 FCF 率 18%，
+# DCF 腿合法，不该被这次改动碰到。两个方向都要钉住。
+
+def test_dcf_nm_amzn_pre_fcf_negative():
+    """AMZN 形态：TTM FCF 为负 -> DCF 腿 n.m.，理由点出护栏无法生效。"""
+    nm, why = dcf_nm_check({"tv_pv_share": 0.723, "tv_pv": 1280030,
+                            "pv_explicit": 490341},
+                           dcf_ps=159.6, fcf_base=-11625, rev0=775680)
+    assert nm is True
+    assert "护栏无法生效" in why and "-1.5%" in why
+
+
+def test_dcf_nm_meta_healthy_fcf_stays_in():
+    """META 形态：FCF 率 18% + TV 占比 70% -> DCF 腿留在综合里。
+
+    TV 占比高不进 n.m. 闸是刻意的：那个量由 margins 路径决定、可被假设层调节，
+    且已有 red 通道。这条测试就是钉住"不要顺手把它加进闸门"。
+    """
+    nm, why = dcf_nm_check({"tv_pv_share": 0.6966, "tv_pv": 1765924,
+                            "pv_explicit": 769161},
+                           dcf_ps=990.5, fcf_base=40976, rev0=228248)
+    assert nm is False and why is None
+
+
+def test_dcf_nm_tv_share_above_75_alone_does_not_gate():
+    """>75% TV 占比 + 健康 FCF：仍留在综合（该形态归 red 通道，不双重处罚）。"""
+    nm, _ = dcf_nm_check({"tv_pv_share": 0.81, "tv_pv": 100.0, "pv_explicit": 23.0},
+                         dcf_ps=50.0, fcf_base=40976, rev0=228248)
+    assert nm is False
+
+
+def test_dcf_nm_boundary_two_pct_of_revenue():
+    """闸门与 dcf_diag_warnings 的 pre_fcf 必须同一条：> 2% 营收才算有锚。"""
+    assert dcf_nm_check({}, 10.0, 2.0001, 100.0)[0] is False
+    assert dcf_nm_check({}, 10.0, 2.0, 100.0)[0] is True
+
+
+def test_dcf_nm_nonpositive_and_degenerate_pv():
+    assert dcf_nm_check({}, -3.0, 50000, 100000)[0] is True
+    nm, why = dcf_nm_check({"tv_pv_share": None, "tv_pv": 900.0, "pv_explicit": -12.0},
+                           dcf_ps=8.0, fcf_base=50000, rev0=100000)
+    assert nm is True and "100% 押终值" in why
+
+
+def test_leg_crosscheck_fires_on_amzn_base():
+    """AMZN base：PE 腿隐含 24.8x vs SOTP 设定 18.2x -> +36%，黄旗。"""
+    (lv, msg), = leg_multiple_crosscheck(
+        pe_target=256.6, fwd_shares=10980, net_cash=-30500, op1=114956,
+        seg1_share=0.58, m1=22, m2=13)
+    assert lv == "yellow"
+    assert "24.8x" in msg and "18.2x" in msg and "+36%" in msg
+
+
+def test_leg_crosscheck_silent_on_meta_base():
+    """META base：18.0x vs 16.7x = +8%，校准过的 config 不该被打扰。"""
+    assert leg_multiple_crosscheck(
+        pe_target=664.3, fwd_shares=2560, net_cash=6596, op1=94266,
+        seg1_share=0.98, m1=17, m2=0) == []
+
+
+def test_leg_crosscheck_skips_degenerate_inputs():
+    """亏损情景（op1<=0）与 m1=m2=0 的约定值不该产出噪声黄旗。"""
+    assert leg_multiple_crosscheck(100, 1000, 0, -5, 0.9, 10, 5) == []
+    assert leg_multiple_crosscheck(100, 1000, 0, 500, 0.9, 0, 0) == []
+
+
+def test_blend_legs_drops_dcf_and_reports_range():
+    """AMZN base 去掉 DCF 腿后：综合 223.0，区间钉在两条腿上。"""
+    vals = {"pe": 256.6, "dcf": 159.6, "sotp": 189.3}
+    w = {"pe": 1.0, "dcf": 1.0, "sotp": 1.0}
+    blend, spread, rng = blend_legs(vals, ["pe", "sotp"], w)
+    assert round(blend, 1) == 223.0
+    assert rng == [189.3, 256.6]
+    # 原三腿等权口径作对照：这就是被修掉的那个 201.8
+    assert round(blend_legs(vals, ["pe", "dcf", "sotp"], w)[0], 1) == 201.8
+
+
+def test_blend_legs_single_leg_has_no_range():
+    blend, spread, rng = blend_legs({"pe": 10.0, "dcf": 5.0, "sotp": 1.0},
+                                    ["pe"], {"pe": 1.0, "dcf": 1.0, "sotp": 1.0})
+    assert blend == 10.0 and spread is None and rng is None
+
+
+def test_blend_legs_respects_weights():
+    vals = {"pe": 100.0, "dcf": 200.0, "sotp": 0.0}
+    blend, _, _ = blend_legs(vals, ["pe", "dcf"], {"pe": 3.0, "dcf": 1.0, "sotp": 1.0})
+    assert blend == 125.0
+
+
+def test_blend_legs_zero_weight_sum_falls_back_to_equal():
+    vals = {"pe": 100.0, "dcf": 200.0, "sotp": 0.0}
+    blend, _, _ = blend_legs(vals, ["pe", "dcf"], {"pe": 0.0, "dcf": 0.0, "sotp": 0.0})
+    assert blend == 150.0
+
+
+def test_blend_legs_empty_methods_returns_none():
+    """三腿全 n.m. 时返回 None——引擎据此走 red 占位分支，不静默发 0。"""
+    assert blend_legs({"pe": 1.0, "dcf": 2.0, "sotp": 3.0}, [],
+                      {"pe": 1.0, "dcf": 1.0, "sotp": 1.0}) == (None, None, None)
+
+# ===================== 0024：FCF 口径对照 =====================
+# 回归对象是 META 2026-09-19：10-K 自己的 FCF 调节表是
+# 115,800 - 69,691 - 2,524 = 43,585，而 hist_fcf_margins 算 46,109（差 1.26pp）。
+# 那张表是 DCF 终值 margins 的锚，而 META 的 DCF 腿是进综合的。
+
+def _facts_fl(flp):
+    """两只票的真实年度序列（原始美元，与 facts.json 同口径）。"""
+    rev = {"2022-12-31": 116609e6, "2023-12-31": 134902e6,
+           "2024-12-31": 164501e6, "2025-12-31": 200966e6}
+    cfo = {"2022-12-31": 50475e6, "2023-12-31": 71113e6,
+           "2024-12-31": 91328e6, "2025-12-31": 115800e6}
+    cap = {"2022-12-31": 31186e6, "2023-12-31": 27045e6,
+           "2024-12-31": 37256e6, "2025-12-31": 69691e6}
+    return {"revenue_annual": rev, "cfo_annual": cfo, "capex_annual": cap,
+            "finance_lease_principal_annual": flp}
+
+
+def test_fcf_caliber_fires_on_meta():
+    w, d = fcf_caliber_warnings(_facts_fl(
+        {"2022-12-31": 850e6, "2023-12-31": 1058e6,
+         "2024-12-31": 1969e6, "2025-12-31": 2524e6}))
+    (lv, msg), = w
+    assert lv == "yellow"
+    assert d["gap_pp"] == 1.26
+    assert round(d["engine_fcf_margin"], 3) == 0.229
+    assert round(d["issuer_caliber_margin"], 3) == 0.217
+    # 金额必须是 $M —— 首版把原始美元直接印成 "2,524,000,000M"
+    assert "2,524M" in msg and "2,524,000,000" not in msg
+    # 逐年差额要能看出漂移方向（0.73 -> 1.26）
+    assert [x[1] for x in d["series"]] == [0.73, 0.78, 1.20, 1.26]
+
+
+def test_fcf_caliber_silent_on_amzn_scale():
+    """AMZN 2025 融资租赁本金 1,557M / 营收 716,924M = 0.22pp，在闸门下。"""
+    w, d = fcf_caliber_warnings({
+        "revenue_annual": {"2025-12-31": 716924e6},
+        "cfo_annual": {"2025-12-31": 139514e6},
+        "capex_annual": {"2025-12-31": 131819e6},
+        "finance_lease_principal_annual": {"2025-12-31": 1557e6}})
+    assert w == [] and d is not None and d["gap_pp"] == 0.22
+
+
+def test_fcf_caliber_no_tag_is_silent_but_diag_none():
+    """缺标签不打旗（ASC 842 下缺失≈真没有），但 diag 为 None 以区分'没跑'。"""
+    w, d = fcf_caliber_warnings({
+        "revenue_annual": {"2025-12-31": 100e6},
+        "cfo_annual": {"2025-12-31": 20e6},
+        "capex_annual": {"2025-12-31": 5e6}})
+    assert w == [] and d is None
+    assert fcf_caliber_warnings(None) == ([], None)
+    assert fcf_caliber_warnings({}) == ([], None)
+
+
+def test_fcf_caliber_uses_latest_common_year():
+    """四条序列 key 不齐时只用共同年份，不拿错年做判据。"""
+    f = _facts_fl({"2024-12-31": 1969e6})   # 只有 2024 有融资租赁
+    w, d = fcf_caliber_warnings(f)
+    assert d["latest_fy"] == "2024-12-31" and d["gap_pp"] == 1.20
+
+
+def test_fcf_caliber_gate_is_configurable_and_sign_safe():
+    f = _facts_fl({"2025-12-31": 2524e6})
+    assert fcf_caliber_warnings(f, gap_pp_gate=2.0)[0] == []
+    # 标签给负值（部分发行人按流出记负）时取绝对值，不能算成"口径偏低"
+    fneg = _facts_fl({"2025-12-31": -2524e6})
+    assert fcf_caliber_warnings(fneg)[1]["gap_pp"] == 1.26
+
+# ============ 0025：会计估计变更的申报 vs 原文证据 ============
+# 让必填字段可执行。现有的 post_period_capital_events 也必填，但校验层只查形状、
+# 从不与原文对账（sections.json 只喂 prompt），写 [] 永远能过。
+
+_META_HIT = {"META_10-K.htm": [
+    {"keyword": "change in estimate", "channel": "fact",
+     "text": "the financial impact of this change in estimate included a reduction in "
+             "depreciation expense of $ 2.92 billion and an increase in net income of "
+             "$ 2.59 billion, or $ 1.00 per diluted share"}]}
+
+
+def test_estimate_evidence_fires_when_declared_empty():
+    (lv, msg), = estimate_change_evidence(json.dumps(_META_HIT, ensure_ascii=False), False)
+    assert lv == "yellow"
+    assert "申报为空" in msg and "2.92 billion" in msg
+
+
+def test_estimate_evidence_silent_when_declared():
+    """已申报就不再提示——它的作用是补漏，不是每次都喊。"""
+    assert estimate_change_evidence(json.dumps(_META_HIT), True) == []
+
+
+def test_estimate_evidence_ignores_useful_li_even_with_amount():
+    """GOOGL 2026-09-19 实测的假阳性：收购无形资产年限表碰巧挨着金额。
+
+    按关键词拆开的实测（四标的）：change in estimate 在 AMZN/META 各 1 次且都是
+    真变更、GOOGL/NVDA 各 0 次且确实没变更（精确率召回率满分）；useful li 贡献的
+    5 处全是噪声。抓取用宽关键词、判据用窄关键词。
+    """
+    googl = {"GOOGL_10-Q.htm": [{"keyword": "useful li", "channel": "fact",
+             "text": "Includes $ 660 million of acquired cash. Intangible assets "
+                     "acquired as of the acquisition date were as follows: Amount "
+                     "(in millions) Weighted-Average Useful Life"}]}
+    assert estimate_change_evidence(json.dumps(googl, ensure_ascii=False), False) == []
+
+
+def test_estimate_evidence_ignores_boilerplate_without_amount():
+    """政策样板满篇都是 'useful lives of equipment'，不带金额不构成证据。"""
+    boiler = {"f.htm": [{"keyword": "useful li", "channel": "fact",
+                         "text": "Estimates are used for, but not limited to, useful lives "
+                                 "of equipment, valuation of acquired intangibles"}]}
+    assert estimate_change_evidence(json.dumps(boiler), False) == []
+
+
+def test_estimate_evidence_ignores_other_keywords_with_money():
+    """别的关键词命中带金额不算数——只认这三条估计变更关键词。"""
+    other = {"f.htm": [{"keyword": "repurchase", "channel": "fact",
+                        "text": "repurchased $ 5.0 billion of common stock"}]}
+    assert estimate_change_evidence(json.dumps(other), False) == []
+
+
+def test_estimate_evidence_tolerates_bad_input():
+    """sections 缺失/损坏不阻断出报告——它是补充证据不是必需输入。"""
+    for bad in ("", None, "not json{", "[]"):
+        assert estimate_change_evidence(bad, False) == []
+
+
+def test_estimate_evidence_accepts_dict_not_only_str():
+    assert len(estimate_change_evidence(_META_HIT, False)) == 1
