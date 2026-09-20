@@ -268,6 +268,89 @@ def vintage_warnings(cfg, vintage, dividends_quarterly=None):
                        + ("（>100 天，严重滞后）" if age > 100 else "")
                        + f"，{bs} 仍是 {end} 口径；" + tail_msg]]
 
+def trailing_basis_position(band, today_iso):
+    """trailing 无滞后带里的当前位置 -> dict|None。与 NTM 分位**并列**，不可相减。
+
+    存在的理由（0026）：ntm 口径结构性滞后一年上下，四标的实测 305/325/415/423
+    天 —— 整个 2026 年的 AI 重定价不在任何一个分布里，而报告给出的"带内第 46
+    百分位"看起来像个确定结论。band_lag_warnings 此前已经把这件事写进黄旗，
+    但只是一句话；读者拿到的**唯一一个分位数字**仍然来自滞后一年的分布。
+
+    trailing 带没有这个滞后（分母是过去 12 个月，当天就算得出），同样经过畸变
+    过滤，数据引擎早就算好了（band.trailing_nolag），只是从没被当成一个读数。
+    本函数把它提成一等公民。实测两个读数分歧很大，值得摆上台面：
+
+        AMZN   NTM ≈P46   trailing 28.1x vs 29.5/32.6/34.1 -> 低于 P25   滞后 52 天
+        META   NTM ≈P48   trailing 25.1x vs 22.3/26.2/28.1 -> ≈P43       滞后  2 天
+        GOOGL  NTM ≈P85   trailing 26.1x vs 26.6/28.1/30.3 -> 低于 P25   滞后 60 天
+        NVDA   NTM ≈P23   trailing 28.1x vs 32.9/41.0/46.6 -> 低于 P25   滞后  2 天
+
+    **两个分位不可相减、更不可合并成一个数**。trailing_PE/NTM_PE 的比值就是 EPS
+    增速因子，取生产带里两者都有值的重叠日实测，极差 1.47x(AMZN) / 3.76x(META) /
+    1.80x(GOOGL) / 1.55x(NVDA)，META 逐年中位在 0.71~2.16 之间摆动 —— 用任何单一
+    标量把一个折算成另一个，引入的误差和要测的东西同量级。所以这里刻意**不**提供
+    任何"折算后分位"或"两者之差"字段：能算的字段最终都会被人当成可用的。
+
+    精度的诚实交代：trailing_nolag 只给 P25/P50/P75 三档，所以带内位置是这三点
+    之间的线性插值，标 `interpolated=True`；带外只给关系不给数值（同 NTM 侧对
+    `_pctile_rank` 只在 [P10,P90] 内给数的裁决）。
+
+    自身的滞后也要报：AMZN/GOOGL 的 trailing 同样被那笔 Anthropic 重估堵住 52/60
+    天（畸变过滤器剔掉了含它的窗口），而且要堵到 2027 年年中那笔滚出 TTM 窗口为止。
+    只有 META/NVDA 是真的 2 天。**"无滞后"是相对的，数字必须自己说话。**
+    """
+    tn = (band or {}).get("trailing_nolag") or {}
+    p = {k: v for k, v in (tn.get("pctiles") or {}).items()
+         if _isnum(v) and v == v}          # NaN 守卫，同 band_lag_warnings
+    cur = tn.get("current")
+    if not p or not (_isnum(cur) and cur == cur):
+        return None
+    cd = tn.get("current_date")
+    lag = None
+    if cd:
+        try:
+            lag = (date.fromisoformat(today_iso) - date.fromisoformat(cd)).days
+        except (ValueError, TypeError):
+            lag = None
+    ks = sorted(int(k) for k in p)
+    lo, hi = p[str(ks[0])], p[str(ks[-1])]
+    if cur < lo:
+        rank, rel = None, f"below_p{ks[0]}"
+        pos = f"低于 P{ks[0]}（{lo:.1f}x）"
+    elif cur > hi:
+        rank, rel = None, f"above_p{ks[-1]}"
+        pos = f"高于 P{ks[-1]}（{hi:.1f}x）"
+    else:
+        rank, rel = round(_pctile_rank(p, cur), 1), "in_band"
+        pos = f"带内第 {rank:.0f} 百分位（P{ks[0]}/P{ks[-1]} 间插值）"
+    return dict(basis="trailing", current=round(cur, 2), current_date=cd,
+                lag_days=lag, span=tn.get("span"), pctiles=p,
+                pctile=rank, vs_band=rel, position=pos, interpolated=True,
+                note="分母=过去12个月；与 NTM 分位口径不同，**不可相减、不可合并**"
+                     "（两者之比即 EPS 增速因子，实测极差 1.5~3.8x）")
+
+
+def dual_basis_warning(ntm_pos, ntm_lag, tr):
+    """两个口径的分位并排给出 -> [[level, msg]]。只在两者都有、且 NTM 确实滞后时出。
+
+    不打分歧大小的阈值：分歧本身不是错误，是两个口径在回答不同问题（"相对
+    一年前的前瞻估值分布"vs"相对最近一年的滞后估值分布"）。读者需要的是**同时
+    看到两个数**，不是引擎替他判哪个对。
+    """
+    if not tr or not ntm_pos or not ntm_lag:
+        return []
+    _l = f"（滞后 {tr['lag_days']} 天）" if tr.get("lag_days") is not None else ""
+    return [["yellow",
+             f"双口径分位（**不可相减**）：① NTM 口径 {ntm_pos}，但该分布滞后 "
+             f"{ntm_lag} 天，最近一年不在里面；② trailing 无滞后口径 "
+             f"{tr['current']:.1f}x → {tr['position']}{_l}。"
+             "两者分母不同（未来12个月 vs 过去12个月），差着一个 EPS 增速因子"
+             "（实测极差 1.5~3.8x，无法用单一标量折算），"
+             "请**分别读**：①回答『相对一年前的前瞻估值分布贵不贵』，"
+             "②回答『相对最近一年的估值水平贵不贵』。两者分歧大时，"
+             "多半说明这一年里发生了重定价 —— 那正是 ① 看不见的东西。"]]
+
+
 def band_lag_warnings(band, span, now_pe, min_lag=270):
     """PE 带子滞后的时效提示 -> [[level, msg], ...]。
 
@@ -1433,6 +1516,13 @@ if (not _base_pe_nm and not _band.get("thin_coverage")
                 f"现价隐含倍数 {_now_pe:.1f}x 已{_side}（带外）且带子滞后 "
                 f"{_sp['lag_days']} 天——区间的均值回归前提可能已失效，"
                 "改看 target_pe 对照与 trailing 分布")
+    # 双口径分位（0026）：把 trailing_nolag 从 band_lag_warnings 里的一句话提成
+    # 一等公民。**并列不合并** —— 两者差着一个 EPS 增速因子，实测无法用标量折算。
+    _trp = trailing_basis_position(_band, cfg["date"])
+    if _trp:
+        out["trading_range"]["trailing_basis"] = _trp
+        out["warnings_global"] += dual_basis_warning(
+            _trw.get("fwd_pe_now_position"), (_trw.get("span") or {}).get("lag_days"), _trp)
 
 # Rule of 40 透传（fetch_facts 计算，standard 模式）：营收增速+利润率的标尺，
 # 与 pe_band 同属"倍数值不值得给"的判断参照，进报告与 prompt 元数据
@@ -1504,6 +1594,14 @@ if out.get("trading_range"):
               f"  →  中位涨幅 {_tr['mult_reversion_to_p50']:+.1%} 是**纯倍数差距**"
               "（给定同一个 base EPS 时，现价与中位价用同一分母，两者之差只能是倍数之差；"
               "改 base EPS 会同比例移动中位价，故此非『与盈利预测无关』）")
+    _tb = _tr.get("trailing_basis")
+    if _tb:
+        # 双口径并排打印（0026）：此前 stdout 只有一个分位数字，且它来自滞后一年
+        # 的分布。两行放一起，读者第一眼就看到它们不是一回事
+        print(f"  双口径分位（不可相减）: ① NTM {_tr.get('fwd_pe_now_position') or 'n/a'}"
+              f"（滞后 {(_tr.get('span') or {}).get('lag_days', '?')} 天）"
+              f"  ② trailing {_tb['current']:.1f}x {_tb['position']}"
+              + (f"（滞后 {_tb['lag_days']} 天）" if _tb.get("lag_days") is not None else ""))
     _df = _tr.get("drift")
     if _df:
         print(f"  窗口内漂移: 早段 {_df['early']['span']['start']}~{_df['early']['span']['end']} "
