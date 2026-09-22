@@ -880,6 +880,28 @@ if _tr:
                             "单一 P50 会把两个 regime 平均成一个看不出分歧的数", GREEN, wrap=True)
         _row += 1
 
+    # ---- 双口径分位（0026）：两个读数并排，放在 trailing 明细之上 ----
+    # 此前整张表只有一个分位数字，而它来自滞后一年的分布。四标的实测两者分歧很大
+    # （GOOGL: NTM 第85百分位 vs trailing 低于P25），并排放才看得见。
+    _tb = _tr.get("trailing_basis")
+    if _tb:
+        _ntm_lag = (_tr.get("span") or {}).get("lag_days")
+        put(ws, f"A{_row}", "双口径分位（不可相减）", BOLD)
+        put(ws, f"B{_row}", f"① NTM：{_tr.get('fwd_pe_now_position') or 'n/a'}"
+                            + (f"（滞后 {_ntm_lag} 天）" if _ntm_lag else ""), BLUE)
+        put(ws, f"E{_row}", f"② trailing：{_tb['current']:.1f}x {_tb['position']}"
+                            + (f"（滞后 {_tb['lag_days']} 天）"
+                               if _tb.get("lag_days") is not None else ""), BLUE)
+        put(ws, f"H{_row}", "两者分母不同（未来12个月 vs 过去12个月），差着一个 EPS "
+                            "增速因子，**不可相减、不可合并成一个数**。分别读："
+                            "① 回答『相对一年前的前瞻估值分布贵不贵』，"
+                            "② 回答『相对最近一年的估值水平贵不贵』。"
+                            "两者分歧大 = 这一年里发生过重定价，而那正是 ① 看不见的。"
+                            "注意 ② 的滞后也要看：畸变过滤器会剔掉含一次性损益的窗口，"
+                            "带一次性重估的票（如持 Anthropic 股权的）两个口径会被"
+                            "同一笔损益同时堵住", GREEN, wrap=True)
+        _row += 1
+
     # ---- 无滞后 trailing 对照：补上主带看不见的最近一年 ----
     _tn = _tr.get("trailing_nolag")
     if _tn:
@@ -896,6 +918,10 @@ if _tr:
                                f"{_g:+.0%}），不是营收增速——两者在利润率扩张/回购的票上"
                                f"会显著分叉。折成 NTM 可比口径约 "
                                f"{_tnp['50'] / (1 + _g):.1f}x"
+                               "（⚠ 这是**点估计**：该因子随盈利周期摆动，取生产带里"
+                               "trailing 与 NTM 都有值的重叠日实测，极差 1.5~3.8x、"
+                               "逐年中位可在 0.7~2.2 之间跳。用它折算整段分布不成立，"
+                               "只能当同一天的粗略对照——要比位置请看上方双口径分位）"
                                if _g is not None and _tnp.get("50") else "")
                             + (f"；主带盲区那段（{_gap['span']['start']}~{_gap['span']['end']}，"
                                f"{_gap['days']}天）trailing P50 {_gap['p50']:.1f}x"

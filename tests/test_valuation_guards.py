@@ -7,6 +7,7 @@
 import ast
 import json
 import re
+from datetime import date
 import copy
 from pathlib import Path
 
@@ -26,13 +27,15 @@ _SEG = [ast.get_source_segment(_SRC, n) for n in ast.parse(_SRC).body
                        "terminal_margin_warnings", "terminal_sensitivity",
                        "dcf", "dcf_diag_warnings", "ps_reference",
                        "dcf_nm_check", "leg_multiple_crosscheck", "blend_legs",
-                       "fcf_caliber_warnings", "estimate_change_evidence")]
+                       "fcf_caliber_warnings", "estimate_change_evidence",
+                       "trailing_basis_position", "dual_basis_warning",
+                       "_pctile_rank")]
 # _isnum 是这些函数共用的模块级谓词（排除 bool），必须一起抽——
 # 否则 exec 出来的命名空间里没有它，全部 NameError
-assert len(_SEG) == 15, _SEG
+assert len(_SEG) == 18, _SEG
 # 抽出来的函数在裸命名空间里 exec —— 生产代码里的模块级 import 不会跟着来。
 # estimate_change_evidence 用了 json/re，不喂进去就是 NameError（实测）。
-_NS = {"json": json, "re": re}
+_NS = {"json": json, "re": re, "date": date}
 exec(chr(10).join(_SEG), _NS)
 _isnum = _NS["_isnum"]
 vintage_warnings = _NS["vintage_warnings"]
@@ -49,6 +52,8 @@ leg_multiple_crosscheck = _NS["leg_multiple_crosscheck"]
 blend_legs = _NS["blend_legs"]
 fcf_caliber_warnings = _NS["fcf_caliber_warnings"]
 estimate_change_evidence = _NS["estimate_change_evidence"]
+trailing_basis_position = _NS["trailing_basis_position"]
+dual_basis_warning = _NS["dual_basis_warning"]
 
 
 def _mk(**over):
@@ -1612,3 +1617,73 @@ def test_estimate_evidence_tolerates_bad_input():
 
 def test_estimate_evidence_accepts_dict_not_only_str():
     assert len(estimate_change_evidence(_META_HIT, False)) == 1
+
+# ============ 0026：双口径分位 ============
+# ntm 口径结构性滞后一年上下（四标的 305/325/415/423 天），而报告此前只给一个
+# 分位数字、且它来自那个滞后分布。trailing 带没有这个滞后、同样过滤，数据早就
+# 算好了，只是从没被当成读数。
+
+def _band(cur, pcts, cd="2026-09-18"):
+    return {"trailing_nolag": {"pctiles": pcts, "current": cur, "current_date": cd,
+                               "span": {"start": "2025-09-18", "end": cd}}}
+
+
+def test_trailing_basis_below_p25_nvda():
+    """NVDA 实测：28.1x vs P25/P50/P75 = 32.9/41.0/46.6 -> 低于 P25。"""
+    r = trailing_basis_position(_band(28.134, {"25": 32.9, "50": 41.0, "75": 46.6}),
+                                "2026-09-20")
+    assert r["vs_band"] == "below_p25" and r["pctile"] is None
+    assert "低于 P25" in r["position"] and r["lag_days"] == 2
+
+
+def test_trailing_basis_in_band_interpolated_meta():
+    """META 实测：25.1x 落在 P25 22.3 与 P50 26.2 之间 -> 插值 ≈P43。"""
+    r = trailing_basis_position(_band(25.1, {"25": 22.3, "50": 26.2, "75": 28.1}),
+                                "2026-09-20")
+    assert r["vs_band"] == "in_band" and 40 <= r["pctile"] <= 46
+    assert r["interpolated"] is True
+
+
+def test_trailing_basis_lag_is_reported_not_assumed_zero():
+    """AMZN/GOOGL 的 trailing 也被同一笔重估堵住——"无滞后"是相对的，要报数字。"""
+    r = trailing_basis_position(_band(28.1, {"25": 29.5, "50": 32.6, "75": 34.1},
+                                      cd="2026-07-30"), "2026-09-20")
+    assert r["lag_days"] == 52
+
+
+def test_trailing_basis_never_exposes_a_convertible_number():
+    """刻意不提供任何'折算后分位'或'两者之差'——能算的字段最终都会被当成可用的。
+
+    实测 trailing/NTM 比值极差 1.47~3.76x，单标量折算不成立。
+    """
+    r = trailing_basis_position(_band(25.1, {"25": 22.3, "50": 26.2, "75": 28.1}),
+                                "2026-09-20")
+    assert not any(k in r for k in ("ntm_equivalent", "converted", "delta_vs_ntm",
+                                    "pctile_diff", "adjusted_pctile"))
+    assert "不可相减" in r["note"]
+
+
+def test_trailing_basis_nan_and_missing_guards():
+    assert trailing_basis_position(None, "2026-09-20") is None
+    assert trailing_basis_position({}, "2026-09-20") is None
+    assert trailing_basis_position(_band(float("nan"), {"50": 20.0}), "2026-09-20") is None
+    # 分位表整列 NaN（KO/AAPL 实测形态）
+    assert trailing_basis_position(_band(20.0, {"50": float("nan")}), "2026-09-20") is None
+    # current_date 缺失/损坏不应抛
+    b = _band(20.0, {"25": 18.0, "50": 20.0, "75": 22.0}, cd=None)
+    assert trailing_basis_position(b, "2026-09-20")["lag_days"] is None
+
+
+def test_dual_basis_warning_states_both_and_forbids_subtraction():
+    tb = trailing_basis_position(_band(26.1, {"25": 26.6, "50": 28.1, "75": 30.3},
+                                       cd="2026-07-22"), "2026-09-20")
+    (lv, msg), = dual_basis_warning("带内第 85 百分位", 423, tb)
+    assert lv == "yellow"
+    assert "第 85 百分位" in msg and "低于 P25" in msg
+    assert "不可相减" in msg and "423" in msg
+
+
+def test_dual_basis_warning_silent_without_both_sides():
+    assert dual_basis_warning(None, 423, {"current": 1, "position": "x"}) == []
+    assert dual_basis_warning("带内第 85 百分位", None, {"current": 1, "position": "x"}) == []
+    assert dual_basis_warning("带内第 85 百分位", 423, None) == []
