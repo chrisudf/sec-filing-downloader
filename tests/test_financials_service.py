@@ -43,6 +43,69 @@ def test_total_debt_combined_fallback():
     assert fs._total_debt(inst) == [3_301e6]
 
 
+def test_total_debt_st_full_line_no_double_count():
+    # IBM 型：ShortTermBorrowings 是整行短期债务（已含当期到期），附注又单标当期到期
+    # 2026-06-30：56,212 + 5,775 = 61,987（公司口径）；旧规则得 67,759
+    inst = make_inst({"lt_debt_noncurrent": [56_212e6],
+                      "lt_debt_current": [5_772e6],
+                      "st_borrowings": [5_775e6]}, 1)
+    assert fs._total_debt(inst) == [(56_212 + 5_772 + 5_775) * 1e6]   # 旧行为保持
+    assert fs._total_debt(inst, st_full_line=True) == [61_987e6]
+
+
+def test_total_debt_st_full_line_absorbs_cp():
+    # IBM 2019-12-31：整行 8,797 已含 CP 304 与当期到期 7,522 → 公司口径 62,899
+    inst = make_inst({"lt_debt_noncurrent": [54_102e6],
+                      "lt_debt_current": [7_522e6],
+                      "commercial_paper": [304e6],
+                      "st_borrowings": [8_797e6]}, 1)
+    assert fs._total_debt(inst, st_full_line=True) == [62_899e6]
+
+
+def test_total_debt_st_full_line_lt_total_branch():
+    # 只有 LongTermDebt 总口径时：整行里的当期到期已在总口径中，只补超出部分
+    inst = make_inst({"lt_debt_total": [60_000e6],
+                      "lt_debt_current": [5_000e6],
+                      "st_borrowings": [5_300e6]}, 1)
+    assert fs._total_debt(inst, st_full_line=True) == [60_300e6]
+    # 缺 lc 拆不开：不加（宁少勿双计）
+    inst = make_inst({"lt_debt_total": [60_000e6], "st_borrowings": [5_300e6]}, 1)
+    assert fs._total_debt(inst, st_full_line=True) == [60_000e6]
+
+
+def test_st_full_line_detection():
+    ibm = {  # 真实 IBM 形状（$B）：2018 两标签并存相等；其后 sb≈lc 多期
+        "debt_current_instant": {"2018-12-31": 10.207, "2017-12-31": 6.987},
+        "st_borrowings_instant": {"2018-12-31": 10.207, "2025-12-31": 6.424,
+                                  "2026-03-31": 8.655, "2026-06-30": 5.775},
+        "lt_debt_current_instant": {"2018-12-31": 7.051, "2025-12-31": 6.424,
+                                    "2026-03-31": 7.554, "2026-06-30": 5.772},
+    }
+    assert fs._st_borrowings_is_full_line(ibm)
+    # 只凭判据②也成立（没有 DebtCurrent 重叠期）
+    only2 = {k: v for k, v in ibm.items() if k != "debt_current_instant"}
+    assert fs._st_borrowings_is_full_line(only2)
+    # 只凭判据①也成立（sb≈lc 的期不足两期）
+    only1 = {"debt_current_instant": {"2018-12-31": 10.207},
+             "st_borrowings_instant": {"2018-12-31": 10.207},
+             "lt_debt_current_instant": {"2018-12-31": 7.051}}
+    assert fs._st_borrowings_is_full_line(only1)
+    # 按定义打标签：短借与当期到期是两笔独立的钱
+    honest = {"st_borrowings_instant": {"2025-12-31": 3.0, "2026-06-30": 2.1},
+              "lt_debt_current_instant": {"2025-12-31": 5.0, "2026-06-30": 4.4}}
+    assert not fs._st_borrowings_is_full_line(honest)
+    # 单期巧合相等不够
+    once = {"st_borrowings_instant": {"2025-12-31": 5.0, "2026-06-30": 2.1},
+            "lt_debt_current_instant": {"2025-12-31": 5.0, "2026-06-30": 4.4}}
+    assert not fs._st_borrowings_is_full_line(once)
+    # DebtCurrent == 短借 但当期到期为 0：相等是平凡的，不能当证据
+    trivial = {"debt_current_instant": {"2025-12-31": 3.0},
+               "st_borrowings_instant": {"2025-12-31": 3.0},
+               "lt_debt_current_instant": {"2025-12-31": 0.0}}
+    assert not fs._st_borrowings_is_full_line(trivial)
+    assert not fs._st_borrowings_is_full_line({})
+
+
 def test_nearest_instant():
     inst = {"2026-06-27": 1.0, "2026-03-28": 2.0}
     assert fs._nearest_instant(inst, ["2026-06-27"]) == [1.0]
@@ -85,6 +148,26 @@ def test_reshape_identities():
         assert cf["fcf"][i] == cf["ocf"][i] - cf["capex"][i]
         # 毛利回退 = 营收 - 营业成本
         assert inc["gross_profit"][i] == inc["revenue"][i] - inc["cogs"][i]
+
+
+def test_reshape_wires_st_full_line_detection():
+    """接线：_reshape 必须把发行人级判据传进 _total_debt（纯函数测不到调用点）。"""
+    facts = _facts()
+    ends = sorted(facts["revenue_quarterly"])
+    facts["lt_debt_noncurrent_instant"] = {e: 56_000e6 for e in ends}
+    facts["lt_debt_current_instant"] = {e: 5_772e6 for e in ends}
+    facts["st_borrowings_instant"] = {e: 5_775e6 for e in ends}   # IBM 型整行
+    r = fs._reshape(facts, {"name": "T"}, "quarterly", 3)
+    assert r["balance"]["total_debt"] == [61_775e6] * len(ends)
+
+
+def test_reshape_op_income_derived_flags():
+    facts = _facts()
+    facts["op_income_derived"] = {"quarterly": ["2026-03-30", "2026-06-30"]}
+    r = fs._reshape(facts, {"name": "T"}, "quarterly", 3)
+    assert r["income"]["op_income_derived"] == [False, False, False, True, True]
+    r = fs._reshape(_facts(), {"name": "T"}, "quarterly", 3)
+    assert not any(r["income"]["op_income_derived"])
 
 
 def test_reshape_bank_format_suppresses_gross():

@@ -377,6 +377,43 @@ PE 法 268.4 vs 285.8/304.6，三个目标价不可比。MSFT 因报告期恰是
       双口径行排在它上面，所以不是新增损害；但限定只是让人别用它，没让它变对。
       分母换成调整后 EPS 后这个因子自动归位，**一并修掉，不要单独打补丁**。
 
+## 🧾 v0.4.3 — IBM 暴露的数据缺口（2026-09-23）
+
+IBM 估值（base $194 vs 现价 $231）复盘时查出三处**数据层**缺口，都不是 IBM 独有：
+
+- [x] **10-K 的 EX-13 没下**：IBM 10-K 主文档把财报/附注/关键会计估计全部"以引用方式
+      并入"年报附件，主文档里 settlement/amortization 0 命中。判断层只能估 2025Q4 的
+      税收利得（~$2B），还声明"已核对关键会计估计段"。修法：主文档同时出现
+      "Annual Report to Stockholders" + "incorporated by reference" 时，按提交索引页的
+      **Type 列**取 EX-13 一并打包（文件名无规律：ibm-20251231_d2.htm）。判据不成立零额外请求。
+      代价：SECTIONS 的 per_file 预算按文件数均分，IBM 从 2 个文件变 3 个——但主文档
+      本就是样板文，预算挪给有附注的 EX-13 是净收益。
+- [x] **无 OperatingIncomeLoss 时只推导了 TTM**：IBM 的 op_income 季度/年度整列为空 →
+      `_opm_series` 静默为空、prompt 每季印 0 且净利÷营业利润全 n/a、图表营业利润率为空。
+      `_derive_op_income_series` 逐期同公式回填（只补最后申报期之后，申报值永不覆盖），
+      推导期进 `op_income_derived`，prompt 打 `*` 加图例、图表状态栏注明。
+      回填后 IBM 的 prompt 直接暴露两个一次性季度：2024Q3 比值 −0.20（养老金结算）、
+      2025Q4 1.31（税务审计结案）。
+- [x] **图表总债务双计**：IBM 把整行 "Short-term debt"（含当期到期长债）标成
+      ShortTermBorrowings，附注又用 …ObligationsCurrent 标一次 → 2019 起每年多算
+      $4.7–7.8B（FY25 面板 $67.7B vs 公司 $61.3B）。发行人级判据
+      `_st_borrowings_is_full_line`（DebtCurrent≈短借 且当期到期>0，或 ≥2 期 短借≈当期到期），
+      20 只抽查中 INTC/JNJ 也触发但它们有 DebtCurrent 走原分支，数字不变。
+
+**同一轮复盘提出、尚未做的**（按性价比）：
+- [ ] 营业线口径 PE 带（(i) 的机械版：op×(1−常态税率)/股数）——营业线以下的一次性
+      （IBM 养老金结算×2+税项、AMZN/GOOGL Anthropic 重估）自动免疫；IBM 带只剩 488 天、
+      滞后 576 天的根因。依赖上面的逐期 op 回填。
+- [ ] **SOTP 系统性偏低**：vintages 43 个 gate-clean base 样本 37 个 SOTP<PE，11 只票全中。
+      先诊断：crosscheck 里加"摊销加回后"的 SOTP EV/EBIT（`AmortizationOfIntangibleAssets`，
+      IBM FY25 $2.74B），看偏离收窄多少；再决定改口径还是从 instance 抽分部利润替代 seg1_share。
+- [ ] 自保融资子公司：融资债务只扣不加（IBM ~$13B，CAT/DE/GM/F 更大）——分部名命中
+      Financing 类时要求分别申报 financing_debt/financing_assets，两口径并列不自动选。
+- [ ] 双口径方向冲突（一边 ≥P60、另一边 ≤P25）时必填 `pe_regime`，并把 现价÷adj_eps 注入
+      prompt（IBM 判断层用含税收利得的 $11.25 论证"锚未过时"）。
+- [ ] 回测定腿权重：DCF/PE 两极分化（AMZN 0.65 / MSFT 0.69 vs IBM 1.42 / ORCL 1.72），
+      等权只是平均系统偏差。规则化 config 在 2019–2024 历史 10-Q 上批量跑。
+
 ## 🚀 v0.5 — 部署与产品化
 
 - [ ] 部署到 Railway / Fly.io（参考站即 Railway）

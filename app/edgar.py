@@ -13,8 +13,10 @@ from __future__ import annotations
 
 import asyncio
 import csv
+import html
 import io
 import os
+import re
 import time
 import zipfile
 from datetime import date, timedelta
@@ -26,7 +28,10 @@ TICKERS_URL = "https://www.sec.gov/files/company_tickers.json"
 SUBMISSIONS_URL = "https://data.sec.gov/submissions/{name}"
 DOC_URL = "https://www.sec.gov/Archives/edgar/data/{cik}/{acc}/{doc}"
 INDEX_URL = "https://www.sec.gov/Archives/edgar/data/{cik}/{acc}/index.json"
+# 带「Type」列的提交索引页（index.json 只有文件名，没有附件类型）
+INDEX_HTML_URL = "https://www.sec.gov/Archives/edgar/data/{cik}/{acc}/{acc_dashed}-index.htm"
 MAX_EXHIBITS = 8
+MAX_EX13 = 2
 
 QUARTER_FORMS = ("10-Q", "6-K")   # 季报（6-K 为中概股等外国发行人）
 ANNUAL_FORMS = ("10-K", "20-F")   # 年报（20-F 为外国发行人）
@@ -331,6 +336,60 @@ async def _6k_exhibits(client: httpx.AsyncClient, cik: int, acc: str, primary: s
     return out[:MAX_EXHIBITS]
 
 
+_ANNUAL_REPORT_RE = re.compile(
+    r"annual report to (?:stock|share|security )holders", re.I)
+_INCORP_RE = re.compile(r"incorporated (?:herein )?by reference", re.I)
+
+
+def _incorporates_annual_report(content: bytes) -> bool:
+    """10-K 主文档是否把财报/附注「以引用方式并入」年报附件（EX-13）？
+
+    IBM 型 10-K 主文档只有封面、风险因素和一串交叉引用——财务报表、附注、
+    关键会计估计全部写成 "included in IBM's 2025 Annual Report to Stockholders
+    and is incorporated herein by reference"，真正的内容在同一提交的 EX-13 里。
+    只下主文档时判断层拿不到税务/养老金/摊销附注，却会照样声明"已核对"。
+    判据取两个短语同时出现：只有其一（普通 10-K 里常见 "incorporated by
+    reference" 引用委托书/附件）不触发。"""
+    text = html.unescape(re.sub(r"<[^>]+>", " ", content.decode("utf-8", "ignore")))
+    text = re.sub(r"\s+", " ", text)
+    return bool(_ANNUAL_REPORT_RE.search(text) and _INCORP_RE.search(text))
+
+
+def _index_exhibits(index_html: str, ex_type: str) -> list[str]:
+    """从提交索引页（-index.htm）的文档表里按 **Type 列**取附件文件名。
+
+    EX-13 的文件名没有规律，不能按名字猜：IBM FY2025 叫 ibm-20251231_d2.htm，
+    FY2019 叫 ibm-20191231xex13907c3.htm。Type 列才是 SEC 的权威分类。
+    表格列序：Seq | Description | Document | Type | Size。"""
+    out = []
+    for row in re.findall(r"<tr[^>]*>(.*?)</tr>", index_html, re.S | re.I):
+        cells = re.findall(r"<td[^>]*>(.*?)</td>", row, re.S | re.I)
+        if len(cells) < 4:
+            continue
+        typ = re.sub(r"<[^>]+>", "", cells[3]).strip().upper()
+        m = re.search(r'href="([^"]+)"', cells[2])
+        if not m or not (typ == ex_type or typ.startswith(ex_type + ".")):
+            continue
+        # iXBRL 附件的链接形如 /ix?doc=/Archives/.../ibm-20251231_d2.htm
+        name = m.group(1).rsplit("/", 1)[-1]
+        if name.lower().endswith((".htm", ".html")) and name not in out:
+            out.append(name)
+    return out
+
+
+async def _10k_ex13(client: httpx.AsyncClient, cik: int, acc: str,
+                    acc_dashed: str) -> list[str]:
+    """10-K 同一提交里的 EX-13 附件文件名；取不到索引页时返回空（不连累主文档）。"""
+    try:
+        resp = await client.get(INDEX_HTML_URL.format(cik=cik, acc=acc,
+                                                      acc_dashed=acc_dashed))
+        if resp.status_code != 200:
+            return []
+    except httpx.HTTPError:
+        return []
+    return _index_exhibits(resp.text, "EX-13")[:MAX_EX13]
+
+
 async def _pack(
     client: httpx.AsyncClient, cik: int, ticker: str, picked: list[dict]
 ) -> tuple[bytes, int]:
@@ -397,6 +456,33 @@ async def _pack(
                     "sourceUrl": url,
                 }
             )
+
+            # 10-K 把财报以引用方式并入年报（EX-13）时，主文档里没有报表和附注，
+            # 把 EX-13 一并带上（与 6-K 带 EX-99 同理）；判据不成立时零额外请求
+            if (row["form"].startswith("10-K") and row["primaryDocument"]
+                    and _incorporates_annual_report(resp.content)):
+                await asyncio.sleep(REQUEST_GAP)
+                for ex in await _10k_ex13(client, cik, acc, row["accessionNumber"]):
+                    ex_url = DOC_URL.format(cik=cik, acc=acc, doc=ex)
+                    await asyncio.sleep(REQUEST_GAP)
+                    ex_resp = await client.get(ex_url)
+                    if ex_resp.status_code != 200:
+                        continue
+                    ex_name = f"{ticker}_{row['form'].replace('/', '')}_{period}_ex13_{ex}"
+                    if ex_name in used:
+                        continue
+                    used.add(ex_name)
+                    zf.writestr(ex_name, ex_resp.content)
+                    manifest.append(
+                        {
+                            "file": ex_name,
+                            "form": f"{row['form']} (exhibit 13, 年报正文：财务报表与附注)",
+                            "reportDate": row["reportDate"],
+                            "filingDate": row["filingDate"],
+                            "accessionNumber": row["accessionNumber"],
+                            "sourceUrl": ex_url,
+                        }
+                    )
 
             if row["form"] == "6-K" and row["primaryDocument"]:
                 for ex in await _6k_exhibits(client, cik, acc, row["primaryDocument"]):

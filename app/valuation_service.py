@@ -928,21 +928,31 @@ def _compact_facts(facts: dict) -> str:
     if facts.get("mode") == "financials":
         return _compact_facts_financials(facts)
     lines = []
+    # 营业利润推导期（fetch_facts._derive_op_income_series）打 * ——判断层必须知道
+    # 这些格子不是申报值；净利÷营业利润 比值与下方残差行也随之建立在推导值上
+    der = facts.get("op_income_derived") or {}
+    der_a, der_q = set(der.get("annual", ())), set(der.get("quarterly", ()))
     ann = list(facts["revenue_annual"].items())[-6:]
     lines.append("年度 (期末: 营收/营业利润/净利/稀释EPS, $M):")
     for k, _ in ann:
         lines.append(f"  {k}: {facts['revenue_annual'].get(k, 0)/1e6:,.0f} / "
-                     f"{facts['op_income_annual'].get(k, 0)/1e6:,.0f} / "
+                     f"{facts['op_income_annual'].get(k, 0)/1e6:,.0f}"
+                     f"{'*' if k in der_a else ''} / "
                      f"{facts['net_income_annual'].get(k, 0)/1e6:,.0f} / "
                      f"{facts['eps_diluted_annual'].get(k, '?')}")
     lines += _fcf_hist_lines(facts)
     lines.append("季度尾8 (期末: 营收/营业利润/净利 | 净利÷营业利润——比值异常=有一次性项目):")
-    for k in list(facts["revenue_quarterly"])[-8:]:
+    qtail = list(facts["revenue_quarterly"])[-8:]
+    for k in qtail:
         op = facts["op_income_quarterly"].get(k, 0)
         ni = facts["net_income_quarterly"].get(k, 0)
         ratio = f"{ni/op:.2f}" if op else "n/a"
-        lines.append(f"  {k}: {facts['revenue_quarterly'][k]/1e6:,.0f} / {op/1e6:,.0f} / "
-                     f"{ni/1e6:,.0f} | {ratio}")
+        lines.append(f"  {k}: {facts['revenue_quarterly'][k]/1e6:,.0f} / {op/1e6:,.0f}"
+                     f"{'*' if k in der_q else ''} / {ni/1e6:,.0f} | {ratio}")
+    if der_q & set(qtail) or der_a & {k for k, _ in ann}:
+        lines.append("  * = 营业利润为推导值（营收−营业成本−研发−销售管理），发行人未申报 "
+                     "OperatingIncomeLoss；可能漏掉公式外的营业项（IP 收入、单列摊销/重组），"
+                     "比值与下方残差行同样基于推导值，异常时以 SECTIONS 利润表原文为准")
     lines += _oie_lines(facts)
     lines.append(f"TTM: { {k: (v.get('value') or 0)/1e6 for k, v in facts['ttm'].items()} }")
     bs = []

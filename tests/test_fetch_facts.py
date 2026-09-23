@@ -342,6 +342,92 @@ def test_derive_op_income_wired_into_build_facts():
     assert "_derive_op_income_ttm(out, ttm)" in inspect.getsource(build_facts)
 
 
+def _ibm_series_out(op_q=None, op_a=None):
+    """IBM 形态：从不标 OperatingIncomeLoss，组件逐期在场（按美元喂）。
+    营收/研发取 IBM 真实季度值，cogs/sga 为示意值。"""
+    q = ["2025-12-31", "2026-03-31", "2026-06-30"]
+    return {
+        "revenue_quarterly": {k: v for k, v in zip(q, (19686e6, 15917e6, 17162e6))},
+        "cogs_quarterly": {k: v for k, v in zip(q, (7500e6, 6900e6, 7256e6))},
+        "rnd_quarterly": {k: v for k, v in zip(q, (2187e6, 2173e6, 2311e6))},
+        "sga_quarterly": {k: v for k, v in zip(q, (5600e6, 5300e6, 5208e6))},
+        "op_income_quarterly": {} if op_q is None else op_q,
+        "revenue_annual": {"2025-12-31": 67535e6},
+        "cogs_annual": {"2025-12-31": 27000e6},
+        "rnd_annual": {"2025-12-31": 8317e6},
+        "sga_annual": {"2025-12-31": 20500e6},
+        "op_income_annual": {} if op_a is None else op_a,
+    }
+
+
+def test_derive_op_series_never_reported():
+    from valuation.fetch_facts import _derive_op_income_series
+    out = _ibm_series_out()
+    _derive_op_income_series(out)
+    assert out["op_income_quarterly"]["2026-06-30"] == pytest.approx(
+        (17162 - 7256 - 2311 - 5208) * 1e6)
+    assert out["op_income_annual"]["2025-12-31"] == pytest.approx(
+        (67535 - 27000 - 8317 - 20500) * 1e6)
+    assert out["op_income_derived"] == {
+        "quarterly": ["2025-12-31", "2026-03-31", "2026-06-30"],
+        "annual": ["2025-12-31"]}
+
+
+def test_derive_op_series_only_after_last_reported():
+    """申报值不覆盖；申报序列中间/之前的空洞不填，只补最后申报期之后（停报型）。"""
+    from valuation.fetch_facts import _derive_op_income_series
+    out = _ibm_series_out(op_q={"2026-03-31": 1234e6})
+    _derive_op_income_series(out)
+    q = out["op_income_quarterly"]
+    assert q["2026-03-31"] == 1234e6                  # 申报值原样
+    assert "2025-12-31" not in q                      # 申报期之前的空洞不填
+    assert "2026-06-30" in q                          # 停报之后补
+    assert out["op_income_derived"]["quarterly"] == ["2026-06-30"]
+
+
+def test_derive_op_series_component_missing_skips_period():
+    from valuation.fetch_facts import _derive_op_income_series
+    out = _ibm_series_out()
+    del out["sga_quarterly"]["2026-03-31"]
+    _derive_op_income_series(out)
+    assert "2026-03-31" not in out["op_income_quarterly"]
+    assert "2026-03-31" not in out["op_income_derived"]["quarterly"]
+
+
+def test_derive_op_series_noop_when_reported_current():
+    from valuation.fetch_facts import _derive_op_income_series
+    reported = {k: 1e9 for k in ("2025-12-31", "2026-03-31", "2026-06-30")}
+    out = _ibm_series_out(op_q=dict(reported), op_a={"2025-12-31": 4e9})
+    _derive_op_income_series(out)
+    assert out["op_income_quarterly"] == reported
+    assert "op_income_derived" not in out
+
+
+def test_derive_op_series_wired_after_ttm():
+    import inspect
+    from valuation.fetch_facts import build_facts
+    src = inspect.getsource(build_facts)
+    assert "_derive_op_income_series(out)" in src
+    # TTM 推导（带 derived 标记）必须先跑，序列回填不能改变 TTM 的来源
+    assert src.index("_derive_op_income_ttm(out, ttm)") < src.index(
+        "_derive_op_income_series(out)")
+
+
+def test_classify_core_gaps_ignores_derived_periods():
+    """推导回填的期不算申报史：从未报过营业利润的发行人不能被说成"停报"。"""
+    from valuation.fetch_facts import classify_core_gaps
+    out = {"mode": "standard",
+           "ttm": {"revenue": {"value": 1.0}, "op_income": {"value": None},
+                   "net_income": {"value": 1.0}},
+           "revenue_annual": {"2025-12-31": 1.0},
+           "revenue_quarterly": {"2026-06-30": 1.0},
+           "op_income_annual": {"2024-12-31": 1.0},
+           "op_income_quarterly": {},
+           "op_income_derived": {"annual": ["2024-12-31"]}}
+    msg = classify_core_gaps(out)[0]
+    assert "从未申报" in msg and "停报" not in msg
+
+
 def _tag(end):
     return {"units": {"USD": [{"end": end}]}}
 
