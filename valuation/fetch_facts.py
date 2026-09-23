@@ -112,6 +112,9 @@ SPEC = {
     "sbc": _item(["ShareBasedCompensation", "AllocatedShareBasedCompensationExpense",
                   "ShareBasedCompensationArrangementByShareBasedPaymentAwardCompensationCost"],
                  y=True),
+    # 无形资产摊销（0030）：SOTP 腿「摊销加回」诊断用——分部可比倍数多按摊销前
+    # 利润报，op1 却是摊销后。IBM 在现金流量表按 YTD 申报（10-Q 累计），走 ytd_flow
+    "amortization": _item(["AmortizationOfIntangibleAssets"], y=True),
     "cash": _item(["CashAndCashEquivalentsAtCarryingValue"], i=True),
     "st_securities": _item(["MarketableSecuritiesCurrent", "ShortTermInvestments",
                             "AvailableForSaleSecuritiesDebtSecuritiesCurrent"],

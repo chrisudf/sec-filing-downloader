@@ -43,6 +43,10 @@ PY = sys.executable
 # sonnet 慢，且 v2 一次运行最多 3 次调用（schema retry + 经济复审），放宽到 600s
 CLAUDE_TIMEOUT = 600
 
+# PE 锚口径声明（0029）的合法取值——必须与 engine.py 的 PE_REGIMES 逐字一致
+# （tests/test_regime_gate.py 钉住）：校验层放行的值引擎却不认，red 永远消不掉
+PE_REGIMES = ("band", "recent", "blend")
+
 
 def _claude_timeout() -> int:
     """判断层超时秒数：VALUATION_CLAUDE_TIMEOUT（正整数秒）覆盖默认 600。
@@ -315,6 +319,15 @@ def _validate_judgment(d: dict, mode: str = "standard",
     # ppce_note（v4）可选：期后事件与 net_cash 的对账说明一句话，引擎附在 info 行后
     if "ppce_note" in d and not isinstance(d["ppce_note"], str):
         raise ValueError("ppce_note 必须是字符串（期后事件对账的一句话说明）")
+    # pe_regime（0029）可选；一旦给出必须是三选一 + 带证据的 note。引擎在「双口径
+    # 冲突」时要求它（缺了打 red 打回一次），这里只管形状
+    if "pe_regime" in d or "pe_regime_note" in d:
+        if d.get("pe_regime") not in PE_REGIMES:
+            raise ValueError(f"pe_regime 必须是 {'/'.join(PE_REGIMES)} 之一"
+                             "（band=沿用历史带中枢 / recent=按最近一年定价 / blend=折中）")
+        if len(str(d.get("pe_regime_note") or "").strip()) < 10:
+            raise ValueError("pe_regime_note 必填：写明为什么选这个口径，"
+                             "引用两个口径的具体倍数与财报/定价证据")
     # build_report.py 直接取这些 rationale 键，缺了会在花完 LLM 调用后才崩，这里提前拒绝
     if not isinstance(d["rationale"], dict):
         raise ValueError("rationale 必须是对象")
@@ -1106,10 +1119,14 @@ def _band_meta(mode: str, facts: dict) -> str:
                     + "。"
                     "**不可与上面的 NTM 分位直接相减**——trailing 分母是过去 12 个月的"
                     "已实现 GAAP EPS，NTM 分位的分母是未来 12 个月的 EPS。"
-                    "换算需要除以 **EPS 增速因子**（你给出的该情景 NTM EPS ÷ 当前 GAAP "
-                    "TTM EPS），**不是营收增速 g**——利润率、税率、其他收益、股数变化"
+                    "换算需要除以 **EPS 增速因子**（该情景 NTM EPS ÷ 当前 TTM EPS），"
+                    "**不是营收增速 g**——利润率、税率、其他收益、股数变化"
                     "都会让 EPS 增速与营收增速显著分叉（利润率扩张叠加回购的票尤其）。"
-                    "当前 GAAP TTM EPS 见 FACTS 的 TTM 净利 ÷ 稀释股数。")
+                    "**TTM EPS 用剔除一次性后的口径**（你的 adj_ni ÷ 稀释股数）："
+                    "trailing 带本身已剔除畸变窗口，拿含一次性的 GAAP TTM EPS 去比会系统性"
+                    "失真——IBM 实测含 2025Q4 税收利得的 $11.25 让现价 trailing 看着像"
+                    " 20.5x（≈带中枢、\"锚未过时\"），按调整后是 25.3x，结论相反。"
+                    "两个口径的现价倍数引擎都会算好并写进报告。")
                 _gap = _tn.get("gap_since_main_band")
                 if _gap:
                     band_meta += (f"\n    本带盲区那一段（{_gap['span']['start']}~"
@@ -1117,7 +1134,13 @@ def _band_meta(mode: str, facts: dict) -> str:
             band_meta += ("\n    → 若折算后显示市场近一年的定价已明显偏离本带中枢，"
                           "那是**锚可能已过时**的证据：此时偏离 P50 属于有证据的偏离，"
                           "请在 rationale.pe 写明「近一年 regime 变化」并给出财报/定价依据。"
-                          "反之若两者量级一致，锚照常适用。")
+                          "反之若两者量级一致，锚照常适用。"
+                          "\n    → **口径冲突闸（0029）**：若现价前瞻倍数落在本带高位（≥P60）"
+                          "而 trailing 最新值低于其 P25——或反过来 ≤P40 与高于 P75——"
+                          "引擎判为「双口径方向冲突」，要求你对 PE 锚口径表态："
+                          "pe_regime = band（沿用本带中枢，等于假设重定价全部回吐）/ "
+                          "recent（按最近一年定价）/ blend（折中），并在 pe_regime_note "
+                          "引用两组倍数与证据；缺了会被打回一次。预判到这种形态可直接给出。")
     elif mode == "standard":
         # 带整体缺席（fetch_facts 已在 pe_band_error 留痕）：与 thin_coverage 同等
         # 显式告知，附失败原因——判断层看得见"为什么没有锚"才不会把缺席当背书

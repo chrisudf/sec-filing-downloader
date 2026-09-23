@@ -404,13 +404,33 @@ IBM 估值（base $194 vs 现价 $231）复盘时查出三处**数据层**缺口
 - [ ] 营业线口径 PE 带（(i) 的机械版：op×(1−常态税率)/股数）——营业线以下的一次性
       （IBM 养老金结算×2+税项、AMZN/GOOGL Anthropic 重估）自动免疫；IBM 带只剩 488 天、
       滞后 576 天的根因。依赖上面的逐期 op 回填。
-- [ ] **SOTP 系统性偏低**：vintages 43 个 gate-clean base 样本 37 个 SOTP<PE，11 只票全中。
-      先诊断：crosscheck 里加"摊销加回后"的 SOTP EV/EBIT（`AmortizationOfIntangibleAssets`，
-      IBM FY25 $2.74B），看偏离收窄多少；再决定改口径还是从 instance 抽分部利润替代 seg1_share。
+- [x] **SOTP 系统性偏低 —— 诊断已做（0030），修法待定**。vintages 43 个 gate-clean base
+      样本 37 个 SOTP<PE。`sotp_addback_diag` 把 TTM 无形资产摊销加回 EBIT 再比
+      （只落盘 + 写进 crosscheck 黄旗，不改数）。12 份 prev_configs 的 base 实测：
+
+      | 票 | seg1 | 偏离 | 摊销/op1 | 加回后 |     | 票 | seg1 | 偏离 | 摊销/op1 | 加回后 |
+      |---|---|---|---|---|---|---|---|---|---|---|
+      | IBM | 0.60 | +29% | 25% | **+3%** | | AMZN | 0.58 | **+36%** | 1% | **+35%** |
+      | AVGO | 0.68 | +12% | 10% | +2% | | ORCL | 0.95 | +16% | 5% | +11% |
+      | INTC | 0.90 | +24% | 32% | −6% | | META/MSFT/NVDA/APP | ≥0.9 | −7~+14% | 0–3% | 基本不变 |
+
+      结论：并购型（IBM/AVGO/INTC）的偏离几乎全是摊销口径；**AMZN 不是**（摊销仅 1%），
+      它的 +36% 在倍数或 seg1_share 本身。SOTP 真正进综合的只有 seg1<0.85 的三只
+      （IBM/AVGO/AMZN）。AAPL（最后标该概念 FY2017）、KO（FY2023）被时效闸挡掉，不出诊断。
+      - [ ] 修法候选 1：SOTP 腿对并购型改用"摊销前 EBIT"（op1 + 摊销）× m——需判断层声明
+            m1/m2 的口径（摊销前/后），否则同样的错配换个方向
+      - [ ] 修法候选 2：AMZN 型单独查——从 instance 抽分部营业利润替代判断层给的 seg1_share
 - [ ] 自保融资子公司：融资债务只扣不加（IBM ~$13B，CAT/DE/GM/F 更大）——分部名命中
       Financing 类时要求分别申报 financing_debt/financing_assets，两口径并列不自动选。
-- [ ] 双口径方向冲突（一边 ≥P60、另一边 ≤P25）时必填 `pe_regime`，并把 现价÷adj_eps 注入
-      prompt（IBM 判断层用含税收利得的 $11.25 论证"锚未过时"）。
+- [x] **口径冲突表态闸（0029）**：NTM 分位 ≥P60 且 trailing <P25（或 ≤P40 且 >P75）、带子
+      滞后 >270 天 → 缺 `pe_regime`（band/recent/blend）打 red 打回一次，已表态降 yellow 并写明
+      "相对现价 X% 纯倍数变动"；声明与 base pe 不一致（band 却偏离中枢 >15% / recent·blend
+      却贴中枢 ±5%）再加注。引擎算好 现价÷GAAP TTM EPS 与 现价÷调整后 EPS 并排（IBM 20.6x vs
+      25.3x）；prompt 删掉"GAAP TTM EPS 见 FACTS"那句（事故直接来源），改为用 adj_ni 口径。
+      实跑验证只有 IBM（缺字段 red / 表态后 yellow 两条路径都走过）；其余标的触发与否取决于
+      当次 eps1，下次各自重跑时看——按 0026 那张表 GOOGL（NTM ≈P85、trailing <P25）大概率触发，
+      NVDA（两边都低）、AMZN（NTM ≈P46）不触发。曾考虑的"盲区 trailing ÷ 主带 trailing"比值
+      会把增速放缓误判成重定价（NVDA 0.67、APP 0.69），弃用。
 - [ ] 回测定腿权重：DCF/PE 两极分化（AMZN 0.65 / MSFT 0.69 vs IBM 1.42 / ORCL 1.72），
       等权只是平均系统偏差。规则化 config 在 2019–2024 历史 10-Q 上批量跑。
 

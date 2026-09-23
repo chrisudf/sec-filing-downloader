@@ -76,6 +76,10 @@ def _env_w(name):
 BLEND_W = {"pe": _env_w("VALUATION_BLEND_W_PE"), "dcf": _env_w("VALUATION_BLEND_W_DCF"),
            "sotp": _env_w("VALUATION_BLEND_W_SOTP"), "ptbv": _env_w("VALUATION_BLEND_W_PTBV")}
 
+# PE 锚口径声明（0029）：band=沿用历史 NTM 带中枢 / recent=按最近一年定价 / blend=折中。
+# 必须与 app/valuation_service.PE_REGIMES 逐字一致（tests/test_regime_gate.py 钉住）
+PE_REGIMES = ("band", "recent", "blend")
+
 
 def _vintage(manifest_text, run_date):
     """从 manifest 提取"这份估值基于哪个报告期"——价值投资的第一个检查项就是数据新鲜度。
@@ -349,6 +353,87 @@ def dual_basis_warning(ntm_pos, ntm_lag, tr):
              "请**分别读**：①回答『相对一年前的前瞻估值分布贵不贵』，"
              "②回答『相对最近一年的估值水平贵不贵』。两者分歧大时，"
              "多半说明这一年里发生了重定价 —— 那正是 ① 看不见的东西。"]]
+
+
+def regime_conflict_warnings(trw, trp, pe_regime, pe_regime_note, price,
+                             adj_eps, gaap_ttm_eps, min_lag=270):
+    """双口径**方向冲突**时要求判断层对 PE 锚口径表态 -> [[level, msg]]。（0029）
+
+    dual_basis_warning 只把两个分位并排摆出、不判分歧（分歧本身不是错）。但有一种
+    分歧会直接决定 base 目标价的方向，不能只摆着：
+      NTM 分位 ≥P60（相对**旧** regime 偏贵）且 trailing 无滞后 < P25（相对**最近
+      一年**偏便宜），或反过来 NTM ≤P40 且 trailing > P75。
+    这恰好是「带子盲区里发生过重定价、价格又部分回撤」的形态——锚旧中枢等于假设
+    重定价全部回吐，锚最近一年等于假设它成立。选哪个是判断，但必须**显式**选。
+
+    IBM 2026-09-23 实测：NTM 带内 P68、trailing 26.8x 低于 P25（30.9x）、带子滞后
+    576 天；判断层写"锚未过时"，依据是 现价÷$11.25=20.5x——$11.25 含 2025Q4 约
+    $2B 税收利得，按它自己的 adj_ni 是 25.3x，结论相反。所以本函数把两个 trailing
+    倍数（GAAP / 调整后）一起算好摆出来，不再让判断层自己除。
+
+    缺 pe_regime → red（服务层打回一次）。打回的最省力解是填一个字段，而不是改
+    g/opm——旗只看字段在不在，所以不会诱导"扭曲假设消红旗"（TUNING 的警告）。
+    已表态 → yellow 留痕，把选择的后果（相对现价的纯倍数变动）写明。
+    判据只读引擎已有读数，不引入新阈值以外的口径；两个分位仍然不相减、不合并。
+    """
+    if not trw or not trp:
+        return []
+    lag = (trw.get("span") or {}).get("lag_days") or 0
+    if lag <= min_lag:
+        return []
+    rel, rank = trw.get("fwd_pe_now_vs_band"), trw.get("fwd_pe_now_pctile")
+    ntm_high = rel == "above_p90" or (_isnum(rank) and rank >= 60)
+    ntm_low = rel == "below_p10" or (_isnum(rank) and rank <= 40)
+    tr_rel = str(trp.get("vs_band") or "")
+    if not ((ntm_high and tr_rel.startswith("below"))
+            or (ntm_low and tr_rel.startswith("above"))):
+        return []
+    now_pe, tgt = trw.get("fwd_pe_now"), trw.get("target_pe")
+    mrt = trw.get("mult_reversion_to_target")
+    p50 = (trw.get("pe") or {}).get("50")
+
+    def _x(v):
+        return f"{v:.1f}x" if _isnum(v) and v > 0 else "n/a"
+    tr_gaap = price / gaap_ttm_eps if _isnum(gaap_ttm_eps) and gaap_ttm_eps > 0 else None
+    tr_adj = price / adj_eps if _isnum(adj_eps) and adj_eps > 0 else None
+    tr_lag = trp.get("lag_days")
+    facts_line = (
+        f"① NTM：现价隐含 {_x(now_pe)} → {trw.get('fwd_pe_now_position') or '?'}"
+        f"（带子中枢 P50 {_x(p50)}，滞后 {lag} 天，最近一年不在分布内）；"
+        f"② trailing 无滞后：{_x(trp.get('current'))} → {trp.get('position') or '?'}"
+        + (f"（该读数本身停在 {trp.get('current_date')}，滞后 {tr_lag} 天）"
+           if _isnum(tr_lag) and tr_lag > 30 else "") + "。"
+        f"现价 ÷ 过去 12 个月 EPS：GAAP {_x(tr_gaap)} / 调整后(adj_ni) {_x(tr_adj)}"
+        + ("——两者差 >10%，与 trailing 带比较请用调整后口径（带子已剔除畸变窗口）"
+           if tr_gaap and tr_adj and abs(tr_gaap / tr_adj - 1) > 0.10 else "")
+        + "。")
+    consequence = (f"base 目标 PE {_x(tgt)} 相对现价隐含 {mrt:+.0%} 的纯倍数变动"
+                   if _isnum(mrt) else f"base 目标 PE {_x(tgt)}")
+    if pe_regime not in PE_REGIMES:
+        return [["red",
+                 "双口径方向冲突，PE 锚口径未表态：" + facts_line
+                 + "一边说相对旧 regime 偏贵、一边说相对最近一年偏便宜——这是带子盲区里"
+                 "发生过重定价的形态，锚哪个口径直接决定 base 方向（" + consequence
+                 + "）。请补 pe_regime（band=沿用历史带中枢，等于假设重定价全部回吐 / "
+                 "recent=按最近一年定价 / blend=折中）与 pe_regime_note（引用上面两组"
+                 "倍数与财报/定价证据）。**只需补这两个字段**；本旗只看字段是否给出，"
+                 "不要为消旗去改 g/opm。连续性基准里的 pe 在本次不构成约束（属失锚重建）。"]]
+    what = {"band": "沿用历史带中枢（等于假设重定价全部回吐）",
+            "recent": "按最近一年定价", "blend": "两口径折中"}[pe_regime]
+    note = str(pe_regime_note or "").strip()
+    # 声明与数字的一致性：band 却偏离中枢 >15%，或 recent/blend 却仍贴着中枢 ±5%
+    mismatch = ""
+    if _isnum(tgt) and _isnum(p50) and p50 > 0:
+        d = tgt / p50 - 1
+        if pe_regime == "band" and abs(d) > 0.15:
+            mismatch = f"；⚠ 声明 band，但 base 目标 PE 偏离带中枢 {d:+.0%}——声明与数字不一致"
+        elif pe_regime != "band" and abs(d) < 0.05:
+            mismatch = (f"；⚠ 声明 {pe_regime}，但 base 目标 PE 仍贴着带中枢 P50"
+                        f"（偏离 {d:+.0%}）——声明与数字不一致")
+    return [["yellow",
+             f"双口径方向冲突，判断层已表态 pe_regime={pe_regime}（{what}）："
+             + facts_line + consequence + mismatch + "。理由：" + note[:200]
+             + ("…" if len(note) > 200 else "")]]
 
 
 def band_lag_warnings(band, span, now_pe, min_lag=270):
@@ -860,8 +945,59 @@ def dcf_nm_check(ddiag, dcf_ps, fcf_base, rev0):
     return False, None
 
 
+def amort_ttm_musd(facts):
+    """无形资产摊销 TTM（$M）-> (value|None, note)。（0030，SOTP 诊断用）
+
+    最近 4 个连续季度（间隔 80-100 天）直加；季度不齐时退回最新财年并注明口径；
+    都没有返回 None——调用方据此**不出**加回诊断，不拿 0 冒充"没有摊销"。
+
+    时效闸（相对 facts.data_latest）：季度序列末季须在 120 天内、年度须在 455 天内。
+    发行人会停标这个概念——AAPL 最后一次是 FY2017、KO 是 FY2023，不设闸会拿
+    九年前的数冒充当前摊销（12 只票实跑时抓到）。"""
+    anchor = (facts or {}).get("data_latest")
+
+    def _fresh(end, max_days):
+        if not anchor:
+            return True
+        return (date.fromisoformat(anchor) - date.fromisoformat(end)).days <= max_days
+    q = sorted(((facts or {}).get("amortization_quarterly") or {}).items())[-4:]
+    if len(q) == 4 and all(_isnum(v) for _, v in q) and _fresh(q[-1][0], 120):
+        ends = [date.fromisoformat(k) for k, _ in q]
+        if all(80 <= (b - a).days <= 100 for a, b in zip(ends, ends[1:])):
+            return sum(v for _, v in q) / 1e6, f"TTM（{q[0][0]}~{q[-1][0]} 四季）"
+    a = sorted(((facts or {}).get("amortization_annual") or {}).items())
+    if a and _isnum(a[-1][1]) and _fresh(a[-1][0], 455):
+        return a[-1][1] / 1e6, f"= FY({a[-1][0]})（季度不齐，退回最新财年）"
+    return None, None
+
+
+def sotp_addback_diag(pe_target, fwd_shares, net_cash, op1, seg1_share, m1, m2, amort):
+    """SOTP 腿「加回无形资产摊销」后的对照 -> dict|None。（0030，只诊断不改数）
+
+    vintages 43 个 gate-clean base 样本里 37 个 SOTP < PE，11 只票全中——是结构不是
+    噪声。第一嫌疑是口径错配：判断层取的分部可比倍数多是按**摊销前**分部利润报的，
+    却乘在**摊销后**的合并 GAAP 营业利润 op1 上，越爱并购越被压（IBM FY25 摊销
+    $2.74B ≈ 营业利润的四分之一）。这里把摊销加回 EBIT 再算一遍 SOTP 权益价值，
+    与 PE 腿的偏离放在一起：偏离显著收窄 → 口径错配是主因；不收窄 → 去查
+    seg1_share 或倍数本身。**不进综合、不改任何腿的数**——先看诊断再决定改哪。
+    摊销按 TTM 平移到前瞻期（与 op1 的前瞻期差一个增速，诊断量级足够）。"""
+    if (not _isnum(amort) or amort <= 0 or op1 <= 0 or pe_target <= 0
+            or not fwd_shares):
+        return None
+    w = seg1_share * m1 + (1 - seg1_share) * m2
+    if w <= 0:
+        return None
+    ev_pe = pe_target * fwd_shares - net_cash
+    ev_sotp, ev_sotp_ab = w * op1, w * (op1 + amort)
+    return dict(amort_musd=round(amort), amort_share_of_op1=round(amort / op1, 3),
+                ev_ebit_sotp=round(w, 1),
+                sotp_vs_pe=round(ev_pe / ev_sotp - 1, 3),
+                sotp_vs_pe_after_addback=round(ev_pe / ev_sotp_ab - 1, 3),
+                sotp_ps_addback=round((ev_sotp_ab + net_cash) / fwd_shares, 1))
+
+
 def leg_multiple_crosscheck(pe_target, fwd_shares, net_cash, op1,
-                            seg1_share, m1, m2, tol=0.25):
+                            seg1_share, m1, m2, tol=0.25, addback=None):
     """PE 腿与 SOTP 腿的倍数自洽性 -> [[level, msg]]。
 
     两条腿给同一家公司、同一情景的同一笔盈利定价，却分别从两套心证取倍数：
@@ -885,9 +1021,19 @@ def leg_multiple_crosscheck(pe_target, fwd_shares, net_cash, op1,
     dev = ev_ebit_pe / ev_ebit_sotp - 1
     if abs(dev) <= tol:
         return []
+    # 摊销加回诊断（0030，sotp_addback_diag）：只给数，不判哪条腿错
+    tail = ""
+    if addback:
+        after = addback["sotp_vs_pe_after_addback"]
+        tail = (f"；把无形资产摊销 {addback['amort_musd']:,}M（营业利润的 "
+                f"{addback['amort_share_of_op1']:.0%}）加回 EBIT 后偏离 {after:+.0%}"
+                + ("——分部可比倍数若按摊销前利润报，口径错配可解释大部分差距"
+                   if abs(after) <= tol else
+                   "——加回后仍超阈值，摊销口径不是主因，查 seg1_share 或倍数本身"))
     return [["yellow", f"PE 腿隐含 EV/EBIT {ev_ebit_pe:.1f}x 与 SOTP 腿设定 "
                        f"{ev_ebit_sotp:.1f}x 偏离 {dev:+.0%}（>±{tol:.0%}）——"
-                       "两条腿在给同一笔营业利润定两个价，请对齐 pe 与 m1/m2 的口径"]]
+                       "两条腿在给同一笔营业利润定两个价，请对齐 pe 与 m1/m2 的口径"
+                       + tail]]
 
 
 def blend_legs(vals, blend_methods, weights):
@@ -1207,6 +1353,8 @@ fcf_base = (ttm_m["fcf"] / rev0_reported * rev0) if rev0_reported else ttm_m["fc
 # 综合 = PE 法与 DCF 各 50%。占比 < 0.85 时维持三法均值。
 SOTP_SEG1_CAP = 0.85
 sotp_in_blend = cfg["seg1_share"] < SOTP_SEG1_CAP
+# 无形资产摊销 TTM（0030）：SOTP 摊销加回诊断的输入；老 facts.json 没有该序列 → None
+_AMORT, _AMORT_NOTE = amort_ttm_musd(facts)
 
 out = dict(
     ticker=cfg["ticker"], name=cfg["name"], date=cfg["date"], mode="standard",
@@ -1332,8 +1480,15 @@ for name, s in cfg["scenarios"].items():
     # PE 腿 vs SOTP 腿的倍数自洽（0023）。降级为参考项的 SOTP 也照查——它不进
     # 综合不代表 m1/m2 可以随便填，报告 SOTP 页仍然按它出数
     if not pe_nm and not sotp_nm:
+        # 摊销加回诊断（0030）：无论是否越阈值都落盘，跨标的统计才有全样本
+        _ab = sotp_addback_diag(pe_target, cfg["fwd_shares"], cfg["net_cash"], op1,
+                                cfg["seg1_share"], s["m1"], s["m2"], _AMORT)
+        if _ab:
+            _ab["amort_note"] = _AMORT_NOTE
+            ddiag["sotp_addback"] = _ab
         _xc = leg_multiple_crosscheck(pe_target, cfg["fwd_shares"], cfg["net_cash"],
-                                      op1, cfg["seg1_share"], s["m1"], s["m2"])
+                                      op1, cfg["seg1_share"], s["m1"], s["m2"],
+                                      addback=_ab)
         if _xc:
             ddiag["ev_ebit_pe"] = round(
                 (pe_target * cfg["fwd_shares"] - cfg["net_cash"]) / op1, 1)
@@ -1523,6 +1678,19 @@ if (not _base_pe_nm and not _band.get("thin_coverage")
         out["trading_range"]["trailing_basis"] = _trp
         out["warnings_global"] += dual_basis_warning(
             _trw.get("fwd_pe_now_position"), (_trw.get("span") or {}).get("lag_days"), _trp)
+    # 现价 ÷ 过去 12 个月 EPS 的两个口径（0029）：判断层此前自己除、用的是含一次性的
+    # GAAP 口径（IBM 实测 20.5x vs 调整后 25.3x）——引擎算好，与 trailing 带并排
+    _trw["trailing_pe_gaap"] = (round(cfg["price"] / _gaap_ttm_eps, 1)
+                                if _gaap_ttm_eps and _gaap_ttm_eps > 0 else None)
+    _trw["trailing_pe_adj"] = (round(cfg["price"] / out["adj_eps"], 1)
+                               if out["adj_eps"] and out["adj_eps"] > 0 else None)
+    # 口径冲突表态闸（0029）：两个分位方向相反时，缺 pe_regime 打 red 打回一次
+    out["warnings_global"] += regime_conflict_warnings(
+        _trw, _trp, cfg.get("pe_regime"), cfg.get("pe_regime_note"),
+        cfg["price"], out["adj_eps"], _gaap_ttm_eps)
+    if cfg.get("pe_regime"):
+        _trw["pe_regime"] = cfg["pe_regime"]
+        _trw["pe_regime_note"] = cfg.get("pe_regime_note", "")
 
 # Rule of 40 透传（fetch_facts 计算，standard 模式）：营收增速+利润率的标尺，
 # 与 pe_band 同属"倍数值不值得给"的判断参照，进报告与 prompt 元数据
