@@ -80,6 +80,10 @@ BLEND_W = {"pe": _env_w("VALUATION_BLEND_W_PE"), "dcf": _env_w("VALUATION_BLEND_
 # 必须与 app/valuation_service.PE_REGIMES 逐字一致（tests/test_regime_gate.py 钉住）
 PE_REGIMES = ("band", "recent", "blend")
 
+# 营业线口径带的展示用常数税率（0031）：必须与 pe_band.OP_TAX 一致——同一常数用于
+# 带子分母与这里的前瞻分母时在目标价里严格约掉（tests/test_op_band.py 钉住）
+OP_TAX = 0.21
+
 
 def _vintage(manifest_text, run_date):
     """从 manifest 提取"这份估值基于哪个报告期"——价值投资的第一个检查项就是数据新鲜度。
@@ -434,6 +438,51 @@ def regime_conflict_warnings(trw, trp, pe_regime, pe_regime_note, price,
              f"双口径方向冲突，判断层已表态 pe_regime={pe_regime}（{what}）："
              + facts_line + consequence + mismatch + "。理由：" + note[:200]
              + ("…" if len(note) > 200 else "")]]
+
+
+def op_band_reading(opb, op1, fwd_shares, eps1, price, gaap_lag=None):
+    """营业线口径 NTM 带的读数（0031）-> dict|None。**参考，不是锚**。
+
+    分母 = 营业利润 × (1 − OP_TAX) ÷ 稀释股数：营业线以下的一次性项目（养老金结算、
+    税务结案、股权重估）不再打断分母，畸变过滤器不必整窗剔除，滞后回到结构下限
+    （IBM 实测 576 → 336 天，2025 年的重定价进入分布）。
+    这条带的倍数**不能**与 GAAP PE 直接比（分母口径不同），所以这里把它的分位
+    换算成两样可比的东西：① 按 base 前瞻营业利润的**每股价格**；② 该价格对应的
+    **等价 GAAP PE**（÷ base eps1）。OP_TAX 在 ① 里严格约掉，只影响倍数的外观。
+    窗口选择与 GAAP 交易区间同一规则：近 3 年子窗优先，回退全窗。
+    """
+    if not opb or opb.get("thin_coverage"):
+        return None
+    rc = opb.get("recent") or {}
+    use = {str(k): v for k, v in (rc.get("pctiles") or opb.get("pctiles") or {}).items()}
+    qs = ("10", "25", "50", "75", "90")
+    if not all(_isnum(use.get(q)) for q in qs) or not fwd_shares or op1 <= 0:
+        return None
+    fwd_opeps = op1 * (1 - OP_TAX) / fwd_shares
+    now = price / fwd_opeps
+    pe = {q: round(float(use[q]), 2) for q in qs}
+    if now < pe["10"]:
+        rank, rel, pos = None, "below_p10", f"低于带子下沿 P10（{pe['10']:.1f}x）"
+    elif now > pe["90"]:
+        rank, rel, pos = None, "above_p90", f"高于带子上沿 P90（{pe['90']:.1f}x）"
+    else:
+        rank = round(_pctile_rank(use, now), 1)
+        rel, pos = "in_band", f"带内第 {rank:.0f} 百分位"
+    px = {q: round(v * fwd_opeps, 1) for q, v in pe.items()}
+    span = (rc.get("span") if rc.get("pctiles") else None) or opb.get("span") or {}
+    lag = span.get("lag_days")
+    return dict(
+        basis=opb.get("basis"), metric="opeps", tax_display=OP_TAX,
+        window=(f"近{rc['years']}年" if rc.get("pctiles") else f"近{opb.get('years')}年"),
+        days=(rc.get("days") if rc.get("pctiles") else opb.get("days")), span=span,
+        fwd_opeps=round(fwd_opeps, 2), pe=pe, px=px,
+        gaap_pe_equiv=({q: round(v / eps1, 1) for q, v in px.items()}
+                       if eps1 and eps1 > 0 else None),
+        now_pe=round(now, 1), now_pctile=rank, now_vs_band=rel, now_position=pos,
+        lag_days=lag,
+        lag_gain_days=(gaap_lag - lag if _isnum(gaap_lag) and _isnum(lag) else None),
+        note="参考读数、不是锚：分母=营业利润×(1−21%)÷股数，21% 仅为展示常数；"
+             "倍数不可与 GAAP PE 直接比，看每股价格与等价 GAAP PE")
 
 
 def band_lag_warnings(band, span, now_pe, min_lag=270):
@@ -1691,6 +1740,12 @@ if (not _base_pe_nm and not _band.get("thin_coverage")
     if cfg.get("pe_regime"):
         _trw["pe_regime"] = cfg["pe_regime"]
         _trw["pe_regime_note"] = cfg.get("pe_regime_note", "")
+    # 营业线口径带读数（0031）：参考、不是锚——不进任何腿、不改任何数
+    _opr = op_band_reading(facts.get("op_band"), out["scenarios"]["base"]["op1"],
+                           cfg["fwd_shares"], _e1, cfg["price"],
+                           (_trw.get("span") or {}).get("lag_days"))
+    if _opr:
+        _trw["op_band"] = _opr
 
 # Rule of 40 透传（fetch_facts 计算，standard 模式）：营收增速+利润率的标尺，
 # 与 pe_band 同属"倍数值不值得给"的判断参照，进报告与 prompt 元数据
@@ -1770,6 +1825,17 @@ if out.get("trading_range"):
               f"（滞后 {(_tr.get('span') or {}).get('lag_days', '?')} 天）"
               f"  ② trailing {_tb['current']:.1f}x {_tb['position']}"
               + (f"（滞后 {_tb['lag_days']} 天）" if _tb.get("lag_days") is not None else ""))
+    _ob = _tr.get("op_band")
+    if _ob:
+        # 营业线口径带（0031）：参考读数，价格与等价 GAAP PE 才可比，倍数本身不可比
+        _eq = _ob.get("gaap_pe_equiv") or {}
+        print(f"  营业线口径带（参考，不是锚；{_ob['window']} {_ob['days']} 天，滞后 "
+              f"{_ob.get('lag_days', '?')} 天"
+              + (f"，比 GAAP 带少 {_ob['lag_gain_days']} 天" if _ob.get("lag_gain_days") else "")
+              + f"）: 现价 {_ob['now_pe']:.1f}x → {_ob['now_position']}；"
+              f"中枢价 {_ob['px']['50']}"
+              + (f"（≈ GAAP PE {_eq['50']:.1f}x）" if _eq.get("50") else "")
+              + f"  P25~P75 {_ob['px']['25']}~{_ob['px']['75']}")
     _df = _tr.get("drift")
     if _df:
         print(f"  窗口内漂移: 早段 {_df['early']['span']['start']}~{_df['early']['span']['end']} "

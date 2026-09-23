@@ -945,6 +945,21 @@ def _add_bands(out: dict, ticker: str, email: str) -> None:
             out["ps_band_error"] = f"{type(e).__name__}: {e}"
             print(f"警告: P/S 带未生成（{out['ps_band_error']}）——近零利润参照本次不生效",
                   file=sys.stderr)
+        # 营业线口径带（0031）：分母=营业利润×(1−21%)÷股数，营业线以下的一次性项目
+        # 免疫——GAAP 带被养老金结算/税务结案/股权重估整窗剔穿时（IBM 滞后 576 天），
+        # 它仍看得见最近的定价。参考读数、不是锚（engine.op_band_reading）
+        try:
+            opb = compute_band(ticker, email, years=5, basis="ntm",
+                               metric="opeps", inputs=inputs)
+            opb.pop("_sorted", None)
+            out["op_band"] = opb
+            print(f"营业线PE带({opb['basis']},{opb['years']}y): 中位 {opb['median']:.1f}x  "
+                  f"区间 {opb['min']:.1f}~{opb['max']:.1f}x  {opb['days']} 个交易日  "
+                  f"止于 {opb['span']['end']}（滞后 {opb['span']['lag_days']} 天）")
+        except Exception as e:
+            out["op_band_error"] = f"{type(e).__name__}: {e}"
+            print(f"警告: 营业线口径带未生成（{out['op_band_error']}）——本次无该参考读数",
+                  file=sys.stderr)
 
 
 def main() -> None:

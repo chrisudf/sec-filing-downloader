@@ -1037,6 +1037,34 @@ def _fwd_meta(fwd: dict | None, force_override: bool) -> str:
         + "\n  fwd_label 由服务器生成，你不要输出该字段。")
 
 
+def _op_band_meta(opb: dict | None, gaap_lag) -> str:
+    """营业线口径带的参考行（0031）——只在带子成形时出，薄样本/缺席都不出。
+
+    是**参考不是锚**：base PE 仍锚上面的 GAAP 带（锚纪律不变）。它的价值是滞后通常
+    更短（营业线以下的一次性项目不再把窗口剔穿，IBM 576 → 336 天），看得见 GAAP 带
+    看不见的那段定价——可以作为 rationale.pe / pe_regime_note 的证据。倍数与 GAAP PE
+    分母不同，这里不让判断层去换算（它不算 EPS），换算由引擎写进报告。"""
+    if not opb or opb.get("thin_coverage") or not opb.get("pctiles"):
+        return ""
+    rc = opb.get("recent") or {}
+    pp = {str(k): v for k, v in (rc.get("pctiles") or opb["pctiles"]).items()}
+    if not all(_isnum(pp.get(q)) for q in ("10", "25", "50", "75", "90")):
+        return ""
+    sp = opb.get("span") or {}
+    win = f"近{rc['years']}年" if rc.get("pctiles") else f"近{opb.get('years')}年"
+    lag = sp.get("lag_days")
+    gain = (f"，比上面的 GAAP 带少滞后 {gaap_lag - lag} 天"
+            if _isnum(gaap_lag) and _isnum(lag) and gaap_lag - lag > 30 else "")
+    return (f"\n  参考（不是锚）· 营业线口径 NTM 带（分母=营业利润×(1−21%)÷稀释股数，"
+            f"营业线以下的一次性项目免疫）{win}: "
+            + " / ".join(f"P{q} {pp[q]:.1f}x" for q in ("10", "25", "50", "75", "90"))
+            + (f"（止于 {sp.get('end')}，滞后 {lag} 天{gain}）" if lag else "")
+            + "。21% 只是展示常数，倍数**不能**与 GAAP PE 直接比——引擎会按你的 base "
+              "盈利把它换成每股价格与等价 GAAP PE 写进报告。base PE 仍锚 GAAP 带；"
+              "若这条带看见的近期定价与 GAAP 带中枢明显不同，可作为 rationale.pe / "
+              "pe_regime_note 的证据。")
+
+
 def _band_meta(mode: str, facts: dict) -> str:
     """历史带锚注入文案（standard=NTM PE 带 / financials=P/TBV 带）。
 
@@ -1141,6 +1169,7 @@ def _band_meta(mode: str, facts: dict) -> str:
                           "pe_regime = band（沿用本带中枢，等于假设重定价全部回吐）/ "
                           "recent（按最近一年定价）/ blend（折中），并在 pe_regime_note "
                           "引用两组倍数与证据；缺了会被打回一次。预判到这种形态可直接给出。")
+        band_meta += _op_band_meta(facts.get("op_band"), _sp.get("lag_days"))
     elif mode == "standard":
         # 带整体缺席（fetch_facts 已在 pe_band_error 留痕）：与 thin_coverage 同等
         # 显式告知，附失败原因——判断层看得见"为什么没有锚"才不会把缺席当背书
