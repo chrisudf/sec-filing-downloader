@@ -902,6 +902,27 @@ if _tr:
                             "同一笔损益同时堵住", GREEN, wrap=True)
         _row += 1
 
+    # ---- 营业线口径带（0031）：参考读数，放在双口径分位之下 ----
+    _ob = _tr.get("op_band")
+    if _ob:
+        _eq = _ob.get("gaap_pe_equiv") or {}
+        put(ws, f"A{_row}", "营业线口径带（参考，不是锚）", BOLD)
+        put(ws, f"B{_row}", f"现价 {_ob['now_pe']:.1f}x → {_ob['now_position']}"
+                            + (f"（滞后 {_ob['lag_days']} 天" if _ob.get("lag_days") else "")
+                            + (f"，比 GAAP 带少 {_ob['lag_gain_days']} 天）"
+                               if _ob.get("lag_gain_days") else
+                               ("）" if _ob.get("lag_days") else "")), BLUE)
+        put(ws, f"E{_row}", f"中枢价 {_ob['px']['50']}"
+                            + (f"（≈ GAAP PE {_eq['50']:.1f}x）" if _eq.get("50") else "")
+                            + f"；P25~P75 {_ob['px']['25']}~{_ob['px']['75']}", BLUE)
+        put(ws, f"H{_row}", "分母 = 营业利润 ×(1−21%) ÷ 稀释股数：营业线以下的一次性项目"
+                            "（养老金结算、税务结案、股权重估）不再打断分母，所以滞后通常比"
+                            "上方 GAAP 带短、能看见更近的定价。21% 只是展示常数、在价格里"
+                            "严格约掉；倍数**不可**与 GAAP PE 直接比，比较请看每股价格与"
+                            "等价 GAAP PE。它不进任何腿、不改目标价——base PE 仍锚 GAAP 带",
+            GREEN, wrap=True)
+        _row += 1
+
     # ---- 无滞后 trailing 对照：补上主带看不见的最近一年 ----
     _tn = _tr.get("trailing_nolag")
     if _tn:

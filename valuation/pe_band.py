@@ -76,6 +76,18 @@ GW_TAGS = ["Goodwill"]
 IT_TAGS = ["IntangibleAssetsNetExcludingGoodwill", "FiniteLivedIntangibleAssetsNet"]
 SH_TAGS = ["WeightedAverageNumberOfDilutedSharesOutstanding",
            "AdjustedWeightedAverageShares", "WeightedAverageShares"]
+# 营业线口径带（metric="opeps"，0031）的原料：营业利润申报优先，发行人停报/从未
+# 申报的期按 rev − cogs − rnd − sga 推导——三个组件的候选列表与 fetch_facts.SPEC
+# 逐字一致（tests/test_op_band.py 钉住），否则带子与引擎 op1 不是同一个营业利润
+OP_TAGS = ["OperatingIncomeLoss"]
+COGS_TAGS = ["CostOfGoodsAndServicesSold", "CostOfRevenue", "CostOfGoodsSold"]
+RND_TAGS = ["ResearchAndDevelopmentExpense"]
+SGA_TAGS = ["SellingGeneralAndAdministrativeExpense"]
+# 展示用常数税率：分母 = 营业利润 × (1 − OP_TAX) ÷ 股数，只为让倍数读起来像 PE。
+# 同一常数同时用于带子与引擎的前瞻分母时，它在目标价里**严格约掉**（带子倍数 ∝
+# 1/(1−t)、前瞻盈利 ∝ (1−t)）——不影响任何结论，所以不按发行人税率取。
+# 必须与 engine.py 的 OP_TAX 一致（同一测试钉住）
+OP_TAX = 0.21
 # 稀释 EPS（股数兜底反推用）：US GAAP + IFRS
 EPS_TAGS = ["EarningsPerShareDiluted", "DilutedEarningsLossPerShare"]
 
@@ -148,6 +160,42 @@ def derive_q4(quarterly, annual):
             quarterly[a_end] = {"val": a["val"] - sum(v["val"] for v in in_year.values()),
                                 "filed": a["filed"], "first_filed": a["first_filed"]}
     return dict(sorted(quarterly.items()))
+
+
+def op_income_rows(facts):
+    """营业利润的 (annual, quarterly) 行（与 pick 同形），税后展示口径 ×(1−OP_TAX)。
+
+    为什么要营业线口径（0031）：GAAP 净利分母被营业线以下的一次性项目打断时，
+    畸变过滤器会整窗剔除——IBM 2022/2024 两次养老金结算 + 2025Q4 税务结案让
+    5 年窗口只剩 488 天、滞后 576 天，2025 年的重定价整段不在分布里；AMZN/GOOGL
+    的 Anthropic 重估同理。这些项目都在营业线以下，换分母就免疫。
+    推导规则与 fetch_facts._derive_op_income_series 相同：只补最后申报期之后的期，
+    三个组件同期全在才算；推导期的可知日 = 各组件可知日的最晚者（全部公布才算得出）。
+    """
+    def _series(tags, prefer_max=False):
+        a = pick(facts, tags, "annual", {"USD"}, prefer_max=prefer_max)
+        return a, derive_q4(pick(facts, tags, "quarterly", {"USD"},
+                                 prefer_max=prefer_max), a)
+    op_a, op_q = _series(OP_TAGS)
+    rev_a, rev_q = _series(REV_TAGS, prefer_max=True)
+    comps = [_series(t) for t in (COGS_TAGS, RND_TAGS, SGA_TAGS)]
+
+    def _fill(op, rev, parts):
+        last = max(op, default="")
+        for k, r in rev.items():
+            if k <= last or any(k not in p for p in parts):
+                continue
+            op[k] = {"val": r["val"] - sum(p[k]["val"] for p in parts),
+                     "filed": max([r["filed"]] + [p[k]["filed"] for p in parts]),
+                     "first_filed": max([r["first_filed"]]
+                                        + [p[k]["first_filed"] for p in parts])}
+        return dict(sorted(op.items()))
+    op_a = _fill(op_a, rev_a, [c[0] for c in comps])
+    op_q = _fill(op_q, rev_q, [c[1] for c in comps])
+
+    def _tax(rows):
+        return {k: dict(v, val=v["val"] * (1 - OP_TAX)) for k, v in rows.items()}
+    return _tax(op_a), _tax(op_q)
 
 
 def derive_q4_avg(quarterly, annual):
@@ -567,7 +615,8 @@ def compute_band(ticker, email, years=5, basis="forward", include_series=False,
 
     供 CLI 与 fetch_facts.py 共用——engine.py 是零联网的确定性计算层，
     带子必须由数据层算好塞进 facts.json，不能让引擎自己去取。
-    metric="eps"（PE 带，默认）或 "rps"（P/S 带，分母=每股营收）；
+    metric="eps"（PE 带，默认）、"rps"（P/S 带，分母=每股营收）或 "opeps"
+    （营业线口径带，分母=营业利润×(1−OP_TAX)÷股数，见 op_income_rows）；
     inputs=load_inputs(...) 可复用已下载数据，None 则自行下载。
     """
     ticker = ticker.upper()
@@ -577,12 +626,18 @@ def compute_band(ticker, email, years=5, basis="forward", include_series=False,
         raise RuntimeError("inputs 的价格窗口比请求的 years 短，请重新 load_inputs")
     facts, hist, splits = inputs["facts"], inputs["hist"], inputs["splits"]
     cik = inputs["cik"]
-    NUM_TAGS, P = (NI_TAGS, "pe") if metric == "eps" else (REV_TAGS, "ps")
-    NUM_WORD = "净利" if metric == "eps" else "营收"
+    NUM_TAGS, P, NUM_WORD = {"eps": (NI_TAGS, "pe", "净利"),
+                             "rps": (REV_TAGS, "ps", "营收"),
+                             "opeps": (REV_TAGS, "peop", "营业利润")}[metric]
+    # 一次性畸变守卫按利润类分母生效（净利 / 营业利润），营收不做（见下方注释）
+    ANOM_ON = metric in ("eps", "opeps")
 
-    ni_a = pick(facts, NUM_TAGS, "annual", {"USD"}, prefer_max=(metric == "rps"))
-    ni_q = derive_q4(pick(facts, NUM_TAGS, "quarterly", {"USD"},
-                          prefer_max=(metric == "rps")), ni_a)
+    if metric == "opeps":
+        ni_a, ni_q = op_income_rows(facts)
+    else:
+        ni_a = pick(facts, NUM_TAGS, "annual", {"USD"}, prefer_max=(metric == "rps"))
+        ni_q = derive_q4(pick(facts, NUM_TAGS, "quarterly", {"USD"},
+                              prefer_max=(metric == "rps")), ni_a)
     if len(ni_q) < 4:
         raise RuntimeError(insufficient_q_msg(
             ticker, f"{NUM_WORD} {len(ni_q)} 期", inputs.get("taxonomy"),
@@ -635,9 +690,11 @@ def compute_band(ticker, email, years=5, basis="forward", include_series=False,
     # 中位是常态结构）会被整段误剔——P/S 带宁可保留全部窗口。
     # _omap/_cov 在窗口层与 FY 层之间共享：季节性豁免两层必须同一判据，各建一张表
     # 会在边界窗上判出两个答案
-    _omap = loo_outlier_map(ni_q) if metric == "eps" else {}
-    _cov = loo_covered_periods(ni_q) if metric == "eps" else set()
-    pts = build_ttm_eps(ni_q, sh_q, anom_k=(ANOM_K if metric == "eps" else None),
+    # opeps 同样开：营业线**以内**的一次性（重组、诉讼和解、减值）照旧由它剔除，
+    # 换分母只免疫营业线以下的那一类
+    _omap = loo_outlier_map(ni_q) if ANOM_ON else {}
+    _cov = loo_covered_periods(ni_q) if ANOM_ON else set()
+    pts = build_ttm_eps(ni_q, sh_q, anom_k=(ANOM_K if ANOM_ON else None),
                         omap=_omap, covered=_cov)
     if not pts:
         raise RuntimeError(f"{ticker} 无法构造连续四季 TTM EPS")
@@ -656,7 +713,7 @@ def compute_band(ticker, email, years=5, basis="forward", include_series=False,
     # 季节性豁免与窗口层同一判据同一张 _omap（0008）：稳定季节性票的**每一个** FY
     # 都含 >1.25x 离群季，不豁免则 forward 口径整段剔穿
     anom_fys, seasonal_fys = [], []
-    for e in (list(eps_fy) if metric == "eps" else []):
+    for e in (list(eps_fy) if ANOM_ON else []):
         ae = date.fromisoformat(e)
         qkv = [(k, v["val"]) for k, v in ni_q.items()
                if 0 <= (ae - date.fromisoformat(k)).days < 340]
@@ -1050,9 +1107,11 @@ def main():
                          "trailing=按当日已公告的滚动TTM EPS；"
                          "ntm=按该日已知最新TTM期末之后12个月实现的EPS"
                          "（与 engine 的前瞻期严格同源；较日历日起算最多滞后一季）")
-    ap.add_argument("--metric", choices=("eps", "rps"), default="eps",
+    ap.add_argument("--metric", choices=("eps", "rps", "opeps"), default="eps",
                     help="eps=PE 带（默认）；rps=P/S 带（分母=每股营收，"
-                         "近零利润票的参照——PE 失效的域换 PS 是教科书答案）")
+                         "近零利润票的参照——PE 失效的域换 PS 是教科书答案）；"
+                         "opeps=营业线口径带（分母=营业利润×(1−21%%)÷股数，"
+                         "营业线以下的一次性项目免疫）")
     ap.add_argument("--match")
     ap.add_argument("--out")
     a = ap.parse_args()
@@ -1063,10 +1122,10 @@ def main():
     except RuntimeError as e:
         raise SystemExit(str(e))
     sv = b.pop("_sorted")
-    P = "pe" if a.metric == "eps" else "ps"
-    LBL = "PE" if a.metric == "eps" else "P/S"
-    EW = "EPS" if a.metric == "eps" else "每股营收"
-    NUMW = "净利" if a.metric == "eps" else "营收"
+    P, LBL, EW, NUMW = {"eps": ("pe", "PE", "EPS", "净利"),
+                        "rps": ("ps", "P/S", "每股营收", "营收"),
+                        "opeps": ("peop", "营业线 PE", "每股税后营业利润",
+                                  "营业利润")}[a.metric]
     mean, sd_, cur, key = b["mean"], b["stdev"], b["current"], f"{P}_{a.basis}"
 
     basis_desc = {"forward": f"forward（分母 = 该财年最终实现的{EW}）",
