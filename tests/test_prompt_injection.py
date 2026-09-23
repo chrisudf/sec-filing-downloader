@@ -375,3 +375,24 @@ def test_standard_band_meta_has_no_fin_pe_reference():
                         "pctiles": {str(p): 20.0 + p / 10 for p in
                                     (1, 5, 10, 25, 50, 75, 90, 95, 99)}}}
     assert "信息参照" not in _band_meta("standard", band)
+
+
+# ---- 营业利润推导期标注（IBM 型：从不标 OperatingIncomeLoss）----
+
+def test_derived_op_income_marked_in_prompt():
+    """推导出的营业利润格子打 * 并给图例——判断层必须知道这不是申报值。"""
+    d = _facts(op_income_derived={"quarterly": ["2026-03-31", "2026-06-30"],
+                                  "annual": ["2025-12-31"]})
+    txt = _compact_facts(d)
+    assert "2026-06-30: 250 / 50* / 40 | 0.80" in txt
+    assert "2025-12-31: 1,000 / 200* / 150" in txt
+    assert "2025-09-30: 250 / 50 / 40 | 0.80" in txt          # 申报期不打标
+    assert "* = 营业利润为推导值" in txt
+
+
+def test_no_derived_legend_without_derived_periods():
+    txt = _compact_facts(_facts())
+    assert "* = 营业利润为推导值" not in txt
+    # 推导期全在展示窗口之外（很早的年份）也不出图例
+    txt = _compact_facts(_facts(op_income_derived={"annual": ["2010-12-31"]}))
+    assert "* = 营业利润为推导值" not in txt

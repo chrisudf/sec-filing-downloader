@@ -601,6 +601,44 @@ def _derive_op_income_ttm(out: dict, ttm: dict) -> None:
                 "可能含未单列的摊销/重组项"}
 
 
+def _derive_op_income_series(out: dict) -> None:
+    """营业利润**逐期序列**的推导回填（_derive_op_income_ttm 只补了 TTM）。原地改写 out。
+
+    不标 OperatingIncomeLoss 的发行人（IBM 从来不列"营业利润"这一行；COHR 是中途
+    停报）此前 op_income_quarterly/annual 整列为空，下游三处静默失明：
+      - _opm_series 返回空 → 0025 (c) 的季度利润率异动检查对它不存在；
+      - _compact_facts 按 .get(k, 0) 把每季营业利润印成 0、净利÷营业利润全是 n/a
+        → 判断层「比值异常=有一次性项目」那条必做检查也瞎了；
+      - valuation.json 的 history.op、图表端营业利润/利润率整列为 0 或 null。
+    与 TTM 推导同一公式、同一规矩：逐期 rev − cogs − rnd − sga，三个组件同期全在
+    才算，缺一不补；申报值永不覆盖。推导出的期记进 op_income_derived，
+    消费方据此标注"推导值"——判断层和图表都必须知道这不是申报数。
+
+    只补**最后一个申报期之后**的期（从未申报 = 全部）：申报序列中间的空洞不填。
+    发行人自己的营业利润常含公式外的行（其他营业费用、单列摊销），推导值与申报值
+    交错排列会在 opm 序列里造出假的利润率跳变——停报之后/从未申报时没有这个问题。
+    """
+    derived: dict[str, list[str]] = {}
+    for suffix in ("quarterly", "annual"):
+        rev = out.get("revenue_" + suffix) or {}
+        op = out.get("op_income_" + suffix)
+        if op is None:
+            continue
+        last_reported = max(op, default="")
+        comps = [out.get(n + "_" + suffix) or {} for n in ("cogs", "rnd", "sga")]
+        added = []
+        for k, r in rev.items():
+            if k <= last_reported or any(k not in c for c in comps):
+                continue
+            op[k] = r - sum(c[k] for c in comps)
+            added.append(k)
+        if added:
+            out["op_income_" + suffix] = dict(sorted(op.items()))
+            derived[suffix] = sorted(added)
+    if derived:
+        out["op_income_derived"] = derived
+
+
 def classify_core_gaps(out: dict) -> list[str]:
     """核心科目 TTM 缺数的适配性分类（0020）-> problems 行。纯函数可单测。
 
@@ -628,8 +666,13 @@ def classify_core_gaps(out: dict) -> list[str]:
         max(out.get("revenue_annual") or {}, default=""),
         max(out.get("revenue_quarterly") or {}, default=""))
     for k in missing:
-        a = out.get(k + "_annual") or {}
-        qq = out.get(k + "_quarterly") or {}
+        # 诊断的是**申报**史：推导回填的期（_derive_op_income_series）不算申报，
+        # 否则从未报过营业利润的发行人会被说成"停报"或"期数不足"
+        skip = out.get(k + "_derived") or {}
+        a = {p: v for p, v in (out.get(k + "_annual") or {}).items()
+             if p not in set(skip.get("annual", ()))}
+        qq = {p: v for p, v in (out.get(k + "_quarterly") or {}).items()
+              if p not in set(skip.get("quarterly", ()))}
         n = len(a) + len(qq)
         if not n:
             per.append(f"  · {k}: 从未申报该概念"
@@ -818,6 +861,9 @@ def build_facts(ticker: str, email: str, cik: int | None = None) -> dict:
         # 营业利润停报的自下而上推导回退（0021）——组件不齐则保持 None，
         # 由 classify_core_gaps 按「停报」分类报错
         _derive_op_income_ttm(out, ttm)
+        # 逐期序列放在 TTM 之后：TTM 仍走上面的推导分支并带 derived 标记，
+        # 这里只补历史序列，给 opm 序列/prompt/图表用
+        _derive_op_income_series(out)
     out["ttm"] = ttm
     out["data_latest"] = max(max(out["revenue_annual"], default=""),
                              max(out["revenue_quarterly"], default=""))

@@ -920,7 +920,10 @@ async function load() {
     renderWaterfall(d, d.periods.length - 1);
     // 卡片刚显示时容器才有宽度，让 ECharts 重算一次
     requestAnimationFrame(() => Object.values(state.charts).forEach(c => c.resize()));
-    const baseStatus = `${d.periods.length} 期 · ${freq === "quarterly" ? "季度" : "年度"}`;
+    // 营业利润推导期（发行人未申报 OperatingIncomeLoss）要说出来，不能冒充申报值
+    const opDerived = (d.income.op_income_derived || []).some(Boolean)
+      ? " · 营业利润为推导值（营收−成本−研发−销管）" : "";
+    const baseStatus = `${d.periods.length} 期 · ${freq === "quarterly" ? "季度" : "年度"}${opDerived}`;
     if (d.warning) setStatus("err", `${d.periods.length} 期 · ⚠ ${d.warning}`);
     else setStatus("ok", baseStatus);
     // 对比票异步落地：主图先出，虚线后叠；失败提示写进最终状态不被覆盖

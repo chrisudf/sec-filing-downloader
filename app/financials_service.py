@@ -94,11 +94,44 @@ def _ratio(num, den):
             for x, y in zip(num, den)]
 
 
-def _total_debt(inst) -> list:
+def _close(a, b, rel=0.005):
+    return a is not None and b is not None and abs(a - b) <= rel * max(abs(a), abs(b))
+
+
+def _st_borrowings_is_full_line(facts: dict) -> bool:
+    """发行人是否把资产负债表「短期债务」**整行**标成 ShortTermBorrowings？
+
+    us-gaap 定义里 ShortTermBorrowings 只是原始期限 <1 年的借款，不含一年内到期的
+    长债，所以组合规则把它和 LongTermDebtCurrent 相加。IBM 不按定义用：2019 起它把
+    整行 "Short-term debt"（=短期借款+商业票据+当期到期长债）标成 ShortTermBorrowings，
+    附注里又用 LongTermDebtAndCapitalLeaseObligationsCurrent 把当期到期那笔再标一次
+    → 相加后同一笔钱算两次，2019 年起每年多算 $4.7–7.8B（FY25 $67.7B vs 公司报 $61.3B）。
+
+    判据扫全历史、在发行人层面下结论（单期无法区分"整行"与"恰好相等"）：
+      ① 同期 DebtCurrent ≈ ShortTermBorrowings 且当期到期长债 > 0——DebtCurrent
+         按定义含当期到期，两者相等说明这个发行人的 ShortTermBorrowings 就是整行
+         （IBM 2018-12-31 两个标签并存且相等）；
+      ② ≥2 期 ShortTermBorrowings ≈ 当期到期长债（两笔独立的钱多期逐一相等不是巧合；
+         IBM 近 6 季里 5 季差额 < 0.05%）。
+    都不成立时返回 False，保持原组合规则——按定义打标签的发行人不受影响。
+    """
+    sb = facts.get("st_borrowings_instant") or {}
+    lc = facts.get("lt_debt_current_instant") or {}
+    dc = facts.get("debt_current_instant") or {}
+    if any(dc[d] and _close(dc[d], sb[d]) and (lc.get(d) or 0) > 0.01 * dc[d]
+           for d in sb.keys() & dc.keys()):
+        return True
+    same = sum(1 for d in sb.keys() & lc.keys() if lc[d] and _close(sb[d], lc[d]))
+    return same >= 2
+
+
+def _total_debt(inst, st_full_line: bool = False) -> list:
     """总债务的组合规则（四个不可混加口径，见 fetch_facts 注释）：
     - 长期腿：优先真非流动口径；只有 LongTermDebt(含当期到期) 时用它，
       流动腿只补 CP/短借（当期到期已在总口径里，再加 DebtCurrent 会双计）
     - 流动腿：DebtCurrent（含 CP）优先，否则 当期到期+CP+短借 逐项拼
+    - st_full_line（见 _st_borrowings_is_full_line）：ShortTermBorrowings 已是整行
+      短期债务，流动腿直接取它，不再叠加当期到期/商业票据（IBM 的 CP 也在这行里）
     - 没有任何长期腿数据的期直接给 null：宁缺勿错（KO 换标签曾把
       42B 债务画成只剩 1B 商业票据的假去杠杆悬崖）"""
     noncur = inst("lt_debt_noncurrent")
@@ -113,6 +146,8 @@ def _total_debt(inst) -> list:
     for nc, lt, lc, dc, c, sb in rows:
         if nc is not None:
             cur = dc if dc is not None else None
+            if cur is None and st_full_line and sb is not None:
+                cur = max(sb, lc or 0)
             if cur is None:
                 parts = [v for v in (lc, c, sb) if v is not None]
                 cur = sum(parts) if parts else None
@@ -120,6 +155,10 @@ def _total_debt(inst) -> list:
         elif lt is not None:
             if dc is not None and lc is not None:
                 extra = max(dc - lc, 0)
+            elif st_full_line and sb is not None:
+                # 整行里的当期到期部分已在 LongTermDebt 总口径中；缺 lc 无法拆时
+                # 宁可少算零星短借，也不把当期到期再加一遍
+                extra = max(sb - lc, 0) if lc is not None else 0
             else:
                 parts = [v for v in (c, sb) if v is not None]
                 extra = sum(parts) if parts else 0
@@ -249,6 +288,9 @@ def _reshape(facts: dict, info: dict, freq: str, years: int) -> dict:
             "sga": sga,
             "opex": opex,
             "op_income": op_income,
+            # 逐期标记推导值（rev−cogs−rnd−sga，发行人未申报 OperatingIncomeLoss）
+            "op_income_derived": [e in set((facts.get("op_income_derived") or {})
+                                           .get(freq, ())) for e in ends],
             "pretax_income": dur("pretax_income"),
             "income_tax": dur("income_tax"),
             "net_income": net_income,
@@ -262,7 +304,8 @@ def _reshape(facts: dict, info: dict, freq: str, years: int) -> dict:
         },
         "cashflow": {"ocf": ocf, "capex": capex, "fcf": fcf,
                      "buyback": buyback, "dividends": dividends, "sbc": sbc},
-        "balance": {"cash": cash, "securities": securities, "total_debt": _total_debt(inst)},
+        "balance": {"cash": cash, "securities": securities,
+                    "total_debt": _total_debt(inst, _st_borrowings_is_full_line(facts))},
         # 营业外/一次性组件：前端拆解瀑布图的营业外损益并标记一次性主导的期
         "oneoff": {k: dur(k) for k in
                    ("equity_inv_gain", "interest_income", "interest_expense_nonop",
