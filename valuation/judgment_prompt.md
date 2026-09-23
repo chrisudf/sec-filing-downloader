@@ -178,6 +178,12 @@
     （interest_income / interest_expense_nonop / other_nonop / equity_inv_gain / fx_gain
     之中存在的那些）与逐季 税前−营业利润 残差行，推导要落在这些数上；
     标注为不可用的序列不要引用>",
+  "pe_regime": "<可选：band|recent|blend。元数据「口径冲突闸」描述的形态出现时必填——
+    band=沿用历史带中枢（等于假设带子盲区里的重定价全部回吐）/ recent=按最近一年定价 /
+    blend=折中。与 base 的 pe 必须一致：选 band 就锚带子 P50，选 recent/blend 的偏离
+    属于有证据的偏离>",
+  "pe_regime_note": "<给 pe_regime 时必填：引用 NTM 带位置与 trailing 位置两组倍数
+    （trailing 用调整后 EPS 口径）和财报/定价证据，说明为什么选这个口径>",
   "seg1": "<主分部名>", "seg2": "<次分部名或—>", "seg1_share": <0-1>,
   "scenarios": {
     "bear": {"g": <前瞻期(NTM,见元数据)营收增速vs TTM,小数>,
