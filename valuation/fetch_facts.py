@@ -70,6 +70,15 @@ SPEC = {
                                      "InterestExpenseNonoperating"]),
     "fx_gain": _item(["ForeignCurrencyTransactionGainLossBeforeTax"]),
     "other_nonop": _item(["OtherNonoperatingIncomeExpense"]),
+    # 私募股权「计量替代法」按可观察价上调（ASC 321）：AMZN 的 Anthropic 优先股
+    # 重估（Q2'26 单季 +50.49B）记在利润表「Other income (expense), net」这一行
+    # （= other_nonop），不在 EquitySecuritiesFvNiGainLoss 下（同季只有 1.3B）
+    # —— 图表端靠它把 other_nonop 里的投资重估拆出来标一次性。GOOGL/NVDA/CRM
+    # 反过来把它算在股权投资损益里，是否单列由图表端逐期判定（见
+    # financials_service._private_equity_gain）。只取上调：下调/减值两个标签的
+    # 符号约定各家不一（UBER/PYPL 正负混用），宁缺勿错
+    "pe_upward_adj": _item(
+        ["EquitySecuritiesWithoutReadilyDeterminableFairValueUpwardPriceAdjustmentAnnualAmount"]),
     "restructuring": _item(["RestructuringCharges"]),
     "impairment": _item(["GoodwillImpairmentLoss", "AssetImpairmentCharges",
                          "ImpairmentOfIntangibleAssetsExcludingGoodwill"]),
