@@ -77,6 +77,7 @@ sec-filing-downloader/
 ├── valuation/                 # 估值确定性计算层 + 判断层提示词
 │   ├── fetch_facts.py         # XBRL companyfacts 取数（多标签合并/Q4推导/TTM/SBC/带子/Ro40）
 │   ├── pe_band.py             # 历史 PE/P.S/P.TBV 分位带（三口径 + 畸变剔除 + 逆向匹配）
+│   ├── pe_rank.py             # watchlist 批量表：当前 PE 的 10/5/3 年分位 + 本/下财年 PE
 │   ├── extract_sections.py    # 财报关键章节定位（分部/税率/capex/流动性）
 │   ├── judgment_prompt.md     # 判断层提示词（假设 schema + 检查清单）
 │   ├── engine.py              # PE 法 / 十年 FCFF DCF / SOTP / 反向 DCF / 交易区间 / 敏感性
@@ -207,6 +208,18 @@ python valuation/ref_table.py AMZN you@example.com
 EPS 用 yfinance 免费一致预期（0y/+1y 财年口径 + 90 天修正轨迹，一次性项目污染 GAAP consensus 时自动预警），
 带子默认 pe_band 分位数、可在 `ref_table_overrides.json` 钉死手拍带（输出自动给逆向匹配：框住历史的百分之几）。
 每次运行快照进 `ref_snapshots/`，攒出参考表「一行一个季度」的修正轨迹。与估值管线的三情景互为对照。
+
+```bash
+# watchlist 批量：当前 PE 在近 10/5/3 年的分位 + 本/下财年 PE，一票一行
+python valuation/pe_rank.py                    # 票单 = ../watchlist-scanner/watchlist.toml
+python valuation/pe_rank.py --tickers MSFT,NVDA
+```
+
+`pe_rank.py` 把 pe_band（trailing 口径，GAAP 与营业线两组）和 yfinance 一致预期拼成一张表，
+写 `reports/pe_rank/pe_rank_YYYY-MM-DD.{md,csv}`。ETF/指数跳过（SEC 无 EPS），外国发行人与
+刚转盈的票只出前瞻列。`†` = 当前 TTM 窗口被畸变守卫剔除（AMZN/GOOG 2026Q2 私募重估型），
+此时看营业线那组。注意 Yahoo 的 forwardPE 是**下财年**预期，不是 NTM。分母一季度才跳一次，
+每周跑一次 + 财报季补跑即可。
 
 `trend.py` 与普通趋势表的区别在于**把季度间的变化和同一报告期内的采样噪声放在一起看**。
 判断层有运行间噪声（MSFT 实测 base 综合目标价 CV 2.4%，NVDA bear CV≈12%），
