@@ -98,6 +98,73 @@ def _close(a, b, rel=0.005):
     return a is not None and b is not None and abs(a - b) <= rel * max(abs(a), abs(b))
 
 
+def _median(arr):
+    vals = sorted(v for v in arr if v is not None)
+    return vals[len(vals) // 2] if vals else None
+
+
+def _coverage(arr) -> int:
+    return sum(v is not None for v in arr)
+
+
+def _afs_is_superset(afs, classified, tol=0.98) -> bool:
+    """AFS 总口径能不能当「证券合计」用：在两者同期都有值的每一期，AFS 都不能
+    明显小于资产负债表的分类证券行。
+
+    保险公司（MET/PGR）的 AFS 是整个债券组合，远大于零星的分类行，天然成立；
+    AMZN 的 AvailableForSaleSecuritiesDebtSecurities 却只标了 **Anthropic 可转债**
+    （23.7/45.8/42.2/97.9B，与 10-Q「estimated fair value of our convertible notes」
+    逐字吻合），2025-09 那期 23.7B 还小于有价证券行 27.3B——一个比资产负债表
+    证券行还小的"总口径"，只能是另一个科目（战略持股），不是证券合计。
+    NVDA 2026 起把证券行拆成 债券+股票，AFS 只剩债券腿（39.5 vs 52.0），同理不能用。
+    没有重叠期（纯保险/银行，分类行整列空）时无从反证，放行。"""
+    pairs = [(a, c) for a, c in zip(afs, classified) if a is not None and c is not None]
+    return all(a >= tol * c for a, c in pairs)
+
+
+def _pick_securities(classified, unclassified, afs) -> list:
+    """证券源整列选择（混着逐期取会跨口径）：
+    ① AFS 总口径先过 _afs_is_superset，过不了就不是候选；
+    ② 覆盖度门槛：只在覆盖期数 ≥ 最佳候选一半的源里比——此前直接取「非空
+       中位数最大」，AMZN 季度图 4 期的 Anthropic 可转债（中位 45.8B）压过了
+       12 期齐全的有价证券行（27.3B），8 个季度画成空白、最新一期多出 53B；
+    ③ 合格者里再取非空中位数最大（原口径：MET 的 AFS ~$300B 胜过零星分类行，
+       SOFI 的 OtherInvestments 胜过同覆盖的 AFS 子集）。
+    候选顺序即并列时的优先级：分类行 > 无分类整行 > AFS。"""
+    cands = [classified, unclassified]
+    if _afs_is_superset(afs, classified):
+        cands.append(afs)
+    best = max(_coverage(c) for c in cands)
+    if best == 0:
+        return classified
+    eligible = [c for c in cands if 2 * _coverage(c) >= best]
+    return max(eligible, key=lambda a: _median(a) or 0)
+
+
+def _private_equity_gain(upward, equity_gain, other_nonop, tol=0.98) -> list:
+    """逐期判定「私募股权按可观察价上调」要不要作为独立的一次性项单列。
+
+    同一笔重估，各家标在不同的汇总科目下（实测 15 只票）：
+    - AMZN：落在利润表「Other income (expense), net」= other_nonop（Q2'26 other_nonop
+      53.41B ⊇ 上调 50.49B，而股权投资损益只有 1.3B）→ 单列，否则图表把它当经常性
+      的 other_nonop 放过，"剔一次性"净利率在 Q2'26 画成 30.7%（应约 11%）
+    - GOOGL/NVDA 2026-07/CRM：算在 EquitySecuritiesFvNiGainLoss 里（eq ≥ 上调）→ 不单列，
+      否则与 equity_inv_gain 重复计算
+    - GOOGL 2022-06：eq 为负（有价股票浮亏抵消），other_nonop 只有 0.26B 装不下 0.91B
+      的上调 → 只能在 eq 里，不单列（单比 eq 与上调的大小会误判成"不在 eq 里"）
+    判据：other_nonop 装得下它 **且** 股权投资损益装不下它，才单列；
+    拿不准一律不单列（漏标一期比同一笔钱算两遍好）。"""
+    out = []
+    for u, e, o in zip(upward, equity_gain, other_nonop):
+        if u is None or u <= 0:
+            out.append(None)
+            continue
+        in_eq = e is not None and e >= tol * u
+        in_other = o is not None and o >= tol * u
+        out.append(u if in_other and not in_eq else None)
+    return out
+
+
 def _st_borrowings_is_full_line(facts: dict) -> bool:
     """发行人是否把资产负债表「短期债务」**整行**标成 ShortTermBorrowings？
 
@@ -249,18 +316,9 @@ def _reshape(facts: dict, info: dict, freq: str, years: int) -> dict:
               for a, b in zip(inst("st_securities"), st_fill)]
     lt_sec = [a if a is not None else b
               for a, b in zip(inst("lt_securities"), inst("debt_securities_lt"))]
-    # 证券源按覆盖度整列选择：分类口径（AAPL/NVDA）、无分类整行
-    # （SOFI 的 OtherInvestments）、保险 AFS 总口径（MET ~$316B）——
-    # 混着逐期取会跨口径，整列取「非空中位数最大」的那个源
-    def _median(arr):
-        vals = sorted(v for v in arr if v is not None)
-        return vals[len(vals) // 2] if vals else None
-
-    candidates = [_add(st_sec, lt_sec), inst("securities_unclassified"),
-                  inst("afs_securities_total")]
-    securities = max(candidates, key=lambda a: _median(a) or 0)
-    if all(v is None for v in securities):
-        securities = candidates[0]
+    securities = _pick_securities(_add(st_sec, lt_sec),
+                                  inst("securities_unclassified"),
+                                  inst("afs_securities_total"))
 
     # 报告断档警示：新控股壳（XOM 重组后新 CIK）申报历史很短，相邻季度
     # 间隔超过一个季度说明有断档，前端提示而不是让相隔一年的柱贴着画
@@ -310,7 +368,9 @@ def _reshape(facts: dict, info: dict, freq: str, years: int) -> dict:
         "oneoff": {k: dur(k) for k in
                    ("equity_inv_gain", "interest_income", "interest_expense_nonop",
                     "fx_gain", "other_nonop", "restructuring", "impairment",
-                    "litigation", "disposal_gain")},
+                    "litigation", "disposal_gain")}
+                  | {"private_equity_gain": _private_equity_gain(
+                      dur("pe_upward_adj"), dur("equity_inv_gain"), dur("other_nonop"))},
         "ttm": ttm,
     }
 

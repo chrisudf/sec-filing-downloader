@@ -199,6 +199,98 @@ def test_reshape_gap_warning():
     assert r["warning"] is not None
 
 
+B = 1e9
+
+
+def test_pick_securities_sparse_afs_loses_to_full_classified():
+    # AMZN 季度 3 年窗实测：有价证券行 12 期齐全；AFS 只有 4 期，而且是 Anthropic
+    # 可转债（中位 45.8B）。旧规则「中位数最大」选了后者：8 期空白 + 最新一期多 53B
+    cls = [v * B for v in (14.6, 13.4, 12.2, 17.9, 13.0, 22.4, 28.4, 35.4,
+                           27.3, 36.2, 41.3, 44.8)]
+    afs = [None] * 8 + [23.7 * B, 45.8 * B, 42.2 * B, 97.9 * B]
+    assert fs._pick_securities(cls, [None] * 12, afs) is cls
+
+
+def test_pick_securities_afs_not_superset_is_dropped_even_when_full():
+    # 定时炸弹：AMZN 再过几个季度 AFS 覆盖就过半、中位数又更大——光靠覆盖度门槛会
+    # 重新选中 Anthropic 可转债。任何一期 AFS 明显小于证券行 ⇒ 不是证券合计
+    cls = [27.3 * B, 36.2 * B, 41.3 * B, 44.8 * B]
+    afs = [23.7 * B, 45.8 * B, 42.2 * B, 97.9 * B]
+    assert not fs._afs_is_superset(afs, cls)
+    assert fs._pick_securities(cls, [None] * 4, afs) is cls
+    # NVDA 2026 拆行后 AFS 只剩债券腿（39.5 vs 债券+股票 52.0）：同理
+    assert fs._pick_securities([38.5 * B, 52.0 * B], [None] * 2,
+                               [52.1 * B, 39.5 * B]) == [38.5 * B, 52.0 * B]
+
+
+def test_pick_securities_insurer_afs_total_still_wins():
+    # MET：分类行零星（~5B），AFS 是整个债券组合（~300B）且逐期都大 ⇒ 仍选 AFS
+    cls = [5.3 * B] * 12
+    afs = [293.8 * B] * 12
+    assert fs._pick_securities(cls, [18.1 * B] * 12, afs) is afs
+
+
+def test_pick_securities_half_coverage_is_eligible():
+    # AIG 年度：分类 4/10、无分类整行 10/10（18.8B 的其他投资）、AFS 6/10（251B 组合）。
+    # 纯「覆盖度优先」会换成 18.8B 的子项；门槛是最佳覆盖的一半，AFS 6 期合格
+    cls = [12.3 * B] * 4 + [None] * 6
+    unc = [18.8 * B] * 10
+    afs = [None] * 4 + [251.1 * B] * 6
+    assert fs._pick_securities(cls, unc, afs) is afs
+
+
+def test_pick_securities_unclassified_bank_and_ties():
+    # SOFI：无分类整行与 AFS 同覆盖，中位数整行更大 ⇒ 整行（行为不变）
+    unc, afs = [2.2 * B] * 12, [2.1 * B] * 12
+    assert fs._pick_securities([None] * 12, unc, afs) is unc
+    # 并列时按候选顺序取分类行
+    cls = [5.0 * B] * 12
+    assert fs._pick_securities(cls, [None] * 12, list(cls)) is cls
+    # 三源全空：退回分类行（全 null）
+    empty = [None] * 3
+    assert fs._pick_securities(empty, [None] * 3, [None] * 3) is empty
+
+
+def test_private_equity_gain_amzn_other_nonop():
+    # AMZN 实测四季：Q3'25 / Q4'25 / Q1'26 / Q2'26
+    up = [7.2 * B, 0.42 * B, 12.33 * B, 50.49 * B]
+    eq = [0.15 * B, 0.86 * B, -0.88 * B, 1.3 * B]
+    oth = [10.19 * B, 1.18 * B, 15.65 * B, 53.41 * B]
+    # Q4'25 的 0.42B 小于同期股权投资损益 0.86B，按"可能在 eq 里"保守不单列
+    assert fs._private_equity_gain(up, eq, oth) == [7.2 * B, None, 12.33 * B, 50.49 * B]
+
+
+def test_private_equity_gain_inside_equity_gain_not_double_counted():
+    # GOOGL 2021-03：eq 4.84 ⊇ 上调 4.68 ⇒ 不单列（否则与 equity_inv_gain 算两遍）
+    assert fs._private_equity_gain([4.68 * B], [4.84 * B], [0.37 * B]) == [None]
+    # NVDA 2026-04：eq 与 other_nonop 同为 ~15.9B（同一笔两次标注），上调 2.6B 在里面
+    assert fs._private_equity_gain([2.6 * B], [15.94 * B], [15.93 * B]) == [None]
+    # GOOGL 2022-06：eq 被有价股票浮亏拖成负数，但 other_nonop 0.26B 装不下 0.91B
+    # ⇒ 只能在 eq 里；单比 eq 与上调的大小会误判
+    assert fs._private_equity_gain([0.91 * B], [-0.25 * B], [0.26 * B]) == [None]
+    # NVDA 2026-01：无 eq 标签、other_nonop 7.85B 装得下 1.28B ⇒ 单列
+    assert fs._private_equity_gain([1.28 * B], [None], [7.85 * B]) == [1.28 * B]
+    # 缺值/非正：一律不单列
+    assert fs._private_equity_gain([None, 0.0, 1 * B], [None] * 3,
+                                   [5 * B, 5 * B, None]) == [None, None, None]
+
+
+def test_reshape_wires_securities_and_private_equity():
+    """接线：_reshape 必须走新的证券选源与私募重估单列（纯函数测不到调用点）。"""
+    facts = _facts()
+    ends = sorted(facts["revenue_quarterly"])
+    facts["st_securities_instant"] = {e: 30 * B for e in ends}
+    facts["afs_securities_total_instant"] = {ends[-1]: 97.9 * B}
+    # 末期 AMZN 型（单列）；倒数第二期 GOOGL 型（在股权投资损益里，不许单列）——
+    # 后者保证接线走的是判定函数而不是直接透传 pe_upward_adj
+    facts["pe_upward_adj_quarterly"] = {ends[-2]: 4.68 * B, ends[-1]: 50.49 * B}
+    facts["equity_inv_gain_quarterly"] = {ends[-2]: 4.84 * B, ends[-1]: 1.3 * B}
+    facts["other_nonop_quarterly"] = {ends[-2]: 0.37 * B, ends[-1]: 53.41 * B}
+    r = fs._reshape(facts, {"name": "T"}, "quarterly", 3)
+    assert r["balance"]["securities"] == [30 * B] * len(ends)
+    assert r["oneoff"]["private_equity_gain"] == [None] * (len(ends) - 1) + [50.49 * B]
+
+
 def test_shared_param_contract():
     # 两个端点的 freq/years 口径必须永远一致（同一常量）
     assert FREQ_PATTERN == "^(quarterly|annual)$"
