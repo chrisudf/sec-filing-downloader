@@ -111,6 +111,21 @@ const bar = (name, data, color, extra = {}) => Object.assign({
   barMaxWidth: 26, emphasis: { focus: "series" },
 }, extra);
 
+// TTM 窗口里一次性/投资项的合计：pre=税前影响，ni=剔除（逐季税后化）后的 TTM 净利。
+// 只在季度频率、且 TTM 四季都在当前图表窗口里时算（年度期末不等于 TTM 窗口）；
+// 影响不足 TTM 净利 20% 返回 null——与图上 ⚡ 标记同一门槛
+function ttmOneoff(d) {
+  const t = d.ttm || {};
+  const q = t.net_income && t.net_income.quarters;
+  const niv = t.net_income && t.net_income.value;
+  if (d.freq !== "quarterly" || !q || q.length !== 4 || niv == null) return null;
+  const idx = q.map(e => d.periods.findIndex(p => p.end === e));
+  if (idx.some(i => i < 0)) return null;
+  const pre = idx.reduce((s, i) => s + oneoffImpact(d, i), 0);
+  if (!pre || Math.abs(pre) < Math.abs(niv) * 0.2) return null;
+  return { pre, ni: niv - idx.reduce((s, i) => s + oneoffAfterTax(d, i), 0) };
+}
+
 // ---- TTM 汇总 tiles：估值锚定的分母（P/E、EV/FCF 都用 TTM）----
 function renderTtm(d) {
   const box = $("ttmTiles");
@@ -122,16 +137,27 @@ function renderTtm(d) {
     ? t.cfo.value - t.capex.value : null;
   const niv = t.net_income && t.net_income.value;
   const rev = t.revenue && t.revenue.value;
+  // 一次性/投资项污染 TTM 净利 ≥20% 时，受影响的三张卡片直接给剔除后的量级
+  // （AMZN：TTM 净利 135.3B 里约 55B 是 Anthropic 重估的税后贡献，卡片此前只字不提）
+  const adj = ttmOneoff(d);
+  const epsNote = (e) => [e.note, `⚡ 剔除一次性后约 $${(e.value * adj.ni / niv).toFixed(2)}`]
+    .filter(Boolean).join("；");
   const defs = [
     ["TTM 营收", t.revenue, fmtUSD],
     ["TTM 营业利润", t.op_income, fmtUSD],
-    ["TTM 净利", t.net_income, fmtUSD],
+    ["TTM 净利", adj ? { ...t.net_income, note:
+        `⚡ 含一次性/投资项 ${adj.pre >= 0 ? "+" : "−"}${fmtUSD(Math.abs(adj.pre))}（税前），` +
+        `剔除后约 ${fmtUSD(adj.ni)}` } : t.net_income, fmtUSD],
     ["TTM OCF", t.cfo && (bank ? { ...t.cfo, note: "银行口径：含贷款业务现金流" }
                                 : t.cfo), fmtUSD],
     ["TTM FCF", bank ? null
       : { value: fcf, note: fcf != null ? "OCF−资本开支" : null }, fmtUSD],
-    ["TTM EPS", t.eps_diluted, (v) => "$" + v.toFixed(2)],
-    ["TTM 净利率", { value: (niv != null && rev) ? niv / rev : null }, fmtPct],
+    ["TTM EPS", adj && t.eps_diluted && t.eps_diluted.value != null
+      ? { ...t.eps_diluted, note: epsNote(t.eps_diluted) } : t.eps_diluted,
+     (v) => "$" + v.toFixed(2)],
+    ["TTM 净利率", { value: (niv != null && rev) ? niv / rev : null,
+                    note: adj && rev ? `⚡ 剔除一次性后约 ${fmtPct(adj.ni / rev)}` : null },
+     fmtPct],
   ];
   let shown = 0;
   for (const [k, item, fmt] of defs) {
@@ -208,14 +234,8 @@ function renderIncome(d, labels) {
   // +99B 浮盈推到 94% 时，这条虚线还原经营内核（~27%）
   const adjNet = inc.net_income.map((ni, i) => {
     const rev = inc.revenue[i];
-    if (ni == null || !rev) return null;
-    const imp = oneoffImpact(d, i);
-    if (!imp) return null;
-    const pretax = inc.pretax_income[i], tax = inc.income_tax[i];
-    let eff = 0.21;
-    if (pretax && tax != null && pretax > 0)
-      eff = Math.min(Math.max(tax / pretax, 0), 0.5);
-    return (ni - imp * (1 - eff)) / rev;
+    if (ni == null || !rev || !oneoffImpact(d, i)) return null;
+    return (ni - oneoffAfterTax(d, i)) / rev;
   });
   const hasAdj = adjNet.some((v, i) =>
     v != null && m.net[i] != null && Math.abs(v - m.net[i]) > 0.01);
@@ -344,6 +364,9 @@ const ONEOFF_LABELS = {
   other_nonop: "其他营业外", restructuring: "重组费用",
   impairment: "资产/商誉减值", litigation: "诉讼和解/罚金",
   disposal_gain: "业务处置损益",
+  // 服务端只在它确实落在 other_nonop 行里、且不在股权投资损益里时才给值
+  // （financials_service._private_equity_gain）——AMZN 的 Anthropic 重估
+  private_equity_gain: "私募股权按可观察价上调",
 };
 // 支出性质的组件按报表口径取负号
 const ONEOFF_SIGN = { interest_expense_nonop: -1, restructuring: -1,
@@ -365,6 +388,18 @@ function oneoffImpact(d, i) {
     .filter(x => !["interest_income", "interest_expense_nonop", "fx_gain",
                    "other_nonop"].includes(x.key))
     .reduce((s, x) => s + x.val, 0);
+}
+
+// 一次性项的税后影响：按当期有效税率（税额/税前，越界回退 21% 法定税率）
+// 税后化——调整后净利率虚线与 TTM 卡片共用同一口径
+function oneoffAfterTax(d, i) {
+  const imp = oneoffImpact(d, i);
+  if (!imp) return 0;
+  const pretax = d.income.pretax_income[i], tax = d.income.income_tax[i];
+  let eff = 0.21;
+  if (pretax && tax != null && pretax > 0)
+    eff = Math.min(Math.max(tax / pretax, 0), 0.5);
+  return imp * (1 - eff);
 }
 
 // ---- 图 2：利润瀑布 ----
@@ -414,12 +449,18 @@ function renderWaterfall(d, i) {
   // 营业外损益按 XBRL 组件拆解：投资损益主导时改紫色并在 hover 里列明细
   const nonoffComp = oneoffAt(d, i).filter(x =>
     ["equity_inv_gain", "interest_income", "interest_expense_nonop",
-     "fx_gain", "other_nonop"].includes(x.key));
+     "fx_gain", "other_nonop", "private_equity_gain"].includes(x.key));
   const eqv = nonoffComp.find(x => x.key === "equity_inv_gain");
+  const pev = nonoffComp.find(x => x.key === "private_equity_gain");
   if (items) {
     for (const it of items) {
       if (it.name !== "营业外损益") continue;
       let comps = nonoffComp;
+      // 私募重估是 other_nonop 行里的子项（服务端给值的前提就是 other_nonop 装得下它），
+      // 单列出来就必须从 other_nonop 里扣掉，否则同一笔钱画两次（AMZN Q2'26 50.49B）
+      if (pev)
+        comps = comps.map(x => x.key !== "other_nonop" ? x
+          : { ...x, label: "其他营业外（剔私募重估）", val: x.val - pev.val });
       // equity_inv_gain（附注级 tag）与 other_nonop（利润表「Other, net」行）
       // 可能是同一笔钱的两次标注：NVDA Q1 FY27 两者同为 ~$15.9B，直接并列
       // 会把同一笔拆成三行互相打架（+15.9 / +15.9 / 余项 −15.9）。判据取
@@ -434,12 +475,15 @@ function renderWaterfall(d, i) {
           Math.abs(gap + eqv.val) <= tol) {
         comps = comps
           .map(x => x.key !== "other_nonop" ? x
-            : { ...x, label: "其他营业外（剔股权投资）", val: x.val - eqv.val })
+            : { ...x, label: pev ? "其他营业外（剔股权投资与私募重估）"
+                                 : "其他营业外（剔股权投资）",
+                val: x.val - eqv.val })
           .filter(x => x.key !== "other_nonop" || Math.abs(x.val) >= 1e6);
       }
       it.components = comps;
       it.unexplained = it.val - comps.reduce((s, x) => s + x.val, 0);
-      it.investmentDriven = !!(eqv && Math.abs(eqv.val) > Math.abs(it.val) * 0.5);
+      const inv = (eqv ? eqv.val : 0) + (pev ? pev.val : 0);
+      it.investmentDriven = !!(eqv || pev) && Math.abs(inv) > Math.abs(it.val) * 0.5;
     }
   }
   const el = $("cWaterfall");
