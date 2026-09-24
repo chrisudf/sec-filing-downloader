@@ -486,6 +486,18 @@ IBM 估值（base $194 vs 现价 $231）复盘时查出三处**数据层**缺口
 - [ ] TSLA/UBER 季度仍选 AFS：TSLA 的 AFS 含现金等价物（与现金重叠），UBER 的是受限保险投资——
       过得了 superset 判据，但语义不是"可动用证券"
 
+## 📋 watchlist PE 分位批量表（`valuation/pe_rank.py`，2026-09-24）
+
+- [x] CLI：pe_band trailing（GAAP + 营业线）10/5/3 年分位 + yfinance 本/下财年 PE 与区间，
+      写 `reports/pe_rank/`。首跑 17 票：9 只出分位，SOFI/HOOD（转盈 <1 年）、RKLB、SPCX、
+      TSM（无季度 XBRL）只出前瞻列，ETF 跳过。
+- [ ] ⚠（本财年一致预期疑含一次性收益）目前只在脚注——标到「本财年 PE」那一格上，
+      否则读者会以为整行（含营业线分位）都被污染
+- [ ] 网页：`GET /api/pe_rank` 读最近一份 + 刷新按钮（后台重跑 ~5 分钟，照估值任务轮询），
+      首页加 Watchlist PE 区块
+- [ ] 定时：每周一次（布里斯班周六早上 = 周五美股收盘后；盘中跑会拿到未收盘 K 线）
+- [ ] 方案 B：并进 droplet 上的 watchlist-scanner，结果进扫描邮件（需把 pe_band 带过去）
+
 ## 🚀 v0.5 — 部署与产品化
 
 - [ ] 部署到 Railway / Fly.io（参考站即 Railway）
