@@ -721,8 +721,16 @@ TTM ending 2026-06-30，含 Q2'26。AMZN 和 GOOGL 都持 Anthropic、都在那�
 
 **核对通过的**：AMZN 10-Q 的 97.9B（可转债）+ 122.3B（非上市股权）+ 0.4B（权益法）与 XBRL
 上限 220.6B 逐项吻合，按口径计入 $14.52/股；引擎 → Excel → verify_report 用真实 facts 全链一致。
-**还没做的**：判断层没用新 prompt 实跑过——AMZN 会不会把期后那笔分开报、MSFT（它的
-「长期有价证券」就是含权益法的 LongTermInvestments 行）会不会标 `in_net_cash=true`，要等实跑。
+
+**判断层实跑（AMZN/MSFT/AAPL/NVDA/GOOG，完整流水线）**：AMZN 把期后 21.3B 单列并在期后事件里
+扣了净现金；MSFT 两项都标 `in_net_cash=true`；AAPL 写 `[]`；PE 腿五只全不变。两次复审红旗都
+来自只看经营价值的 DCF 护栏，与持股无关。结果表见 TODO v0.4.4。
+
+**但我对本人说过的一句话不成立**：「已在 net_cash 的只留痕不挪动，所以不会有标的因此被调低」。
+NVDA 的判断层把 42.8B 上市股权从 net_cash 挪进了 strategic_holdings——在 net_cash 里 100% 计、
+不扣税，挪过来后没给成本、按全额 21% 计税，这一块少 9.0B（约 $0.37/股）。NVDA 整体仍是加值，
+但这条承诺只约束了「标 true 的项」，管不住判断层因为读了新段落而改自己的 net_cash 口径。
+**改 prompt 的影响面不止新字段本身**：它会改变判断层对相邻字段的决定，只能靠实跑看出来。
 
 ### 本轮自己犯的两个错
 
