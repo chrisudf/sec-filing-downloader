@@ -119,16 +119,24 @@ def _row(**over):
 def test_render_columns_align():
     stale = dict(_row()["gaap"], fresh=False, date="2026-07-30")
     rows = [_row(), _row(ticker="AMZN", gaap=stale),
-            {"ticker": "QQQ", "skip": "index：SEC 无 EPS"},
-            _row(ticker="RKLB", gaap={"err": "样本不足"}, op={"err": "样本不足"})]
+            {"ticker": "QQQ", "kind": "index", "skip": pr.ETF_SKIP},
+            _row(ticker="RKLB", gaap={"err": "样本不足"}, op={"err": "样本不足"}),
+            {"ticker": "GLD", "kind": "etf", "skip": pr.ETF_SKIP},
+            {"ticker": "XYZ", "skip": "yfinance 取不到 XYZ 价格"}]
     text, notes = pr.render(rows, "2026-09-24")
     table = [ln for ln in text.splitlines() if ln.startswith("| ")]
-    assert len(table) == 1 + len(rows)
+    # 跳过的票不占表格行：表头 + 3 只有数的票
+    assert len(table) == 1 + 3
+    assert not any(ln.startswith(("| QQQ", "| GLD", "| XYZ")) for ln in table)
     assert all(ln.count("|") == len(pr.HEADER) + 1 for ln in table)
+    # 汇成表格下方一行，同因合并、不同因分开
+    assert f"未纳入：QQQ、GLD（{pr.ETF_SKIP}）；XYZ（yfinance 取不到 XYZ 价格）" in text
     assert "28.5x†07-30" in text
     assert any("AMZN TTM: 当前 TTM 窗口被剔" in n for n in notes)
-    assert any(n.startswith("QQQ: 跳过") for n in notes)
+    assert not any("QQQ" in n or "GLD" in n for n in notes)   # 脚注也不再逐条列
     assert any("RKLB 营业线: 样本不足" in n for n in notes)
+    assert pr.skipped_line([_row()]) is None
+    assert "未纳入" not in pr.render([_row()], "2026-09-24")[0]
 
 
 def test_csv_rows_flatten_all_kinds():
@@ -210,6 +218,7 @@ def test_payload_is_strict_json():
     assert back["rows"][0]["gaap"]["p3"]["50"] == 51           # int 键 -> str 键
     assert back["rows"][0]["fy_labels"] == ["FY2027(至2027-01)", "FY2028(至2028-01)"]
     assert back["header"] == pr.HEADER and back["notes"] == ["n1"]
+    assert back["skipped"] == "未纳入：QQQ（index）"          # 网页与 md 同一行文字
 
 
 def test_write_atomic_leaves_no_tmp(tmp_path):

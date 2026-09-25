@@ -153,7 +153,7 @@ def yahoo_info(t):
 def collect(t, kind, email):
     """一只票的全部读数（联网）。异常逐项兜住，一票失败不拖垮整张表。"""
     if kind in SKIP_KINDS:
-        return {"ticker": t, "skip": f"{kind}：SEC 无 EPS"}
+        return {"ticker": t, "kind": kind, "skip": ETF_SKIP}
     row = {"ticker": t, "notes": []}
     try:
         inputs = pb.load_inputs(t, email, 10)
@@ -225,12 +225,27 @@ HEADER = ["票", "收盘", "TTM PE", "10y", "5y", "3y", "3y P10/50/90",
 
 
 INTRADAY_NOTE = "⚠ 运行时美股在盘中：「收盘」列是盘中价，分位与前瞻 PE 随之浮动"
+ETF_SKIP = "ETF/指数：SEC 没有 EPS"
+
+
+def skipped_line(rows):
+    """不进表格的票汇成一行（按原因分组）；没有则 None。ETF/指数和取数失败的票
+    一整行全是「—」没有信息量，还把真正要看的行挤开。纯函数。"""
+    groups = {}
+    for r in rows:
+        if "skip" in r:
+            groups.setdefault(r["skip"], []).append(r["ticker"])
+    if not groups:
+        return None
+    return "未纳入：" + "；".join(f"{'、'.join(ts)}（{why}）" for why, ts in groups.items())
 
 
 def render(rows, asof, intraday=False):
     """-> (markdown 全文, 脚注列表)。纯函数。"""
     md = [f"# Watchlist PE 分位 · {asof}", "",
           "TTM PE 与分位 = SEC XBRL 已公告 TTM EPS × yfinance 收盘（pe_band trailing）；"
+          "营业线 PE = P/NOPAT（市值 ÷ 营业利润×(1−21%)）；"
+          "P10/50/90 = 近 3 年 10%/一半/90% 的交易日 PE 低于该值；"
           "† = 当前窗口被剔，显示末个有效点；本/下财年 PE = 收盘 ÷ yfinance 一致预期"
           "（Yahoo forwardPE = 下财年列，不是 NTM）；⚠ = 本财年预期疑含一次性收益。"
           "口径细节见 valuation/pe_rank.py 文件头。", ""]
@@ -241,8 +256,6 @@ def render(rows, asof, intraday=False):
     for r in rows:
         t = r["ticker"]
         if "skip" in r:
-            md.append(f"| {t} | " + " | ".join(["—"] * (len(HEADER) - 2)) + f" | {r['skip']} |")
-            notes.append(f"{t}: 跳过 — {r['skip']}")
             continue
         yh = r.get("yh", {})
         md.append("| " + " | ".join(
@@ -258,6 +271,9 @@ def render(rows, asof, intraday=False):
             elif m["thin"]:
                 notes.append(f"{t} {lbl}: 有效样本仅 {m['days10']} 天，不给分位")
         notes += [f"{t}: {n}" for n in r.get("notes", [])]
+    sk = skipped_line(rows)
+    if sk:
+        md += ["", sk]
     md += ["", "## 脚注", ""] + [f"- {n}" for n in notes]
     return "\n".join(md) + "\n", notes
 
@@ -306,7 +322,8 @@ def payload(rows, notes, asof, generated_at, intraday, watchlist):
     px = [r["px_date"] for r in rows if r.get("px_date")]
     return _jsonable({"asof": asof, "generated_at": generated_at, "intraday": intraday,
                       "px_date": max(px) if px else None, "watchlist": str(watchlist),
-                      "header": HEADER, "rows": rows, "notes": notes})
+                      "header": HEADER, "rows": rows, "notes": notes,
+                      "skipped": skipped_line(rows)})
 
 
 def write_atomic(path, text):

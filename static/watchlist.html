@@ -79,8 +79,7 @@
   td.tk a span { color: var(--muted); font-weight: 400; font-size: 11px; }
   td.pct { font-weight: 600; }
   td.na { color: var(--muted); }
-  td.skip { text-align: left; color: var(--muted); }
-  tr.skip td.tk { color: var(--muted); font-weight: 400; }
+  .skipline { color: var(--muted); font-size: 12px; margin-top: 10px; }
   .mark { color: var(--warn); font-weight: 700; cursor: help; }
   [title] { cursor: help; }
   td.tk a[title] { cursor: pointer; }
@@ -127,12 +126,13 @@
     <div class="card">
       <h2>当前 PE 在自己历史里的位置</h2>
       <div class="sub">
-        分位底色 <span class="legend" id="legend"></span> 越亮 = 分位越高（在自己历史里越贵）。
+        分位底色 P0 <span class="legend" id="legend"></span> P100，越蓝 = 分位越高（在自己历史里越贵）。
         分位只描述历史位置，不是买卖信号——要和右边的前瞻 PE 一起读。
         <span class="mark">†</span> 当前窗口被剔、显示末个有效点；
-        <span class="mark">⚠</span> 本财年一致预期疑含一次性收益。悬停看原因，点票名打开财务图表。
+        <span class="mark">⚠</span> 本财年一致预期疑含一次性收益。表头、格子悬停都有解释，点票名打开财务图表。
       </div>
       <div class="scroll"><table id="tbl"></table></div>
+      <div class="skipline" id="skipped"></div>
     </div>
     <div class="card">
       <h2>脚注</h2>
@@ -142,10 +142,11 @@
       <details>
         <summary><h2 style="display:inline">怎么读这张表</h2></summary>
         <ul class="notes">
-          <li><b>TTM（GAAP）</b>：SEC XBRL 已公告的滚动四季 EPS × 日收盘。防前视（按 filed 日生效）、拆股归一、一次性畸变与近零分母都已剔除。</li>
-          <li><b>营业利润口径</b>：分母 = 营业利润 ×(1−21%) ÷ 股数，营业线以下的一次性收益（如 AMZN/GOOG 的 Anthropic 重估）影响不到它。税率是常数，不影响排序。</li>
+          <li><b>TTM · GAAP P/E</b>（trailing P/E）：收盘 ÷ SEC XBRL 已公告的滚动四季 GAAP 稀释 EPS。防前视（按 filed 日生效）、拆股归一、一次性畸变与近零分母都已剔除。</li>
+          <li><b>营业利润 · P/NOPAT</b>（price-to-NOPAT，NOPAT = Net Operating Profit After Tax）：市值 ÷ 营业利润 ×(1−21%)。营业线以下的一次性收益（如 AMZN/GOOG 的 Anthropic 重估）、利息收支影响不到它。税率是常数，不影响排序；但绝对值不能和 GAAP P/E 直接比。它不是 EV/EBIT（那个用企业价值、税前），也不是标普说的 “operating earnings”（剔除一次性项目后的调整 EPS）。</li>
           <li><b>10y / 5y / 3y</b>：以 5 年为主，10 年、3 年交叉验证。三个一致才可靠；不一致说明结论取决于窗口，信号弱。业务变过的公司（NVDA、AMZN）10 年窗口要打折。</li>
           <li><b>P3</b>：有效交易日里约 3% 的日子 PE 比现在低。只算有效日；不是概率；TTM 分位低也可能是 EPS 暴涨。</li>
+          <li><b>近3年 P10 / P50 / P90</b>：把近 3 年每个交易日的 PE 从低到高排——10% 的日子低于 P10，一半低于 P50（中位数），90% 低于 P90。例：NVDA 33 / 51 / 73 = 近 3 年一半时间 PE 低于 51x，只有 10% 的时间低于 33x。</li>
           <li><b>本财年 / 下财年 PE</b>：收盘 ÷ yfinance 一致预期（分析师口径，通常是调整后）。Yahoo 的 forwardPE 就是「下财年」这一列，不是未来 12 个月——错位财年（NVDA）会领先约 16 个月。</li>
         </ul>
       </details>

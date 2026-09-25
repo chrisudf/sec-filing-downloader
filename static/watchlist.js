@@ -9,8 +9,14 @@ let data = null;
 const fmtPE = (v) => v == null ? "—" : v >= 1000 ? ">999x" : `${v.toFixed(1)}x`;
 const fmtNum = (v, d = 1) => v == null ? "—" : v >= 1000 ? ">999" : v.toFixed(d);
 const pctPct = (v) => `${v >= 0 ? "+" : ""}${Math.round(v * 100)}%`;
-// 分位只用明度表达，不用红绿——红绿会被读成买卖信号
-const shade = (p) => `rgba(232, 232, 238, ${(0.03 + 0.25 * p / 100).toFixed(3)})`;
+// 分位 = 量的大小 → 单色相顺序色阶。不用红绿：那是好坏/状态的编码，会被读成买卖信号。
+// 深色底上低值融进卡片底色、高值越蓝；#3987e5 = dashboard 的 --s1。P100 处白字对比度
+// 4.70:1（dataviz validate_palette 的 contrast() 实算，≥ WCAG AA 4.5），明度单调递增
+const CARD_RGB = [20, 21, 28], SEQ_RGB = [57, 135, 229];
+const shade = (p) => {
+  const a = 0.08 + 0.64 * p / 100;
+  return `rgb(${CARD_RGB.map((c, i) => Math.round(c * (1 - a) + SEQ_RGB[i] * a)).join(", ")})`;
+};
 
 function usMarketOpen(d = new Date()) {
   const parts = Object.fromEntries(new Intl.DateTimeFormat("en-US", {
@@ -41,21 +47,33 @@ function setStatus(msg, kind = "") {
 
 // ---- 表格 ----
 const GROUPS = [
-  ["TTM（GAAP）", 5], ["营业利润口径", 5], ["前瞻（一致预期）", 4], ["Yahoo", 2],
+  ["TTM · GAAP P/E", 5, "Trailing P/E：收盘 ÷ 过去四个季度已公告的 GAAP 稀释 EPS"],
+  ["营业利润 · P/NOPAT", 5, "P/NOPAT（price-to-NOPAT）：市值 ÷ 税后营业利润（营业利润 × (1−21%)）。"
+    + "营业线以下的一次性项目（投资重估、利息）影响不到它。绝对值不能和 GAAP P/E 直接比，"
+    + "看它在自己历史里的分位"],
+  ["前瞻 · 一致预期", 4, "收盘 ÷ yfinance 分析师一致预期 EPS（通常是调整后口径，与 GAAP 不同）"],
+  ["Yahoo", 2, "Yahoo 自己的 trailingPE 与 PEG，供交叉核对"],
 ];
-const SUBS = ["PE", "10y", "5y", "3y", "近3年 P10/50/90",
-              "PE", "10y", "5y", "3y", "近3年 P10/50/90",
-              "本财年", "下财年", "下财年区间", "下财年止", "tPE", "PEG"];
+const winTitle = (n) => `当前 PE 在近 ${n} 年有效交易日里的分位。P7 = 约 7% 的日子 PE 比现在低`;
+const P3_TITLE = "近 3 年的 PE 分布：10% 的交易日低于第一个数，一半低于中间数（中位数），"
+               + "90% 低于第三个数";
+const BAND_SUBS = [["PE"], ["10y", winTitle(10)], ["5y", winTitle(5)], ["3y", winTitle(3)],
+                   ["近3年 P10/50/90", P3_TITLE]];
+const SUBS = [...BAND_SUBS, ...BAND_SUBS,
+              ["本财年", "收盘 ÷ 本财年一致预期 EPS"],
+              ["下财年", "收盘 ÷ 下财年一致预期 EPS——Yahoo 的 forwardPE 就是这个，不是未来 12 个月"],
+              ["下财年区间", "收盘 ÷ 最高预期 … 收盘 ÷ 最低预期"],
+              ["下财年止"], ["tPE"], ["PEG"]];
 const GSTART = new Set([0, 5, 10, 14]);     // 每组第一列画左边线
-const NCOLS = 2 + SUBS.length;
 
 function head() {
   const r1 = el("tr", {}, el("th", { text: "票", cls: "tk", attrs: { rowspan: 2 } }),
                 el("th", { text: "收盘", attrs: { rowspan: 2 } }));
-  for (const [name, n] of GROUPS)
-    r1.append(el("th", { text: name, cls: "grp gstart", attrs: { colspan: n } }));
+  for (const [name, n, title] of GROUPS)
+    r1.append(el("th", { text: name, title, cls: "grp gstart", attrs: { colspan: n } }));
   const r2 = el("tr");
-  SUBS.forEach((s, i) => r2.append(el("th", { text: s, cls: GSTART.has(i) ? "gstart" : "" })));
+  SUBS.forEach(([s, title], i) =>
+    r2.append(el("th", { text: s, title, cls: GSTART.has(i) ? "gstart" : "" })));
   return el("thead", {}, r1, r2);
 }
 
@@ -69,15 +87,18 @@ function bandCells(m) {
     pe.append(mark("†", `当前 TTM 窗口被剔（一次性畸变/亏损/近零），显示的是 ${m.date} 的末个有效点`));
   }
   const why = m.thin ? `有效样本仅 ${m.days10} 天，不给分位` : "该窗口有效样本不足 250 天";
-  const pct = (v) => v == null
+  const pct = (v, n) => v == null
     ? el("td", { text: "—", cls: "na", title: why })
     : el("td", { text: `P${Math.round(v)}`, cls: "pct",
+                 title: `近 ${n} 年里约 ${Math.round(v)}% 的有效交易日 PE 比现在低`,
                  attrs: { style: `background:${shade(v)}` } });
   const p3 = m.p3;
+  const [lo, mid, hi] = p3 ? [p3["10"], p3["50"], p3["90"]].map(Math.round) : [];
   const band = el("td", p3
-    ? { text: `${Math.round(p3["10"])} / ${Math.round(p3["50"])} / ${Math.round(p3["90"])}` }
+    ? { text: `${lo} / ${mid} / ${hi}`,
+        title: `近 3 年：10% 的交易日 PE 低于 ${lo}x，一半低于 ${mid}x，90% 低于 ${hi}x` }
     : { text: "—", cls: "na" });
-  return [pe, pct(m.r10), pct(m.r5), pct(m.r3), band];
+  return [pe, pct(m.r10, 10), pct(m.r5, 5), pct(m.r3, 3), band];
 }
 
 function fwdCells(fw, labels) {
@@ -100,10 +121,6 @@ function fwdCells(fw, labels) {
 }
 
 function bodyRow(r) {
-  if (r.skip) {
-    return el("tr", { cls: "skip" }, el("td", { text: r.ticker, cls: "tk" }),
-              el("td", { text: r.skip, cls: "skip", attrs: { colspan: NCOLS - 1 } }));
-  }
   const tk = el("td", { cls: "tk" }, el("a", {
     text: r.ticker + " ", title: "在新标签页打开财务图表",
     attrs: { href: `/dashboard.html?ticker=${encodeURIComponent(r.ticker)}`,
@@ -115,10 +132,9 @@ function bodyRow(r) {
   return el("tr", {}, tk, el("td", { text: r.close.toFixed(2) }), ...cells);
 }
 
-// 排序档位：有值(0) < 缺值(1) < 跳过行(2)，同档再按数值——不能用 Infinity 当哨兵，
+// 排序档位：有值(0) < 缺值(1)，同档再按数值——不能用 Infinity 当哨兵，
 // Infinity − Infinity = NaN 会让 sort 的比较结果不自洽
 function sortKey(r, path) {
-  if (r.skip) return [2, 0];
   const [grp, k] = path.split(".");
   const v = (r[grp] || {})[k];
   return v == null ? [1, 0] : [0, v];
@@ -128,11 +144,23 @@ const byKey = (path) => (a, b) => {
   return ta - tb || va - vb;
 };
 
+// 跳过的票（ETF/指数、取数失败）不占表格行，汇成表下一行。新 json 带现成的
+// skipped 文案（与 md 同源）；旧 json 没有该字段时在这里按原因分组兜底
+function skippedLine(rows) {
+  const groups = new Map();
+  for (const r of rows.filter((x) => x.skip)) {
+    groups.set(r.skip, [...(groups.get(r.skip) || []), r.ticker]);
+  }
+  if (!groups.size) return "";
+  return "未纳入：" + [...groups].map(([why, ts]) => `${ts.join("、")}（${why}）`).join("；");
+}
+
 function render() {
   const path = $("sort").value;
-  const rows = [...data.rows];
+  const rows = data.rows.filter((r) => !r.skip);
   if (path) rows.sort(byKey(path));
   $("tbl").replaceChildren(head(), el("tbody", {}, ...rows.map(bodyRow)));
+  $("skipped").textContent = data.skipped ?? skippedLine(data.rows);
   $("notes").replaceChildren(...data.notes.map((n) => el("li", { text: n })));
 
   const gen = new Date(data.generated_at);
