@@ -481,8 +481,22 @@ IBM 估值（base $194 vs 现价 $231）复盘时查出三处**数据层**缺口
 - [ ] 分部「按业务线」Q4 整列 null（经营分部轴有推导 Q4，业务线轴没有）；13 期与其他卡片的 12 期不对齐
 - [ ] FCF 口径：capex 取毛额（173.0B），公司口径扣掉设备出售与激励（169.0B）；
       同一份估值报告里，引擎警告用 −11,625、判断层用 −7,604
-- [ ] 估值引擎：非经营性战略持股（AMZN 的 Anthropic $190B + OpenAI $50B）不进任何一条腿，
-      约 $18.7/股（税后）；net_cash 没有给这类资产的字段
+- [x] **估值引擎：非经营性战略持股进 DCF 与 SOTP（0033）**。此前 AMZN 的 Anthropic $190B +
+      OpenAI $50B 不进任何一条腿（约 $18.7/股税后）。口径（2026-09-25 与本人确认）：按账面值、
+      只进 DCF 与 SOTP、非上市打 20% 折价、上市不打折、未实现收益按 21% 计税。判断层必填
+      `strategic_holdings`（没有写 `[]`）；引擎拿 XBRL 投资类科目合计核对上限，超了红旗打回、
+      无从核对则不计入；两个布尔（是否已在 net_cash / 收益是否在营业利润里）必须显式 false 才计入。
+      DCF 护栏一律按不含持股的经营价值判。**没申报的运行逐位不变**（引擎 JSON/stdout/Excel 对拍过）。
+      AMZN 的实际加值要等本地实跑（$190B/$50B 是不是账面值还没核对）；它的 DCF 腿当前 n.m.，
+      所以综合只吃到 SOTP 那一半。
+      - [ ] **真实数据验证**：云端环境连不上 data.sec.gov，本 PR 只有合成数据测试。需要本地跑
+            AMZN/GOOGL/MSFT/NVDA，确认 ① XBRL 上限科目实际有值（AMZN 的优先股是否标在
+            EquitySecuritiesWithoutReadilyDeterminableFairValueAmount）② 判断层给的是账面值
+            ③ 没有持股的标的（AAPL/META 等）判断层写 [] 且输出不变
+      - [ ] PE 腿是否也加持股：先看几期 `pe_plus_holdings` 参考数与各腿的偏离再定；要加得先
+            解决 other_income 里的权益法损益与历史倍数里已含的持股定价两处重复计算
+      - [ ] `check_configs` 回放 0033 之前留档的 config 会因缺 `strategic_holdings` BLOCK
+            （与 0025 之前的 config 缺 `accounting_estimate_changes` 同一形态），回归时注意区分
 - [ ] TSLA/UBER 季度仍选 AFS：TSLA 的 AFS 含现金等价物（与现金重叠），UBER 的是受限保险投资——
       过得了 superset 判据，但语义不是"可动用证券"
 
