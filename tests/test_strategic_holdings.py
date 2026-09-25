@@ -404,3 +404,76 @@ def test_vintage_record_carries_holdings_ps(tmp_path, pair):
         vintages.record(v, gate_clean=True, root=tmp_path)
     samples = vintages.load("TGLB", root=tmp_path)[0]["samples"]
     assert [s.get("strategic_holdings_ps") for s in samples] == [None, 2.0]
+
+
+# ======================= 真实数据核对后补的两处（2026-09-25）=======================
+
+def test_cap_staleness_anchored_to_data_latest():
+    """AAPL 实测：非上市股权最后标在 2021-06、AFS 合计 2020-12（$195.6B）。只拿科目彼此比较
+    时两者都"新鲜"，上限被撑到 $198B；以 data_latest 为锚时两者都过期 → 无从核对。"""
+    facts = {"data_latest": "2026-06-27",
+             "inv_nonmarketable_equity_instant": {"2021-06-26": 2.8e9},
+             "afs_securities_total_instant": {"2020-12-26": 195.571e9}}
+    assert cap_fn(facts) == (None, {})
+    facts["inv_equity_method_instant"] = {"2026-06-27": 1e9}
+    cap, parts = cap_fn(facts)
+    assert cap == pytest.approx(1000.0) and list(parts) == ["inv_equity_method_instant"]
+
+
+def _pp_item(pp):
+    return _item(carrying_value_musd=300.0, cost_basis_musd=50.0, post_period_investment_musd=pp)
+
+
+def test_post_period_investment_counted_only_within_confirmed_outflow():
+    # 期后投 100：已在 net_cash 里确认扣掉 100 → 加回；税只对账面值部分的增值计
+    v, d, w = value_fn([_pp_item(100.0)], 400.0, 100.0, ppce_out=100.0)
+    assert d["post_period_counted"] is True
+    assert v == pytest.approx(400 * 0.8 - 0.21 * (400 * 0.8 - 50 - 100))
+    # 上限只核对报告期末账面值：300 + 期后 100 = 400 不算超（XBRL 里本来就没有期后的钱）
+    v2, d2, _ = value_fn([_pp_item(100.0)], 300.0, 100.0, ppce_out=100.0)
+    assert d2["status"] == "counted" and v2 == pytest.approx(v)
+
+
+@pytest.mark.parametrize("ppce_out", [None, 0.0, 50.0])
+def test_post_period_investment_without_matching_net_cash_debit_is_dropped(ppce_out):
+    """期后那笔现金没按期后事件从 net_cash 扣掉（或扣得不够）→ 加回就是重复，期后部分不计入。"""
+    v, d, w = value_fn([_pp_item(100.0)], 400.0, 100.0, ppce_out=ppce_out)
+    base, _, _ = value_fn([_pp_item(0.0)], 400.0, 100.0)
+    assert d["status"] == "counted" and d["post_period_counted"] is False
+    assert v == pytest.approx(base)
+    assert any(lv == "yellow" and "期后追加投资" in m for lv, m in w)
+
+
+def test_engine_reads_confirmed_post_period_outflow(tmp_path):
+    ppce = [{"date": "2026-07-15", "kind": "并购", "amount_musd": -100.0,
+             "net_cash_impact_musd": -100.0, "reflected_in_net_cash": True, "note": "10-Q 期后事项"},
+            # 未确认计入 net_cash 的那笔不给额度
+            {"date": "2026-07-20", "kind": "并购", "amount_musd": -500.0,
+             "net_cash_impact_musd": -500.0, "note": "x"}]
+    out = _run(tmp_path, _std_cfg(strategic_holdings=[_pp_item(100.0)],
+                                  post_period_capital_events=ppce), _hold_facts(), "pp")
+    sh = out["meta"]["strategic_holdings"]
+    assert sh["post_period_confirmed_outflow_musd"] == pytest.approx(100.0)
+    assert sh["post_period_counted"] is True
+    out = _run(tmp_path, _std_cfg(strategic_holdings=[_pp_item(150.0)],
+                                  post_period_capital_events=ppce), _hold_facts(), "pp2")
+    assert out["meta"]["strategic_holdings"]["post_period_counted"] is False
+
+
+def test_validator_post_period_investment_shape():
+    _validate_judgment(_mk(strategic_holdings=[_pp_item(100.0)], strategic_holdings_note="x"),
+                       "standard")
+    with pytest.raises(ValueError, match="post_period_investment_musd"):
+        _validate_judgment(_mk(strategic_holdings=[_pp_item(-1.0)], strategic_holdings_note="x"),
+                           "standard")
+
+
+def test_compact_facts_flags_long_term_investments_overlap():
+    """MSFT 实测：「长期有价证券」= LongTermInvestments = 36,348M（Equity investments 行，
+    含权益法与非上市股权）——算进 net_cash 的这一行里就有战略持股，必须点明。"""
+    from tests.test_prompt_injection import _facts as inj_facts
+    f = inj_facts()
+    f["lt_securities_instant"] = {"2026-06-30": 36348e6}
+    assert "泛标签 LongTermInvestments" not in _compact_facts(f)
+    f["inv_long_term_instant"] = {"2026-06-30": 36348e6}
+    assert "必须标 in_net_cash=true" in _compact_facts(f)

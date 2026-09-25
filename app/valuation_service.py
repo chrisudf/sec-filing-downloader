@@ -344,9 +344,10 @@ def _validate_judgment(d: dict, mode: str = "standard",
         for _k in ("in_net_cash", "income_in_operating_income"):
             if not isinstance(e[_k], bool):
                 raise ValueError(f"strategic_holdings[{i}].{_k} 必须是布尔 true/false")
-        _cb = e.get("cost_basis_musd")
-        if _cb is not None and (not _isnum(_cb) or _cb < 0):
-            raise ValueError(f"strategic_holdings[{i}].cost_basis_musd 须为非负数字（$M）或省略")
+        for _k in ("cost_basis_musd", "post_period_investment_musd"):
+            _v = e.get(_k)
+            if _v is not None and (not _isnum(_v) or _v < 0):
+                raise ValueError(f"strategic_holdings[{i}].{_k} 须为非负数字（$M）或省略")
         if not str(e.get("source") or "").strip():
             raise ValueError(f"strategic_holdings[{i}].source 必填（财报附注出处）")
     if not str(d.get("strategic_holdings_note") or "").strip():
@@ -1029,6 +1030,14 @@ def _compact_facts(facts: dict) -> str:
     lines.append("投资类科目时点(XBRL，只用于核对 strategic_holdings 的上限，不是净现金口径): "
                  + ("、".join(inv) if inv
                     else "无——申报的战略持股无从核对，引擎不会计入"))
+    # 上面「长期有价证券」取的是泛标签 LongTermInvestments 时（MSFT 实测：两者同为
+    # 36,348M，即资产负债表 Equity investments 行，含权益法 12,000M 与非上市股权
+    # 12,400M），按 prompt 口径算进 net_cash 的这一行里就有战略持股——不点明的话
+    # 判断层会把同一笔钱在 strategic_holdings 里再报一遍
+    _lt, _li = facts.get("lt_securities_instant") or {}, facts.get("inv_long_term_instant") or {}
+    if _lt and _li and list(_lt.items())[-1] == list(_li.items())[-1]:
+        lines.append("  ⚠ 「长期有价证券」取自泛标签 LongTermInvestments（常含权益法与非上市股权）："
+                     "net_cash 若用了它，其中的战略持股必须标 in_net_cash=true")
     return "\n".join(lines)
 
 

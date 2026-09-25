@@ -195,8 +195,11 @@ AMZN 的 Anthropic/OpenAI 持股（2026-09-24 面板审计估约 $18.7/股税后
   持股不产生 FCF，不能把一条本该退出综合的腿抬回来。方法离散度、终值敏感性、
   `blend_p_adjni` 是进综合的腿/综合价的读数，随持股变。反向 DCF 与敏感性表同 DCF 腿口径。
 - **拿不准一律不计入**：两个布尔必须显式 false；XBRL 没有投资类科目可核对 → 黄旗、
-  不计入；申报账面值合计超过 XBRL 投资类科目合计（`holdings_xbrl_cap`，只当上限）→
-  红旗打回判断层一次，仍超则不计入。
+  不计入；申报账面值合计超过 XBRL 投资类科目合计（`holdings_xbrl_cap`，只当上限，科目时效
+  以 `data_latest` 为锚）→ 红旗打回判断层一次，仍超则不计入。
+- **期后追加投资**（`post_period_investment_musd`）：报告期后才投的现金（AMZN 6/30 后又投
+  OpenAI $21.3B）不进上限核对，只在 `post_period_capital_events` 里已确认从 net_cash 扣掉的
+  额度内加回；否则期后部分不计入。
 - **呈现**：`meta.strategic_holdings` 明细；Excel「情景假设」B29 + DCF/SOTP 的净现金行改为
   「净现金 + 战略持股」公式，`verify_report` 多核一格；`compare` 报每股持股值变化；
   趋势视图把「含持股」样本单独分组。

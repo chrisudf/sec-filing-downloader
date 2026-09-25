@@ -487,12 +487,25 @@ IBM 估值（base $194 vs 现价 $231）复盘时查出三处**数据层**缺口
       `strategic_holdings`（没有写 `[]`）；引擎拿 XBRL 投资类科目合计核对上限，超了红旗打回、
       无从核对则不计入；两个布尔（是否已在 net_cash / 收益是否在营业利润里）必须显式 false 才计入。
       DCF 护栏一律按不含持股的经营价值判。**没申报的运行逐位不变**（引擎 JSON/stdout/Excel 对拍过）。
-      AMZN 的实际加值要等本地实跑（$190B/$50B 是不是账面值还没核对）；它的 DCF 腿当前 n.m.，
-      所以综合只吃到 SOTP 那一半。
-      - [ ] **真实数据验证**：云端环境连不上 data.sec.gov，本 PR 只有合成数据测试。需要本地跑
-            AMZN/GOOGL/MSFT/NVDA，确认 ① XBRL 上限科目实际有值（AMZN 的优先股是否标在
-            EquitySecuritiesWithoutReadilyDeterminableFairValueAmount）② 判断层给的是账面值
-            ③ 没有持股的标的（AAPL/META 等）判断层写 [] 且输出不变
+      它的 DCF 腿当前 n.m.，所以综合只吃到 SOTP 那一半。
+      - [x] **真实数据验证（2026-09-25，放开 data.sec.gov 后）**：
+            ① AMZN 10-Q Q2'26：可转债（AFS 公允价值）97.9B + 非上市股权（计量替代法，Anthropic
+            优先股 + OpenAI 优先股）122.3B + 权益法 0.4B = XBRL 上限 220.6B，与原文逐项吻合；
+            标签选对了。按口径计入 158.3B = **$14.52/股**（期后那笔没从 net_cash 扣则 $12.88）。
+            TODO 原记的「$190B + $50B」里 OpenAI 的 50B 含 6/30 之后才付的 21.3B——照它报会
+            超上限被打回，这正是下面 ② 的由来。
+            ② 修了两处：上限时效改以 data_latest 为锚（AAPL 的 AFS 合计停在 2020-12、$195.6B，
+            原写法把上限撑到 $198B）；新增 post_period_investment_musd（期后追加投资只在
+            期后事件已确认从 net_cash 扣掉的额度内加回）。
+            ③ MSFT 的「长期有价证券」= LongTermInvestments = 36.3B（Equity investments 行，
+            含权益法 12.0B、非上市股权 12.4B），按 prompt 口径已进 net_cash——FACTS 注入加了
+            提示要求这类持股标 in_net_cash=true。
+            ④ 上限覆盖：GOOGL 364.6B（OtherLongTermInvestments 与非上市股权大概率重叠，偏松）、
+            NVDA 137.6B、META 33.7B、MSFT 131.8B、KO 23.0B（几乎全是装瓶厂权益法，prompt 已
+            排除经营性联营）、INTC 30.3B、TSLA 41.6B（只有 AFS，停在 2025-09）、AAPL 无（旧科目过期）。
+            AMZN 引擎 → Excel → verify_report 全链实跑一致。
+      - [ ] 判断层实跑：还没让 LLM 真正走一遍新 prompt（需要调用判断层，花额度）。要看的是
+            AMZN 会不会把期后 21.3B 分开报、MSFT 会不会标 in_net_cash=true、AAPL/KO 会不会写 []
       - [ ] PE 腿是否也加持股：先看几期 `pe_plus_holdings` 参考数与各腿的偏离再定；要加得先
             解决 other_income 里的权益法损益与历史倍数里已含的持股定价两处重复计算
       - [ ] `check_configs` 回放 0033 之前留档的 config 会因缺 `strategic_holdings` BLOCK

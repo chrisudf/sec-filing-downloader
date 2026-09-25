@@ -1213,8 +1213,10 @@ HOLD_CAP_KEYS = ("inv_nonmarketable_equity_instant", "inv_equity_method_instant"
 def holdings_xbrl_cap(facts, max_age_days=400):
     """XBRL 投资类科目合计（$M）-> (cap|None, {key: [期末, $M]})。
 
-    各科目取最新一期；比全体最新期早 max_age_days 以上的科目剔除（停标的旧概念会把
-    上限撑大）。400 天是为了留住只在 10-K 里标的科目（权益法投资常见）。
+    各科目取最新一期；比数据最新期（facts.data_latest，缺了才退回各科目里最新的一期）
+    早 max_age_days 以上的科目剔除——停标的旧概念会把上限撑大。AAPL 实测：非上市股权
+    最后一次标在 2021-06、AFS 合计 2020-12（$195.6B），只拿科目彼此比较时两者都"新鲜"，
+    上限被撑到 $198B。400 天是为了留住只在 10-K 里标的科目（权益法投资常见）。
     一个科目都没有返回 (None, {})——调用方据此判「无从核对」，不拿 0 当上限。"""
     latest = {}
     for k in HOLD_CAP_KEYS:
@@ -1224,13 +1226,16 @@ def holdings_xbrl_cap(facts, max_age_days=400):
             latest[k] = max(vals)
     if not latest:
         return None, {}
-    newest = date.fromisoformat(max(e for e, _ in latest.values()))
+    anchor = date.fromisoformat((facts or {}).get("data_latest")
+                                or max(e for e, _ in latest.values()))
     parts = {k: [e, round(v / 1e6, 1)] for k, (e, v) in latest.items()
-             if (newest - date.fromisoformat(e)).days <= max_age_days}
+             if (anchor - date.fromisoformat(e)).days <= max_age_days}
+    if not parts:
+        return None, {}
     return round(sum(p[1] for p in parts.values()), 1), parts
 
 
-def strategic_holdings_value(items, cap, shares, cap_parts=None, tol=0.02):
+def strategic_holdings_value(items, cap, shares, cap_parts=None, tol=0.02, ppce_out=None):
     """判断层申报的战略持股 -> (计入 DCF/SOTP 的税后价值 $M, 明细 dict|None, [[level, msg]])。
 
     没申报（None 或 []）返回 (0.0, None, [])：调用方加 0.0，输出逐位不变。
@@ -1239,10 +1244,22 @@ def strategic_holdings_value(items, cap, shares, cap_parts=None, tol=0.02):
       已在净现金里，后者为真是收益已在营业利润里（倍数和现金流都已含它）
     - XBRL 没有任何投资类科目可核对 → 整体不计入（黄旗）
     - 申报账面值合计超过 XBRL 上限 → 整体不计入（红旗，服务层打回判断层一次）
-    计入的每项：账面值 × (1 − 折价) − 21% × max(0, 折价后 − 成本)；没给成本按全额计税。"""
+    - 期后追加投资（post_period_investment_musd）：这笔现金若已按期后事件从 net_cash
+      扣掉，就得在持股里加回，否则钱凭空消失（AMZN 实测：6/30 之后又投 OpenAI $21.3B）；
+      若没扣，加回就是重复。所以只在合计 <= ppce_out（期后事件里 reflected_in_net_cash=true
+      的净现金流出之和）时计入，否则期后部分整体不计入（黄旗），报告期末账面值照常计入。
+      上限核对只看报告期末账面值——XBRL 里本来就没有期后的钱。
+    计入的每项：(账面值 + 期后追加) × (1 − 折价) − 21% × max(0, 折价后 − 成本 − 期后追加)；
+    没给成本按账面值全额计税（期后追加是刚投的现金，按成本处理）。"""
     if not items:
         return 0.0, None, []
     rows, warns = [], []
+
+    def _net(cv, pp, kind, basis):
+        v = (cv + pp) * (1 - HOLD_DISCOUNT[kind])
+        tax = HOLD_GAIN_TAX * max(0.0, v - basis - pp)
+        return v, tax, v - tax
+
     for i, it in enumerate(items):
         it = it if isinstance(it, dict) else {}
         name = str(it.get("name") or f"#{i + 1}")
@@ -1260,16 +1277,22 @@ def strategic_holdings_value(items, cap, shares, cap_parts=None, tol=0.02):
                        reason=("收益已在营业利润里" if it.get("income_in_operating_income") is True
                                else "未声明 income_in_operating_income=false"))
         else:
-            v = float(cv) * (1 - HOLD_DISCOUNT[kind])
             basis = it.get("cost_basis_musd")
             has_basis = _isnum(basis) and basis >= 0
-            tax = HOLD_GAIN_TAX * max(0.0, v - (float(basis) if has_basis else 0.0))
-            row.update(counted=True, after_discount_musd=round(v, 1),
+            pp = it.get("post_period_investment_musd")
+            row.update(counted=True,
                        cost_basis_musd=round(float(basis), 1) if has_basis else None,
-                       tax_musd=round(tax, 1), net_musd=round(v - tax, 1))
+                       post_period_musd=round(float(pp), 1) if _isnum(pp) and pp > 0 else 0.0,
+                       _basis=float(basis) if has_basis else 0.0)
         rows.append(row)
     elig = [r for r in rows if r["counted"]]
     cv_sum = round(sum(r["carrying_musd"] for r in elig), 1)
+    pp_sum = round(sum(r["post_period_musd"] for r in elig), 1)
+    pp_ok = pp_sum > 0 and _isnum(ppce_out) and pp_sum <= ppce_out * (1 + tol)
+    for r in elig:
+        pp = r["post_period_musd"] if pp_ok else 0.0
+        v, tax, net = _net(r["carrying_musd"], pp, r["kind"], r.pop("_basis"))
+        r.update(after_discount_musd=round(v, 1), tax_musd=round(tax, 1), net_musd=round(net, 1))
     status = "counted" if elig else "none_eligible"
     if elig and cap is None:
         status = "unverified"
@@ -1282,11 +1305,18 @@ def strategic_holdings_value(items, cap, shares, cap_parts=None, tol=0.02):
         warns.append(["red",
                       f"战略持股申报账面值合计 {cv_sum:,.0f}M 超过 XBRL 投资类科目合计 "
                       f"{cap:,.0f}M（{_p}）——请按资产负债表账面值申报（不要用 持股比例×最新一轮"
-                      "估值），并剔除已在 net_cash 里的项；本次未计入任何一条腿"])
+                      "估值；报告期后才投的钱写进 post_period_investment_musd，不要并进账面值），"
+                      "并剔除已在 net_cash 里的项；本次未计入任何一条腿"])
     if status in ("unverified", "over_cap"):
         for r in elig:
             r.update(counted=False, reason="未通过 XBRL 上限核对" if status == "over_cap"
                      else "XBRL 无投资类科目可核对")
+    elif status == "counted" and pp_sum > 0 and not pp_ok:
+        warns.append(["yellow",
+                      f"期后追加投资合计 {pp_sum:,.0f}M 超过期后事件里已确认从 net_cash 扣掉的流出 "
+                      f"{ppce_out or 0:,.0f}M（post_period_capital_events 中 reflected_in_net_cash="
+                      "true 的负 net_cash_impact_musd）——期后部分未计入，免得与净现金重复；"
+                      "报告期末账面值照常计入"])
     value = round(sum(r["net_musd"] for r in rows if r["counted"]), 1)
     skipped = [f"{r['name']}（{r['reason']}）" for r in rows
                if not r["counted"] and r.get("reason", "").startswith(("未声明", "字段不全"))]
@@ -1294,17 +1324,23 @@ def strategic_holdings_value(items, cap, shares, cap_parts=None, tol=0.02):
         warns.append(["yellow", "战略持股以下各项未计入——" + "；".join(skipped)])
     if status == "counted":
         _it = "；".join(
-            f"{r['name']} 账面 {r['carrying_musd']:,.0f} → 税后 {r['net_musd']:,.0f}"
+            f"{r['name']} 账面 {r['carrying_musd']:,.0f}"
+            + (f" + 期后 {r['post_period_musd']:,.0f}" if pp_ok and r["post_period_musd"] else "")
+            + f" → 税后 {r['net_musd']:,.0f}"
             + ("（未给成本，按全额计税）" if r["cost_basis_musd"] is None else "")
             for r in rows if r["counted"])
         warns.append(["info",
                       f"战略持股计入 DCF 与 SOTP（PE 腿不含，诊断里另给参考数）：账面 {cv_sum:,.0f}M"
-                      f" → 折价（非上市 {HOLD_DISCOUNT['private']:.0%}、上市不打折）、未实现收益按 "
+                      + (f" + 期后追加 {pp_sum:,.0f}M" if pp_ok else "")
+                      + f" → 折价（非上市 {HOLD_DISCOUNT['private']:.0%}、上市不打折）、未实现收益按 "
                       f"{HOLD_GAIN_TAX:.0%} 计税 → {value:,.0f}M"
                       + (f"（每股 {value / shares:.2f}）" if shares else "") + f"。逐项 $M：{_it}"])
     detail = dict(status=status, value_musd=value,
                   per_share=round(value / shares, 2) if shares else None,
                   carrying_musd=cv_sum, cap_musd=cap, cap_parts=cap_parts or {},
+                  post_period_musd=pp_sum,
+                  post_period_counted=bool(pp_ok and status == "counted"),
+                  post_period_confirmed_outflow_musd=ppce_out,
                   discount=dict(HOLD_DISCOUNT), gain_tax=HOLD_GAIN_TAX,
                   legs=["dcf", "sotp"], items=rows)
     return value, detail, warns
@@ -1525,8 +1561,15 @@ _AMORT, _AMORT_NOTE = amort_ttm_musd(facts)
 # 一律按**不含持股**的经营价值判：持股不产生 FCF，不能把一条本该退出综合的腿抬回来
 if cfg.get("strategic_holdings"):
     _HOLD_CAP, _HOLD_PARTS = holdings_xbrl_cap(facts)
+    # 期后事件里已确认从 net_cash 扣掉的流出（只认 reflected_in_net_cash=true 的负
+    # net_cash_impact_musd）——期后追加投资只能在这个额度内加回持股
+    _PPCE_OUT = -sum(e["net_cash_impact_musd"]
+                     for e in cfg.get("post_period_capital_events") or []
+                     if isinstance(e, dict) and e.get("reflected_in_net_cash") is True
+                     and _isnum(e.get("net_cash_impact_musd")) and e["net_cash_impact_musd"] < 0)
     _HOLD, _HOLD_D, _HOLD_W = strategic_holdings_value(
-        cfg["strategic_holdings"], _HOLD_CAP, cfg["shares"], _HOLD_PARTS)
+        cfg["strategic_holdings"], _HOLD_CAP, cfg["shares"], _HOLD_PARTS,
+        ppce_out=_PPCE_OUT)
 else:
     _HOLD, _HOLD_D, _HOLD_W = 0.0, None, []
 _hold_ps = _HOLD / cfg["shares"]

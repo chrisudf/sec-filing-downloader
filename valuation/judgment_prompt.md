@@ -120,7 +120,14 @@
      `income_in_operating_income`：它的损益是否记在营业利润里（true 则不再加）。
      两个都必须显式写布尔，引擎只认显式 false 才计入。
    - `cost_basis_musd`（可选）：附注披露了投资成本就写。引擎按（折价后价值 − 成本）× 21%
-     扣未实现收益税；不写就按全额计税。
+     扣未实现收益税；不写就按全额计税。AFS 可转债按公允价值入账，附注会披露计入 AOCI 的
+     未实现收益：成本 = 公允价值 − 未实现收益（AMZN 2026-06-30：97.9B − 92.0B = 5.9B）。
+   - `post_period_investment_musd`（可选）：**报告期末之后**才投进去的现金（AMZN 6/30 之后
+     又投 OpenAI $21.3B）。不要并进账面值（XBRL 上限只含报告期末），单独写在这里；而且
+     必须在 post_period_capital_events 里有对应的一笔 reflected_in_net_cash=true、
+     net_cash_impact_musd 为负的事件——引擎只在这个额度内加回，否则期后部分不计入。
+   - ⚠ FACTS 的「长期有价证券」若注明取自泛标签 LongTermInvestments（MSFT 型），这一行
+     常含权益法与非上市股权；你的 net_cash 用了它，其中的战略持股就必须标 in_net_cash=true。
    - **引擎怎么用（你不用算）**：非上市打 20% 折价、上市不打折，扣税后**只加进 DCF 与
      SOTP** 的股权价值。**PE 腿不加**——所以 other_income 照旧剔除这些持股的重估收益，
      不要为了"让 PE 腿也算到"把重估收益留在 other_income 里。
@@ -169,7 +176,9 @@
     {"name": "<被投公司与证券类型，如 Anthropic 优先股>",
      "kind": "private|public",
      "carrying_value_musd": <资产负债表账面值 $M（报告期末）——不是 持股比例×最新一轮估值>,
-     "cost_basis_musd": <可选：附注披露的投资成本 $M>,
+     "cost_basis_musd": <可选：附注披露的投资成本 $M（AFS = 公允价值 − 未实现收益）>,
+     "post_period_investment_musd": <可选：报告期末之后追加投入的现金 $M；须在
+       post_period_capital_events 里有对应的 net_cash 扣减>,
      "in_net_cash": <布尔：已算进上面的 net_cash 则 true（引擎不再加）>,
      "income_in_operating_income": <布尔：损益记在营业利润里则 true（引擎不再加）>,
      "source": "<附注出处，如 10-Q Note 4 Investments>"}
