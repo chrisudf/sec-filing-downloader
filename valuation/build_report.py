@@ -58,6 +58,11 @@ def put(ws, cell, value, font=BLACK, fmt=None, fill=None, border=True, wrap=Fals
 S = d["scenarios"]
 R = d["rationale"]
 FWD = d["meta"]["fwd_label"]
+# 战略持股（0033）：只在确实计入（status=counted 且 >0）时新增 情景假设!B29 并改写
+# DCF/SOTP 的「加：净现金」一行——没有持股的报告与改动前逐格相同
+_SH = d["meta"].get("strategic_holdings") or {}
+HOLD = (_SH["value_musd"] if _SH.get("status") == "counted"
+        and (_SH.get("value_musd") or 0) > 0 else None)
 MODE = d.get("mode", "standard")
 
 # ttm_revenue_override 生效时只有营收被滚动到含最新季度的窗口，同块的利润/现金流
@@ -468,6 +473,15 @@ for label, v, note in facts_rows:
 put(ws, "A28", "TTM 调整后 EPS", BOLD)
 put(ws, "B28", "=B22/B27", BLACK, fmt=FM_EPS)
 put(ws, "E28", "调整后净利 / 稀释股本", GREEN)
+if HOLD:
+    put(ws, "A29", "战略持股（折价+税后，$M）", BOLD)
+    put(ws, "B29", HOLD, BLUE, fmt=FM_M)
+    put(ws, "E29", f"账面 {_SH['carrying_musd']:,.0f}M → 折价（非上市 "
+                   f"{_SH['discount']['private']:.0%}、上市不打折）、未实现收益按 {_SH['gain_tax']:.0%} 计税；"
+                   "只加进 DCF 与 SOTP，PE 法不含。逐项："
+                   + "；".join(f"{it['name']} {it['carrying_musd']:,.0f}→{it['net_musd']:,.0f}"
+                              for it in _SH["items"] if it.get("counted")),
+        GREEN, wrap=True)
 
 put(ws, "A30", "情景计算（公式）", H2, border=False)
 calc_rows = [
@@ -519,7 +533,8 @@ for name, acol, key, r0 in SCEN:
         ("终值 ($M)", f"=K{r0+5}*(1+'情景假设'!{acol}11)/('情景假设'!{acol}10-'情景假设'!{acol}11)", FM_M),
         ("终值折现 ($M)", f"=B{r0+8}/POWER(1+'情景假设'!{acol}10,10)", FM_M),
         ("企业价值 EV ($M)", f"=B{r0+7}+B{r0+9}", FM_M),
-        ("加：净现金 ($M)", "='情景假设'!$B$26", FM_M),
+        (("加：净现金 + 战略持股 ($M)", "='情景假设'!$B$26+'情景假设'!$B$29", FM_M) if HOLD
+         else ("加：净现金 ($M)", "='情景假设'!$B$26", FM_M)),
         ("股权价值 ($M)", f"=B{r0+10}+B{r0+11}", FM_M),
         ("每股价值", f"=B{r0+12}/'情景假设'!$B$27", FM_PX),
     ]
@@ -564,7 +579,9 @@ rows = [
     ("次分部营业利润 ($M)", d["meta"]["seg2"], "='情景假设'!{a}32*(1-'情景假设'!$B$16)", FM_M),
     ("次分部倍数", "引用「情景假设」第9行", "='情景假设'!{a}9", '0"x"'),
     ("次分部估值 ($M)", "", "={c}7*{c}8", FM_M),
-    ("净现金 ($M)", d["net_cash_note"][:44] + "…", "='情景假设'!$B$26", FM_M),
+    (("净现金 + 战略持股 ($M)", "持股明细见「情景假设」第29行",
+      "='情景假设'!$B$26+'情景假设'!$B$29", FM_M) if HOLD
+     else ("净现金 ($M)", d["net_cash_note"][:44] + "…", "='情景假设'!$B$26", FM_M)),
     ("总权益价值 ($M)", "", "={c}6+{c}9+{c}10", FM_M),
     ("每股公允价值", "", "={c}11/'情景假设'!$B$27", FM_PX),
     ("现价", "可在「摘要」B4 修改", "='摘要'!$B$4", FM_PX),
@@ -772,6 +789,10 @@ if _nm_rows:
     _note25 += ("；" + "、".join(_nm_rows)
                 + " n.m. 不入综合（近零/负利润守卫、或 DCF 无现金流锚，"
                   "综合口径逐档不同，见红旗区）")
+if HOLD:
+    _pp = (S["base"].get("diagnostics") or {}).get("pe_plus_holdings")
+    _note25 += (f"；DCF/SOTP 含战略持股每股 {_SH['per_share']}（PE 法不含"
+                + (f"，PE 法+持股参考 base {_pp}" if _pp is not None else "") + "）")
 put(ws, "A25", _note25, GREEN, border=False)
 _mth = "三法" if _sotp_in else "PE/DCF 两法"
 # 离散度后面跟上参与综合的腿区间（0023）：只报一个 max/min 比值，读者还是会把
@@ -978,6 +999,14 @@ ws = wb.create_sheet("出处")
 ws.column_dimensions["A"].width = 30
 ws.column_dimensions["B"].width = 105
 put(ws, "A1", "数据出处与调整口径", TITLE, border=False)
+# 战略持股（0033）：申报过就留一行出处（含未计入的项与原因），没申报则不出这一行
+_SH_STATUS = {"counted": "已计入 DCF 与 SOTP",
+              "over_cap": "申报账面值超过 XBRL 投资类科目上限，未计入",
+              "unverified": "XBRL 无投资类科目可核对，未计入",
+              "none_eligible": "申报项均已在净现金或营业利润里，未另加"}
+_sh_rows = ([("战略持股", _SH_STATUS.get(_SH.get("status"), "") + "："
+              + "；".join(f"{it['name']}（{it.get('reason') or '计入'}）"
+                         for it in _SH.get("items") or []))] if _SH else [])
 sources = [
     ("下载器 manifest", d["manifest"].strip()),
     ("XBRL companyfacts", f"https://data.sec.gov/api/xbrl/companyfacts/CIK*.json（{T}）—— 营收/营业利润/净利/EPS/CFO/Capex/现金/债务/股本"),
@@ -985,6 +1014,7 @@ sources = [
     ("TTM 口径", "损益类=最近四个离散季度加总（Q4=年度-前三季）；现金流类=最新年度+本财年YTD-上年同期YTD（10-Q现金流表为累计口径）"),
     ("调整后净利", d["adj_note"]),
     ("净现金", d["net_cash_note"]),
+    *_sh_rows,
     # 与 adj_note/net_cash_note 同级的推导出处（0015）——老 valuation.json 缺字段时回退通用口径
     ("年化其他收益", d.get("other_income_note") or "净利息及其他（正常化）；三情景共用"),
     ("估值语义版本", (f"semantics_version={d.get('semantics_version', 1)}"

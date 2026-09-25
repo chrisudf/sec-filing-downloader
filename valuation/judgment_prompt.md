@@ -104,6 +104,27 @@
    把结果写进 `post_period_capital_events`（确认无事件就写 `[]`），并让 net_cash 反映最终值。
    实测：INTC 2026-08-30，8/18 完成的 $20B 增发股数已计、$19.7B 现金未计，净债务少算 4.2% 市值，
    该偏差又把 bear 推出 P/FCF 界外触发假红旗，连锁破坏了 margins 情景排序。
+3b. **战略持股**（`strategic_holdings`，**必填，没有写 `[]`**）：发行人持有的**非经营性**
+   股权或可转债——例如 AMZN 持有的 Anthropic 优先股与可转债、OpenAI 股权。它们既不在
+   FCF、营业利润里，也不在净现金里，漏报就是整块价值没算。
+   - **去哪找**：10-Q/10-K 的 Investments / Fair Value Measurements 附注、"equity securities
+     without readily determinable fair values"（计量替代法）、"equity method investments"、
+     资产负债表 Other assets 明细。FACTS 的「投资类科目时点」列了 XBRL 里的相关科目。
+   - **`carrying_value_musd` 是资产负债表账面值**（报告期末，美元 $M）。**不要**用
+     「持股比例 × 最新一轮估值」——那是市场价值不是账面值。引擎会拿 XBRL 投资类科目
+     合计核对上限，超了打红旗打回，本次一分不计。
+   - **只报经营链条之外、回报主要来自增值的持股**。不要报：经营性合资/联营（KO 的装瓶厂、
+     车企的合资公司）、银行/保险的投资组合、已按上面口径计入 net_cash 的有价证券。
+     拿不准就照样列出，把下面两个布尔如实写 true——引擎会跳过但留痕，比漏看强。
+   - `in_net_cash`：这一项是否已经算进上面的 net_cash（true 则不再加）；
+     `income_in_operating_income`：它的损益是否记在营业利润里（true 则不再加）。
+     两个都必须显式写布尔，引擎只认显式 false 才计入。
+   - `cost_basis_musd`（可选）：附注披露了投资成本就写。引擎按（折价后价值 − 成本）× 21%
+     扣未实现收益税；不写就按全额计税。
+   - **引擎怎么用（你不用算）**：非上市打 20% 折价、上市不打折，扣税后**只加进 DCF 与
+     SOTP** 的股权价值。**PE 腿不加**——所以 other_income 照旧剔除这些持股的重估收益，
+     不要为了"让 PE 腿也算到"把重估收益留在 other_income 里。
+   - 合计不到市值 1% 的可以不报：写 `[]`，并在 strategic_holdings_note 里写明量级。
 4. **other_income**：年化的**正常化**利息与其他收益，**必须剔除一次性**。
    FACTS 的「OI&E 组件」区已给出本票**实际存在**的组件序列与逐季「税前−营业利润」
    残差行（不存在的序列会被显式标注——被标注不可用的序列不要引用）；推导落在这些数上。
@@ -144,6 +165,17 @@
     推出的真实 TTM 营收 $M，g 的基准将以此为准>,
   "ttm_revenue_note": "<提供 override 时必填：推导口径与出处>",
   "net_cash": <净现金 $M>, "net_cash_note": "<口径与出处>",
+  "strategic_holdings": [   // **必填**；没有（或合计不到市值 1%）写 []
+    {"name": "<被投公司与证券类型，如 Anthropic 优先股>",
+     "kind": "private|public",
+     "carrying_value_musd": <资产负债表账面值 $M（报告期末）——不是 持股比例×最新一轮估值>,
+     "cost_basis_musd": <可选：附注披露的投资成本 $M>,
+     "in_net_cash": <布尔：已算进上面的 net_cash 则 true（引擎不再加）>,
+     "income_in_operating_income": <布尔：损益记在营业利润里则 true（引擎不再加）>,
+     "source": "<附注出处，如 10-Q Note 4 Investments>"}
+  ],
+  "strategic_holdings_note": "<**必填**：在哪份财报哪一节核对的；写 [] 时说明为什么没有
+    或量级为何可忽略>",
   "accounting_estimate_changes": [   // **必填**；确认无变更写 []
     {"effective_date": "YYYY-MM-DD",
      "subject": "<变更对象，如 servers and network assets 折旧年限 6→5 年>",

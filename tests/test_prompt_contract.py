@@ -42,6 +42,7 @@ def _mk(**over):
         fwd_shares=1000.0, net_cash=0.0, net_cash_note="x",
         adj_ni=100.0, adj_note="x", other_income=0.0, other_income_note="x",
         accounting_estimate_changes=[], accounting_estimate_note="x",
+        strategic_holdings=[], strategic_holdings_note="x",
         seg1="A", seg2="B", seg1_share=0.9,
         rationale={k: "x" for k in ("g", "opm", "pe", "m1", "rl", "wacc", "dcf_margin")},
         notes=["x"],

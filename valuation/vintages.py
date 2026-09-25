@@ -80,6 +80,10 @@ def _sample(val: dict, gate_clean: bool) -> dict:
         # SOTP 是否入综合（seg1_share >= 0.85 时降级为参考项）——等权下
         # blend_weights 归一化后看不出两腿/三腿之别，趋势分组要靠这个字段
         "sotp_in_blend": val.get("meta", {}).get("sotp_in_blend"),
+        # 战略持股每股值（0033）：DCF/SOTP 含它、PE 腿不含——有与没有是两个口径，
+        # 趋势视图据此分组（老样本无该键 = 当时没计入，与 0 同组）
+        "strategic_holdings_ps": ((val.get("meta", {}).get("strategic_holdings") or {})
+                                  .get("per_share") or 0) or None,
         "adj_ni": val.get("adj_ni"), "adj_eps": val.get("adj_eps"),
         "ttm_revenue": ttm.get("revenue"), "ttm_op_income": ttm.get("op_income"),
         "ttm_net_income": ttm.get("net_income"),

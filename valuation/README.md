@@ -30,6 +30,14 @@ python valuation\verify_report.py valuation.json reports\NVDA_valuation_2026-07-
   "price": 207.40, "mcap": 5023435,        // $M，yfinance
   "shares": 24391, "fwd_shares": 24300,    // 百万股：最新稀释 / 前瞻期(NTM)估计
   "net_cash": 44000, "net_cash_note": "现金+短期证券-债务，出处…",
+  "strategic_holdings": [                  // 必填（判断层输出时）；没有写 []。手写 config 可省略
+    {"name": "某私营公司优先股", "kind": "private",   // private 打 20% 折价 / public 不打折
+     "carrying_value_musd": 5000,          // 资产负债表账面值 $M，不是 持股比例×估值
+     "cost_basis_musd": 1000,              // 可选；缺省按全额计 21% 未实现收益税
+     "in_net_cash": false, "income_in_operating_income": false,   // 显式 false 才计入
+     "source": "10-Q Note 4"}
+  ],
+  "strategic_holdings_note": "在哪份财报哪一节核对的",
   "adj_ni": 137831, "adj_note": "TTM 调整口径说明（还原/剔除了哪些一次性项）",
   "other_income": 2400,                    // 年化其他收益 $M
   "fwd_label": "NTM 2026-08~2027-07（横跨 FY2027 后段 + FY2028 前段）",
@@ -173,6 +181,29 @@ MSFT 2026-09-08 实测就是这个形态（判断层 `seg1_share=1.0` 零理由�
 就与发行人申报矛盾时才改变输出（NVDA 94% vs 91.8%、AMZN 58% vs 57.9% 逐位不变）。
 形态与 0018 幽灵 ADR 同类——修的是缺陷而非口径，同样不占语义号。真改变了综合腿集合
 的那些运行，`compare.py` 的逐情景 `blend_methods` 警告本就会报。
+
+### 战略持股（0033，2026-09-25，**不占语义号**）
+
+AMZN 的 Anthropic/OpenAI 持股（2026-09-24 面板审计估约 $18.7/股税后）此前不进任何
+一条腿：FCFF 不含重估收益、EBIT 不含营业外、`net_cash` 只收现金与有价证券。
+
+- **口径**（与本人确认）：按资产负债表**账面值**；非上市打 20% 折价、上市不打折；
+  未实现收益按 21% 计税（没给成本按全额）；**只加进 DCF 与 SOTP** 的股权价值。
+  PE 腿不动——`other_income` 可能已含权益法损益、历史倍数也含部分持股定价，加进去
+  有重复计算风险；诊断里给 `pe_plus_holdings` 参考数，不进综合。
+- **护栏按经营价值判**：DCF 的 n.m. 闸、P/FCF、终值占比都看不含持股的 `dcf_ps_operating`。
+  持股不产生 FCF，不能把一条本该退出综合的腿抬回来。方法离散度、终值敏感性、
+  `blend_p_adjni` 是进综合的腿/综合价的读数，随持股变。反向 DCF 与敏感性表同 DCF 腿口径。
+- **拿不准一律不计入**：两个布尔必须显式 false；XBRL 没有投资类科目可核对 → 黄旗、
+  不计入；申报账面值合计超过 XBRL 投资类科目合计（`holdings_xbrl_cap`，只当上限）→
+  红旗打回判断层一次，仍超则不计入。
+- **呈现**：`meta.strategic_holdings` 明细；Excel「情景假设」B29 + DCF/SOTP 的净现金行改为
+  「净现金 + 战略持股」公式，`verify_report` 多核一格；`compare` 报每股持股值变化；
+  趋势视图把「含持股」样本单独分组。
+
+**为什么不升语义号**：没申报（缺键或 `[]`）的运行逐位不变（引擎 JSON、stdout、Excel
+逐格对拍过），只改变确实持有非经营性股权的少数标的；持股计入与否在 compare/trend 里
+按自己的字段隔离，不需要让所有标的的历史一起断代。
 
 ## financials v3 语义（fin semantics_version=3，2026-09-06）
 

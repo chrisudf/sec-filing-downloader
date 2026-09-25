@@ -65,6 +65,7 @@ def _mk(**over):
         fwd_shares=1000.0, net_cash=0.0, net_cash_note="x",
         adj_ni=100.0, adj_note="x", other_income=0.0, other_income_note="x",
         accounting_estimate_changes=[], accounting_estimate_note="x",
+        strategic_holdings=[], strategic_holdings_note="x",
         seg1="A", seg2="B", seg1_share=0.9,
         rationale={k: "x" for k in ("g", "opm", "pe", "m1", "rl", "wacc", "dcf_margin")},
         notes=["x"],
@@ -710,11 +711,16 @@ def test_terminal_sensitivity_lambda_shares_base_matches_dcf_ps():
         dcf=dcf, rev0=1000.0,
         _bcfg=dict(g0=0.06, gN=0.03, wacc=0.10, tg=0.025),
         cfg=dict(net_cash=500.0, shares=1000.0, fwd_shares=1049.0),  # +4.9% 增发
+        _hold_ps=0.0,            # 战略持股每股值（0033）：没申报时恒 0
     )
     lam = eval(lam_src, ns)      # 调用点换了变量名会 NameError —— 响亮失败，别兜
     base_ps = dcf(1000.0, 0.06, 0.03, margins, 0.10, 0.025, 500.0,
                   ns["cfg"]["shares"])[0]
     assert lam(margins) == pytest.approx(base_ps, rel=1e-12)
+    # 有持股时敏感性与报告里的 DCF 腿同口径（经营 + 每股持股），三元组才可比
+    ns["_hold_ps"] = 2.5
+    lam = eval(lam_src, ns)
+    assert lam(margins) == pytest.approx(base_ps + 2.5, rel=1e-12)
 
 
 # ---- margins 谷底护栏：负 FCF 时退到历史中位，而不是整条跳过 ----

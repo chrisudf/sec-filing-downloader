@@ -316,6 +316,44 @@ def _validate_judgment(d: dict, mode: str = "standard",
             "accounting_estimate_note 必填：写明在哪份财报的哪一节核对了会计估计变更"
             "（10-K 的 Summary of Significant Accounting Policies / Change in "
             "Accounting Estimate、10-Q 对应附注）。写 [] 时这句是唯一凭据")
+    # strategic_holdings（0033，**必填**，没有就写 []）：非经营性战略持股（AMZN 的
+    # Anthropic/OpenAI 型）。引擎只把它加进 DCF 与 SOTP，按账面值、非上市打 20% 折价、
+    # 未实现收益按 21% 计税。必填的理由与 accounting_estimate_changes 相同：写 [] 是
+    # "查过、没有"的唯一凭据。这里只管形状；账面值与 XBRL 投资类科目的上限对账在
+    # 引擎（超了打 red 打回一次）。两个布尔必须显式给——引擎只认显式 false 才计入
+    sh = d.get("strategic_holdings")
+    if sh is None:
+        raise ValueError(
+            "strategic_holdings 必填（没有写 []，并在 strategic_holdings_note 里说明查了哪里）"
+            "——非经营性战略持股不在 FCF、营业利润和净现金里，漏报就是整块价值没算")
+    if not isinstance(sh, list):
+        raise ValueError("strategic_holdings 必须是数组（没有则写 []）")
+    _sh_keys = {"name", "kind", "carrying_value_musd", "in_net_cash",
+                "income_in_operating_income", "source"}
+    for i, e in enumerate(sh):
+        if not isinstance(e, dict) or not _sh_keys <= set(e):
+            raise ValueError(
+                f"strategic_holdings[{i}] 须含 name/kind/carrying_value_musd/in_net_cash/"
+                "income_in_operating_income/source")
+        if e["kind"] not in ("private", "public"):
+            raise ValueError(f"strategic_holdings[{i}].kind 必须是 private 或 public")
+        if not _isnum(e["carrying_value_musd"]) or e["carrying_value_musd"] <= 0:
+            raise ValueError(
+                f"strategic_holdings[{i}].carrying_value_musd 必须是正数（$M，资产负债表账面值，"
+                "不是 持股比例×最新一轮估值）")
+        for _k in ("in_net_cash", "income_in_operating_income"):
+            if not isinstance(e[_k], bool):
+                raise ValueError(f"strategic_holdings[{i}].{_k} 必须是布尔 true/false")
+        _cb = e.get("cost_basis_musd")
+        if _cb is not None and (not _isnum(_cb) or _cb < 0):
+            raise ValueError(f"strategic_holdings[{i}].cost_basis_musd 须为非负数字（$M）或省略")
+        if not str(e.get("source") or "").strip():
+            raise ValueError(f"strategic_holdings[{i}].source 必填（财报附注出处）")
+    if not str(d.get("strategic_holdings_note") or "").strip():
+        raise ValueError(
+            "strategic_holdings_note 必填：写明在哪份财报的哪一节核对了投资/持股"
+            "（10-Q 的 Investments / Fair Value 附注、资产负债表 Other assets 明细）。"
+            "写 [] 时这句是唯一凭据")
     # ppce_note（v4）可选：期后事件与 net_cash 的对账说明一句话，引擎附在 info 行后
     if "ppce_note" in d and not isinstance(d["ppce_note"], str):
         raise ValueError("ppce_note 必须是字符串（期后事件对账的一句话说明）")
@@ -975,6 +1013,22 @@ def _compact_facts(facts: dict) -> str:
         d = facts.get(key) or {}
         bs.append(f"{label} {list(d.items())[-1] if d else '无'}")
     lines.append("资产负债时点(XBRL,可能滞后,净现金以10-Q原文优先): " + ", ".join(bs))
+    # 战略持股（0033）：引擎拿这些科目之和当 strategic_holdings 账面值的上限核对。
+    # 几个科目可能互相包含，这里只列数，不代表它们都是战略持股、更不是净现金口径
+    inv = []
+    for label, key in (("非上市股权(计量替代法)", "inv_nonmarketable_equity_instant"),
+                       ("权益法投资", "inv_equity_method_instant"),
+                       ("长期投资", "inv_long_term_instant"),
+                       ("其他长期投资", "inv_other_long_term_instant"),
+                       ("AFS 债券合计", "afs_securities_total_instant"),
+                       ("公允价值计量的股权", "equity_securities_st_instant")):
+        d = facts.get(key) or {}
+        if d:
+            _e, _v = list(d.items())[-1]
+            inv.append(f"{label} {_e} {_v / 1e6:,.0f}M")
+    lines.append("投资类科目时点(XBRL，只用于核对 strategic_holdings 的上限，不是净现金口径): "
+                 + ("、".join(inv) if inv
+                    else "无——申报的战略持股无从核对，引擎不会计入"))
     return "\n".join(lines)
 
 
@@ -1444,9 +1498,11 @@ def _check_seg1_share(d: dict, sf: dict | None) -> None:
 # 同输入两次运行 other_income 漂 -33%，而连续性注入偏偏不带这个字段：判断层看不到
 # 上次的值，纪律对它管不着，漂移从连续性通道原样漏回来。seg1_share 同理（SOTP 权重
 # 每次独立重拍）。
+# strategic_holdings（0033）同属事实类锚：账面值每季才变，不该每次独立重报
 _PREV_CORE_KEYS = ("date", "adj_ni", "net_cash", "fwd_shares",
                    "other_income", "other_income_note",
-                   "seg1", "seg2", "seg1_share", "scenarios", "rationale")
+                   "seg1", "seg2", "seg1_share", "scenarios", "rationale",
+                   "strategic_holdings")
 
 
 def _prev_core(prev: dict) -> dict:
@@ -1864,7 +1920,7 @@ async def _pipeline(job: dict, ticker: str, email: str) -> None:
                    + json.dumps(judgment, ensure_ascii=False)
                    + "\n\n# 估值引擎对上述假设的经济合理性红旗\n- "
                    + "\n- ".join(reds)
-                   + "\n\n只调整导致红旗的假设（DCF 增速路径/margins/wacc-tg/倍数），"
+                   + "\n\n只调整导致红旗的假设（DCF 增速路径/margins/wacc-tg/倍数/战略持股申报），"
                      "其余保持原值，重新只输出完整 JSON。若你坚持某项红旗假设，"
                      "必须在 notes 里给出财报原文依据（红旗会随报告展示）。")
         try:

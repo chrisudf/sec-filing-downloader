@@ -1194,6 +1194,122 @@ def ps_reference(psb, rev1, fwd_shares, scen_name, ddiag):
             f"{scen_name} 每股营收 {_rps1:.2f} ≈ {float(_psp['50']) * _rps1:.1f}")
 
 
+# ---- 战略持股（0033）：非经营性持股进 DCF 与 SOTP 的「企业价值 → 股权价值」桥 ----
+# AMZN 的 Anthropic/OpenAI 持股（TODO v0.4.4 估约 $18.7/股税后）此前不进任何一条腿：
+# FCFF 不含重估收益、EBIT 不含营业外、net_cash 只收现金与有价证券。口径（2026-09-25
+# 与本人确认）：按资产负债表**账面值**、只进 DCF 与 SOTP、非上市打 20% 折价、上市不打折、
+# 未实现收益按 21% 计税。PE 腿不动——other_income 可能已含权益法损益、历史倍数也
+# 已含部分市场对持股的定价，加进去有重复计算风险；只在诊断里给一个参考数。
+HOLD_DISCOUNT = {"private": 0.20, "public": 0.0}
+HOLD_GAIN_TAX = 0.21
+# 上限核对用的 XBRL 投资类科目：**只当上限**，不当数用——几个科目之间可能互相包含
+# （LongTermInvestments 常含权益法与非上市股权），加总只会让上限更松，不会误杀。
+# 它挡的是量级错误：把「持股比例 × 最新一轮估值」当账面值（AI 实验室常是账面的数倍）
+HOLD_CAP_KEYS = ("inv_nonmarketable_equity_instant", "inv_equity_method_instant",
+                 "inv_long_term_instant", "inv_other_long_term_instant",
+                 "afs_securities_total_instant", "equity_securities_st_instant")
+
+
+def holdings_xbrl_cap(facts, max_age_days=400):
+    """XBRL 投资类科目合计（$M）-> (cap|None, {key: [期末, $M]})。
+
+    各科目取最新一期；比全体最新期早 max_age_days 以上的科目剔除（停标的旧概念会把
+    上限撑大）。400 天是为了留住只在 10-K 里标的科目（权益法投资常见）。
+    一个科目都没有返回 (None, {})——调用方据此判「无从核对」，不拿 0 当上限。"""
+    latest = {}
+    for k in HOLD_CAP_KEYS:
+        vals = [(e, v) for e, v in ((facts or {}).get(k) or {}).items()
+                if _isnum(v) and v > 0]
+        if vals:
+            latest[k] = max(vals)
+    if not latest:
+        return None, {}
+    newest = date.fromisoformat(max(e for e, _ in latest.values()))
+    parts = {k: [e, round(v / 1e6, 1)] for k, (e, v) in latest.items()
+             if (newest - date.fromisoformat(e)).days <= max_age_days}
+    return round(sum(p[1] for p in parts.values()), 1), parts
+
+
+def strategic_holdings_value(items, cap, shares, cap_parts=None, tol=0.02):
+    """判断层申报的战略持股 -> (计入 DCF/SOTP 的税后价值 $M, 明细 dict|None, [[level, msg]])。
+
+    没申报（None 或 []）返回 (0.0, None, [])：调用方加 0.0，输出逐位不变。
+    每一处拿不准都走「不计入」（宁缺勿重，缺的只是回到改动前的状态）：
+    - in_net_cash / income_in_operating_income 必须**显式 false** 才计入：前者为真是
+      已在净现金里，后者为真是收益已在营业利润里（倍数和现金流都已含它）
+    - XBRL 没有任何投资类科目可核对 → 整体不计入（黄旗）
+    - 申报账面值合计超过 XBRL 上限 → 整体不计入（红旗，服务层打回判断层一次）
+    计入的每项：账面值 × (1 − 折价) − 21% × max(0, 折价后 − 成本)；没给成本按全额计税。"""
+    if not items:
+        return 0.0, None, []
+    rows, warns = [], []
+    for i, it in enumerate(items):
+        it = it if isinstance(it, dict) else {}
+        name = str(it.get("name") or f"#{i + 1}")
+        cv, kind = it.get("carrying_value_musd"), it.get("kind")
+        if not _isnum(cv) or cv <= 0 or kind not in HOLD_DISCOUNT:
+            rows.append(dict(name=name, counted=False,
+                             reason="字段不全（须有 carrying_value_musd>0 与 kind=private|public）"))
+            continue
+        row = dict(name=name, kind=kind, carrying_musd=round(float(cv), 1))
+        if it.get("in_net_cash") is not False:
+            row.update(counted=False, reason=("已在 net_cash 里" if it.get("in_net_cash") is True
+                                              else "未声明 in_net_cash=false"))
+        elif it.get("income_in_operating_income") is not False:
+            row.update(counted=False,
+                       reason=("收益已在营业利润里" if it.get("income_in_operating_income") is True
+                               else "未声明 income_in_operating_income=false"))
+        else:
+            v = float(cv) * (1 - HOLD_DISCOUNT[kind])
+            basis = it.get("cost_basis_musd")
+            has_basis = _isnum(basis) and basis >= 0
+            tax = HOLD_GAIN_TAX * max(0.0, v - (float(basis) if has_basis else 0.0))
+            row.update(counted=True, after_discount_musd=round(v, 1),
+                       cost_basis_musd=round(float(basis), 1) if has_basis else None,
+                       tax_musd=round(tax, 1), net_musd=round(v - tax, 1))
+        rows.append(row)
+    elig = [r for r in rows if r["counted"]]
+    cv_sum = round(sum(r["carrying_musd"] for r in elig), 1)
+    status = "counted" if elig else "none_eligible"
+    if elig and cap is None:
+        status = "unverified"
+        warns.append(["yellow",
+                      f"战略持股申报账面值 {cv_sum:,.0f}M，但 XBRL 里没有投资类科目可核对上限"
+                      "——本次未计入任何一条腿（宁缺勿错）；如确有，请对照资产负债表人工核对"])
+    elif elig and cv_sum > cap * (1 + tol):
+        status = "over_cap"
+        _p = "、".join(f"{k.replace('_instant', '')} {v[1]:,.0f}M" for k, v in (cap_parts or {}).items())
+        warns.append(["red",
+                      f"战略持股申报账面值合计 {cv_sum:,.0f}M 超过 XBRL 投资类科目合计 "
+                      f"{cap:,.0f}M（{_p}）——请按资产负债表账面值申报（不要用 持股比例×最新一轮"
+                      "估值），并剔除已在 net_cash 里的项；本次未计入任何一条腿"])
+    if status in ("unverified", "over_cap"):
+        for r in elig:
+            r.update(counted=False, reason="未通过 XBRL 上限核对" if status == "over_cap"
+                     else "XBRL 无投资类科目可核对")
+    value = round(sum(r["net_musd"] for r in rows if r["counted"]), 1)
+    skipped = [f"{r['name']}（{r['reason']}）" for r in rows
+               if not r["counted"] and r.get("reason", "").startswith(("未声明", "字段不全"))]
+    if skipped:
+        warns.append(["yellow", "战略持股以下各项未计入——" + "；".join(skipped)])
+    if status == "counted":
+        _it = "；".join(
+            f"{r['name']} 账面 {r['carrying_musd']:,.0f} → 税后 {r['net_musd']:,.0f}"
+            + ("（未给成本，按全额计税）" if r["cost_basis_musd"] is None else "")
+            for r in rows if r["counted"])
+        warns.append(["info",
+                      f"战略持股计入 DCF 与 SOTP（PE 腿不含，诊断里另给参考数）：账面 {cv_sum:,.0f}M"
+                      f" → 折价（非上市 {HOLD_DISCOUNT['private']:.0%}、上市不打折）、未实现收益按 "
+                      f"{HOLD_GAIN_TAX:.0%} 计税 → {value:,.0f}M"
+                      + (f"（每股 {value / shares:.2f}）" if shares else "") + f"。逐项 $M：{_it}"])
+    detail = dict(status=status, value_musd=value,
+                  per_share=round(value / shares, 2) if shares else None,
+                  carrying_musd=cv_sum, cap_musd=cap, cap_parts=cap_parts or {},
+                  discount=dict(HOLD_DISCOUNT), gain_tax=HOLD_GAIN_TAX,
+                  legs=["dcf", "sotp"], items=rows)
+    return value, detail, warns
+
+
 ttm = facts["ttm"]
 rev0 = ttm["revenue"]["value"] / 1e6
 
@@ -1404,6 +1520,16 @@ SOTP_SEG1_CAP = 0.85
 sotp_in_blend = cfg["seg1_share"] < SOTP_SEG1_CAP
 # 无形资产摊销 TTM（0030）：SOTP 摊销加回诊断的输入；老 facts.json 没有该序列 → None
 _AMORT, _AMORT_NOTE = amort_ttm_musd(facts)
+# 战略持股（0033）：只进 DCF 与 SOTP 两条腿的股权价值。没申报时 _HOLD=0.0，下面
+# 每一处都是「+ 0.0」，老 config 重放逐位不变。DCF 的护栏（n.m. 闸、P/FCF、终值占比）
+# 一律按**不含持股**的经营价值判：持股不产生 FCF，不能把一条本该退出综合的腿抬回来
+if cfg.get("strategic_holdings"):
+    _HOLD_CAP, _HOLD_PARTS = holdings_xbrl_cap(facts)
+    _HOLD, _HOLD_D, _HOLD_W = strategic_holdings_value(
+        cfg["strategic_holdings"], _HOLD_CAP, cfg["shares"], _HOLD_PARTS)
+else:
+    _HOLD, _HOLD_D, _HOLD_W = 0.0, None, []
+_hold_ps = _HOLD / cfg["shares"]
 
 out = dict(
     ticker=cfg["ticker"], name=cfg["name"], date=cfg["date"], mode="standard",
@@ -1445,10 +1571,13 @@ for name, s in cfg["scenarios"].items():
     ni1 = (op1 + cfg["other_income"]) * (1 - s["tax"])
     eps1 = ni1 / cfg["fwd_shares"]
     pe_target = eps1 * s["pe"]
+    # dcf_ps / dcf_eq 是**经营**口径（不含战略持股），只喂护栏；进综合与报告的是
+    # dcf_leg = 经营 + 持股（0033）
     dcf_ps, dcf_eq, ddiag = dcf(rev0, s["g0"], s["gN"], s["margins"], s["wacc"], s["tg"],
                                 cfg["net_cash"], cfg["shares"])
+    dcf_leg = dcf_ps + _hold_ps
     sotp_eq = (op1 * cfg["seg1_share"] * s["m1"]
-               + op1 * (1 - cfg["seg1_share"]) * s["m2"] + cfg["net_cash"])
+               + op1 * (1 - cfg["seg1_share"]) * s["m2"] + cfg["net_cash"] + _HOLD)
     sotp_ps = sotp_eq / cfg["shares"]
     # 近零利润守卫：eps1<=0 或情景 opm<2% 时 PE 腿病态——盈利不是市场给这类票
     # 定价的基础，「近零盈利 × 正常倍数 ≈ 0」不是估值是除法事故（COIN 实测
@@ -1468,7 +1597,7 @@ for name, s in cfg["scenarios"].items():
     blend_methods = ((["pe"] if not pe_nm else [])
                      + ([] if dcf_nm else ["dcf"])
                      + (["sotp"] if sotp_in_blend and not sotp_nm else []))
-    _vals = {"pe": pe_target, "dcf": dcf_ps, "sotp": sotp_ps}
+    _vals = {"pe": pe_target, "dcf": dcf_leg, "sotp": sotp_ps}
     # 三条腿全 n.m. 时不能交出空综合：退回 DCF 单腿并在下面打 red。让"无腿可用"
     # 显式失败一次，好过静默 None 流进 Excel 公式与 compare/trend
     _all_nm = not blend_methods
@@ -1497,7 +1626,7 @@ for name, s in cfg["scenarios"].items():
                          f"{name} DCF 腿 n.m.（{dcf_nm_reason}）——现金流锚缺失时"
                          "十年 FCFF 的每一分钱都来自 margins 路径与终值假设，已剔出综合；"
                          "综合仅取 " + "+".join(m.upper() for m in blend_methods)
-                         + f"（DCF 每股 {dcf_ps:.1f} 仍在报告 DCF 页备查）"])
+                         + f"（DCF 每股 {dcf_leg:.1f} 仍在报告 DCF 页备查）"])
     if _all_nm:
         warnings.append(["red", f"{name} 三条腿全部 n.m.（PE/SOTP 已剔、DCF 亦无现金流锚），"
                                 "综合退回 DCF 单腿仅为占位——该情景没有可用的估值支撑，"
@@ -1544,11 +1673,16 @@ for name, s in cfg["scenarios"].items():
             ddiag["ev_ebit_sotp"] = round(
                 cfg["seg1_share"] * s["m1"] + (1 - cfg["seg1_share"]) * s["m2"], 1)
         warnings += _xc
+    if _HOLD:
+        # PE 腿不含持股（0033）：给一个「PE 腿 + 每股持股」的参考数，不进综合
+        ddiag["pe_plus_holdings"] = round(pe_target + _hold_ps, 1)
 
     out["scenarios"][name] = dict(
         assumptions=s, rev1=round(rev1), op1=round(op1), ni1=round(ni1),
         eps1=round(eps1, 2), pe_target=round(pe_target, 1),
-        dcf_ps=round(dcf_ps, 1), sotp_ps=round(sotp_ps, 1),
+        dcf_ps=round(dcf_leg, 1), sotp_ps=round(sotp_ps, 1),
+        # 有持股时并列经营口径，报告/compare 能把两部分分开读
+        **({"dcf_ps_operating": round(dcf_ps, 1)} if _HOLD else {}),
         blend=round(blend, 1), upside=round(blend / cfg["price"] - 1, 4),
         # eps1<=0 时 fwd_pe 是负数假读数，置 None（报告/归档按缺失处理）
         fwd_pe=round(cfg["price"] / eps1, 1) if eps1 > 0 else None,
@@ -1591,6 +1725,10 @@ out["fcf_caliber"] = _fcfd
 # 会计估计变更的申报 vs 原文证据（0025）：走全局通道——与情景假设无关
 out["warnings_global"] += estimate_change_evidence(
     SECTIONS_RAW, bool(cfg.get("accounting_estimate_changes")))
+# 战略持股（0033）：明细进 meta（报告/compare/vintages 读它），核对结论进全局通道
+if _HOLD_D:
+    out["meta"]["strategic_holdings"] = _HOLD_D
+out["warnings_global"] += _HOLD_W
 
 # ---- DCF 终值护栏（2026-08-31）：终值那一个数字撑起 DCF 的大头，却是整份
 # 假设里最不受约束的——原有三道护栏（第10年营收 >8x / 终值占比 >75% /
@@ -1604,7 +1742,7 @@ _bcfg, _bout = cfg["scenarios"]["base"], out["scenarios"]["base"]
 # "36/43/50（±16%）"印成"34/43/48（±20%）"，敏感性被增发/回购幅度污染
 out["scenarios"]["base"]["warnings"] += terminal_sensitivity(
     lambda m: dcf(rev0, _bcfg["g0"], _bcfg["gN"], m, _bcfg["wacc"], _bcfg["tg"],
-                  cfg["net_cash"], cfg["shares"])[0],
+                  cfg["net_cash"], cfg["shares"])[0] + _hold_ps,
     (_bout.get("diagnostics") or {}).get("tv_pv_share"),
     _bcfg["margins"], _bout.get("dcf_ps"))
 
@@ -1759,7 +1897,8 @@ for _ in range(60):
     mid = (lo + hi) / 2
     _, eq, _d = dcf(rev0, mid, s["gN"], s["margins"], s["wacc"], s["tg"],
                     cfg["net_cash"], cfg["shares"])
-    if eq < cfg["mcap"]:
+    # 市值里含市场给战略持股的价（0033）：经营部分 + 持股 才与市值同口径
+    if eq + _HOLD < cfg["mcap"]:
         lo = mid
     else:
         hi = mid
@@ -1772,7 +1911,7 @@ for w in (s["wacc"] - 0.01, s["wacc"] - 0.005, s["wacc"], s["wacc"] + 0.005, s["
     for g in (s["tg"] - 0.01, s["tg"] - 0.005, s["tg"], s["tg"] + 0.005, s["tg"] + 0.01):
         ps, _, _d = dcf(rev0, s["g0"], s["gN"], s["margins"], round(w, 4), round(g, 4),
                         cfg["net_cash"], cfg["shares"])
-        row[round(g, 4)] = round(ps)
+        row[round(g, 4)] = round(ps + _hold_ps)
     sens[round(w, 4)] = row
 out["sensitivity"] = sens
 
@@ -1795,6 +1934,9 @@ print(f"===== {cfg['ticker']} @ ${cfg['price']} (semantics v{out['semantics_vers
 print(f"TTM: rev {ttm_m['revenue']:,} op {ttm_m['op_income']:,} adjNI {cfg['adj_ni']:,} "
       f"adjEPS {out['adj_eps']} FCF {ttm_m['fcf']:,}")
 print(f"反向DCF隐含起始增速: {out['reverse_dcf']:.1%}（base 利润率/WACC 条件下）")
+if _HOLD_D:
+    print(f"战略持股（{_HOLD_D['status']}）: 账面 {_HOLD_D['carrying_musd']:,.0f}M → 计入 "
+          f"{_HOLD_D['value_musd']:,.0f}M（每股 {_HOLD_D['per_share']}），只进 DCF 与 SOTP")
 if out.get("trading_range"):
     _tr = out["trading_range"]
     _sp = _tr.get("span") or {}

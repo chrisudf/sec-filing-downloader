@@ -63,6 +63,7 @@ def _std_cfg(price):
         net_cash=0.0, net_cash_note="x", adj_ni=120.0, adj_note="x",
         other_income=0.0, other_income_note="x", fwd_label="NTM 2026-07~2027-06",
         accounting_estimate_changes=[], accounting_estimate_note="x",
+        strategic_holdings=[], strategic_holdings_note="x",
         seg1="A", seg2="B", seg1_share=0.9, notes=["x"],
         rationale={k: "x" for k in ("g", "opm", "pe", "m1", "rl", "wacc")},
         scenarios=dict(bear=sc(-0.05, 0.06, 18, 10, wacc=0.11),
