@@ -37,6 +37,10 @@
   h1 { font-size: 26px; letter-spacing: .5px; }
   .sub { color: var(--muted); font-size: 13px; margin-top: 6px; }
   .head { display: flex; align-items: center; gap: 14px; margin-bottom: 28px; }
+  a.head-link { margin-left: auto; align-self: flex-start; white-space: nowrap;
+                color: var(--muted); font-size: 12px; text-decoration: none;
+                border: 1px solid var(--border); border-radius: 8px; padding: 5px 10px; }
+  a.head-link:hover { color: var(--accent); border-color: var(--accent); }
   .logo { font-size: 34px; }
   label.section { display: block; color: var(--text); font-size: 14px; font-weight: 600; margin: 22px 0 8px; }
   input[type=text], input[type=email], select {
@@ -156,6 +160,7 @@
       <h1>EDGAR 财报下载器</h1>
       <div class="sub">通过 SEC EDGAR 官方数据库下载财报文件</div>
     </div>
+    <a class="head-link" href="/watchlist.html" title="watchlist 每只票当前 PE 的历史分位 + 前瞻 PE">📋 Watchlist PE</a>
   </div>
 
   <label class="section" for="ticker">公司股票代码</label>

@@ -5,8 +5,10 @@
   python valuation/pe_rank.py [--tickers A,B] [--watchlist PATH] [--out-dir DIR]
 
 票单默认读同级目录 ../watchlist-scanner/watchlist.toml；kind=etf/index 跳过（SEC 无 EPS）。
-结果写 reports/pe_rank/pe_rank_YYYY-MM-DD.{md,csv}（reports/ 已 gitignore），同时打印到终端。
+结果写 reports/pe_rank/pe_rank_YYYY-MM-DD.{md,csv,json}（reports/ 已 gitignore），同时打印到终端；
+json 供网页 /watchlist.html 读（app/pe_rank_service.py），原子写入。
 节奏：分母一季度才跳一次，每周跑一次 + 财报季补跑就够，天天跑没有信息量。
+美股盘中跑的话 yfinance 末根是未收盘 K 线，「收盘」其实是盘中价——报告头会标出来。
 
 列的口径:
   TTM PE / 分位 —— pe_band trailing 口径（XBRL 已公告 TTM EPS × yfinance 日收盘，
@@ -20,14 +22,20 @@
     与 TTM 的 GAAP 不同口径）。Yahoo 的 forwardPE 就是「下财年」这一列，不是 NTM——
     错位财年（NVDA 1 月底）会领先约 16 个月，看起来特别便宜。区间 = 收盘÷预期 high …
     收盘÷预期 low，low ≤ 0 的上沿写「含亏损」。
+  ⚠ —— 标在「本财年 PE」格上：本财年一致预期 90 天内大跳而下财年没动（ref_table 的
+    一次性判据），疑似一次性收益进了预期。只污染这一格，不波及营业线分位。
   分位与前瞻 PE 回答的是两个问题（历史位置 vs 预期兑现后的倍数），要一起读。
 """
 import argparse
 import csv
+import json
+import math
+import os
 import sys
 import tomllib
-from datetime import date
+from datetime import date, datetime
 from pathlib import Path
+from zoneinfo import ZoneInfo
 
 ROOT = Path(__file__).resolve().parent.parent
 sys.path.insert(0, str(Path(__file__).resolve().parent))
@@ -42,6 +50,27 @@ STALE_DAYS = 7    # 带子末点落后最新收盘超过这么多天 = 当前窗
 MIN_DAYS = 250    # 与 pe_band 的 thin_coverage 同一门槛（约一个财年的交易日）
 SKIP_KINDS = ("etf", "index")
 METRICS = (("gaap", "eps", "pe_trailing"), ("op", "opeps", "peop_trailing"))
+ET = ZoneInfo("America/New_York")
+
+
+def us_market_open(now=None):
+    """美股常规时段（周一至五 9:30–16:00 ET，不计节假日）。"""
+    t = (now or datetime.now(ET)).astimezone(ET)
+    return t.weekday() < 5 and (9, 30) <= (t.hour, t.minute) < (16, 0)
+
+
+def one_time_flag(trend):
+    """ref_table 的一次性判据命中 -> {j0, j1}（本/下财年一致预期 90 天变动），否则 None。
+    判据复用，文案不复用（那边的建议是钉 overrides，这张表不适用）。"""
+    if not one_time_warning(trend):
+        return None
+    j0, j1 = (trend[p]["current"] / trend[p]["90daysAgo"] - 1 for p in ("0y", "+1y"))
+    return {"j0": j0, "j1": j1}
+
+
+def one_time_note(flag):
+    return (f"本财年一致预期 90 天内 {flag['j0']:+.0%}、下财年仅 {flag['j1']:+.0%}——"
+            "疑似一次性收益进了预期，本财年 PE 偏低不可信，看下财年")
 
 
 def load_watchlist(path, tickers=None):
@@ -142,11 +171,10 @@ def collect(t, kind, email):
     try:
         cons, trend, _ = fetch_consensus(t)
         row["fwd"] = forward(row["close"], cons)
-        # 判据复用 ref_table，文案不复用（那边的建议是钉 overrides，这张表不适用）
-        if one_time_warning(trend):
-            j0, j1 = (trend[p]["current"] / trend[p]["90daysAgo"] - 1 for p in ("0y", "+1y"))
-            row["notes"].append(f"本财年一致预期 90 天内 {j0:+.0%}、下财年仅 {j1:+.0%}——"
-                                "疑似一次性收益进了预期，本财年 PE 偏低不可信，看下财年")
+        flag = one_time_flag(trend)
+        if flag:
+            row["fwd"]["fy1_suspect"] = flag
+            row["notes"].append(one_time_note(flag))
     except (SystemExit, Exception) as e:   # fetch_consensus 取不到时 raise SystemExit
         row["fwd"] = {}
         row["notes"].append(f"一致预期取不到：{str(e).splitlines()[0][:80]}")
@@ -187,7 +215,8 @@ def _fwd_cells(fw):
         rng = f"{_f(lo)}–含亏损"
     else:
         rng = f"{_f(lo)}–{_f(hi)}"
-    return [_f(fw.get("fy1_pe"), suffix="x"), _f(fw.get("fy2_pe"), suffix="x"), rng]
+    fy1 = _f(fw.get("fy1_pe"), suffix="x") + ("⚠" if fw.get("fy1_suspect") else "")
+    return [fy1, _f(fw.get("fy2_pe"), suffix="x"), rng]
 
 
 HEADER = ["票", "收盘", "TTM PE", "10y", "5y", "3y", "3y P10/50/90",
@@ -195,13 +224,19 @@ HEADER = ["票", "收盘", "TTM PE", "10y", "5y", "3y", "3y P10/50/90",
           "本财年 PE", "下财年 PE", "下财年区间", "下财年", "Yahoo tPE", "PEG"]
 
 
-def render(rows, asof):
+INTRADAY_NOTE = "⚠ 运行时美股在盘中：「收盘」列是盘中价，分位与前瞻 PE 随之浮动"
+
+
+def render(rows, asof, intraday=False):
     """-> (markdown 全文, 脚注列表)。纯函数。"""
     md = [f"# Watchlist PE 分位 · {asof}", "",
           "TTM PE 与分位 = SEC XBRL 已公告 TTM EPS × yfinance 收盘（pe_band trailing）；"
           "† = 当前窗口被剔，显示末个有效点；本/下财年 PE = 收盘 ÷ yfinance 一致预期"
-          "（Yahoo forwardPE = 下财年列，不是 NTM）。口径细节见 valuation/pe_rank.py 文件头。", "",
-          "| " + " | ".join(HEADER) + " |", "|" + "---|" * len(HEADER)]
+          "（Yahoo forwardPE = 下财年列，不是 NTM）；⚠ = 本财年预期疑含一次性收益。"
+          "口径细节见 valuation/pe_rank.py 文件头。", ""]
+    if intraday:
+        md += [f"**{INTRADAY_NOTE}**", ""]
+    md += ["| " + " | ".join(HEADER) + " |", "|" + "---|" * len(HEADER)]
     notes = []
     for r in rows:
         t = r["ticker"]
@@ -243,12 +278,42 @@ def csv_rows(rows):
         for k in ("fy1_eps", "fy1_pe", "fy1_n", "fy2_eps", "fy2_pe", "fy2_n",
                   "fy2_pe_lo", "fy2_pe_hi"):
             rec[k] = fw.get(k)
+        rec["fy1_suspect"] = bool(fw.get("fy1_suspect"))
         labels = r.get("fy_labels") or (None, None)
         rec["fy1_label"], rec["fy2_label"] = labels
         yh = r.get("yh") or {}
         rec["yahoo_tpe"], rec["yahoo_peg"] = yh.get("tpe"), yh.get("peg")
         out.append(rec)
     return out
+
+
+def _jsonable(o):
+    """NaN/inf -> None（JSON 规范没有 NaN，浏览器 JSON.parse 直接抛）、date -> ISO、
+    tuple -> list。yfinance 的 info 字段偶发 NaN。"""
+    if isinstance(o, float):
+        return o if math.isfinite(o) else None
+    if isinstance(o, date):
+        return o.isoformat()
+    if isinstance(o, dict):
+        return {str(k): _jsonable(v) for k, v in o.items()}
+    if isinstance(o, (list, tuple)):
+        return [_jsonable(v) for v in o]
+    return o
+
+
+def payload(rows, notes, asof, generated_at, intraday, watchlist):
+    """网页读的 JSON（纯函数）。px_date = 各票最新价格日的最大值（=「数据截至」）。"""
+    px = [r["px_date"] for r in rows if r.get("px_date")]
+    return _jsonable({"asof": asof, "generated_at": generated_at, "intraday": intraday,
+                      "px_date": max(px) if px else None, "watchlist": str(watchlist),
+                      "header": HEADER, "rows": rows, "notes": notes})
+
+
+def write_atomic(path, text):
+    """先写临时文件再 os.replace：网页刷新和定时任务可能撞车，读者不能读到半截文件。"""
+    tmp = path.with_name(f".{path.name}.tmp")
+    tmp.write_text(text, encoding="utf-8")
+    os.replace(tmp, path)
 
 
 def main():
@@ -262,13 +327,16 @@ def main():
         s.reconfigure(encoding="utf-8", errors="replace")
 
     email = contact_email()
+    intraday = us_market_open()
+    tickers = load_watchlist(a.watchlist, a.tickers)
     rows = []
-    for t, kind in load_watchlist(a.watchlist, a.tickers):
-        print(f"… {t}", file=sys.stderr, flush=True)
+    for i, (t, kind) in enumerate(tickers, 1):
+        # 「[i/n] 票」是 app/pe_rank_service.py 解析进度的格式，改这里要同步改那边
+        print(f"[{i}/{len(tickers)}] {t}", file=sys.stderr, flush=True)
         rows.append(collect(t, kind, email))
 
     asof = date.today().isoformat()
-    text, _ = render(rows, asof)
+    text, notes = render(rows, asof, intraday)
     out = Path(a.out_dir)
     out.mkdir(parents=True, exist_ok=True)
     (out / f"pe_rank_{asof}.md").write_text(text, encoding="utf-8")
@@ -277,8 +345,11 @@ def main():
         w = csv.DictWriter(fh, fieldnames=list(recs[0]))
         w.writeheader()
         w.writerows(recs)
+    gen = datetime.now().astimezone().isoformat(timespec="seconds")
+    write_atomic(out / f"pe_rank_{asof}.json", json.dumps(
+        payload(rows, notes, asof, gen, intraday, a.watchlist), ensure_ascii=False))
     print(text)
-    print(f"已写出 {out / f'pe_rank_{asof}.md'} 与 .csv", file=sys.stderr)
+    print(f"已写出 {out / f'pe_rank_{asof}'}.md / .csv / .json", file=sys.stderr)
 
 
 if __name__ == "__main__":
