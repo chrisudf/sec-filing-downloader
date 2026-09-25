@@ -71,9 +71,13 @@ sec-filing-downloader/
 ├── app/
 │   ├── main.py                # FastAPI 入口：/api/company、/api/download、静态托管
 │   ├── edgar.py               # SEC EDGAR 客户端：查询、过滤、下载、重命名、打包
-│   └── valuation_service.py   # 估值任务管道：/api/valuation 提交/轮询/下载
+│   ├── valuation_service.py   # 估值任务管道：/api/valuation 提交/轮询/下载
+│   └── pe_rank_service.py     # Watchlist PE：/api/pe_rank 读最近一份 + 后台刷新
 ├── static/
-│   └── index.html             # 深色主题单页前端（原生 JS，无构建步骤）
+│   ├── index.html             # 深色主题单页前端（原生 JS，无构建步骤）
+│   └── watchlist.html/.js     # Watchlist PE 分位页（入口在首页右上角）
+├── scripts/
+│   └── pe_rank_weekly.ps1     # 注册/删除每周定时任务（Windows 任务计划程序）
 ├── valuation/                 # 估值确定性计算层 + 判断层提示词
 │   ├── fetch_facts.py         # XBRL companyfacts 取数（多标签合并/Q4推导/TTM/SBC/带子/Ro40）
 │   ├── pe_band.py             # 历史 PE/P.S/P.TBV 分位带（三口径 + 畸变剔除 + 逆向匹配）
@@ -216,10 +220,24 @@ python valuation/pe_rank.py --tickers MSFT,NVDA
 ```
 
 `pe_rank.py` 把 pe_band（trailing 口径，GAAP 与营业线两组）和 yfinance 一致预期拼成一张表，
-写 `reports/pe_rank/pe_rank_YYYY-MM-DD.{md,csv}`。ETF/指数跳过（SEC 无 EPS），外国发行人与
+写 `reports/pe_rank/pe_rank_YYYY-MM-DD.{md,csv,json}`。ETF/指数跳过（SEC 无 EPS），外国发行人与
 刚转盈的票只出前瞻列。`†` = 当前 TTM 窗口被畸变守卫剔除（AMZN/GOOG 2026Q2 私募重估型），
-此时看营业线那组。注意 Yahoo 的 forwardPE 是**下财年**预期，不是 NTM。分母一季度才跳一次，
-每周跑一次 + 财报季补跑即可。
+此时看营业线那组；`⚠` 标在「本财年 PE」格 = 本财年一致预期疑含一次性收益。注意 Yahoo 的
+forwardPE 是**下财年**预期，不是 NTM。美股盘中跑会拿到盘中价，报告头与网页都会标出。
+
+**网页**：首页右上角「📋 Watchlist PE」→ `/watchlist.html`，读最近一份 json；「刷新」在后台
+重跑（约 5 分钟，逐票进度），可按分位/下财年 PE 排序，点票名开财务图表。
+
+![Watchlist PE 分位页](docs/watchlist.png)
+
+**每周定时**（分母一季度才跳一次，每周一次 + 财报季手动补跑就够）：
+
+```powershell
+powershell -ExecutionPolicy Bypass -File scripts\pe_rank_weekly.ps1              # 周六 08:00（本机时区）
+powershell -ExecutionPolicy Bypass -File scripts\pe_rank_weekly.ps1 -Unregister  # 删除
+```
+
+后台静默运行，错过时点（电脑没开）下次可用时补跑，日志追加到 `reports/pe_rank/scheduled.log`。
 
 `trend.py` 与普通趋势表的区别在于**把季度间的变化和同一报告期内的采样噪声放在一起看**。
 判断层有运行间噪声（MSFT 实测 base 综合目标价 CV 2.4%，NVDA bear CV≈12%），

@@ -1,0 +1,158 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Watchlist PE 分位 · EDGAR 财报下载器</title>
+<style>
+  :root {
+    --bg: #0b0c10;
+    --card: #14151c;
+    --card2: #101118;
+    --border: #2a2b36;
+    --text: #e8e8ee;
+    --muted: #8b8c9a;
+    --accent: #7c7ff3;
+    --accent-dim: #23244a;
+    --err: #f37c7c;
+    --ok: #7cf3a8;
+    --warn: #e0a63f;
+  }
+  * { box-sizing: border-box; margin: 0; padding: 0; }
+  body {
+    background: var(--bg);
+    color: var(--text);
+    font-family: "Segoe UI", "Microsoft YaHei", system-ui, sans-serif;
+    padding-bottom: 48px;
+  }
+  .wrap { max-width: 1400px; margin: 0 auto; padding: 0 16px; }
+  .topbar {
+    position: sticky; top: 0; z-index: 10;
+    background: rgba(11, 12, 16, .92);
+    backdrop-filter: blur(6px);
+    border-bottom: 1px solid var(--border);
+    padding: 14px 0;
+  }
+  .topbar .wrap { display: flex; align-items: center; gap: 12px; flex-wrap: wrap; }
+  .brand { display: flex; align-items: baseline; gap: 10px; margin-right: 8px; }
+  .brand h1 { font-size: 18px; white-space: nowrap; }
+  .brand a { color: var(--muted); font-size: 12px; text-decoration: none; white-space: nowrap; }
+  .brand a:hover { color: var(--accent); }
+  select {
+    background: var(--card2); border: 1px solid var(--border); border-radius: 10px;
+    color: var(--text); font-size: 13px; padding: 8px 10px; outline: none;
+  }
+  select:focus { border-color: var(--accent); }
+  button.go {
+    background: var(--accent); color: #fff; border: none; border-radius: 10px;
+    font-size: 14px; font-weight: 700; padding: 9px 22px; cursor: pointer;
+  }
+  button.go:hover { filter: brightness(1.08); }
+  button.go:disabled { opacity: .5; cursor: wait; }
+  .meta { color: var(--muted); font-size: 13px; }
+  .meta b { color: var(--text); font-weight: 600; }
+  .status { font-size: 13px; color: var(--muted); }
+  .status.err { color: var(--err); white-space: pre-wrap; }
+  .status.ok { color: var(--ok); }
+  .spacer { flex: 1; }
+  .banner { border-radius: 10px; padding: 12px 16px; font-size: 14px; margin-top: 16px;
+            background: rgba(201, 133, 0, .12); color: var(--warn);
+            border: 1px solid rgba(201, 133, 0, .4); }
+  .card { background: var(--card); border: 1px solid var(--border); border-radius: 16px;
+          padding: 18px 20px; margin-top: 16px; }
+  .card h2 { font-size: 15px; letter-spacing: .3px; }
+  .card .sub { color: var(--muted); font-size: 12px; margin-top: 4px; line-height: 1.6; }
+  .scroll { overflow-x: auto; margin-top: 12px; }
+  table { border-collapse: collapse; font-size: 13px; width: 100%;
+          font-variant-numeric: tabular-nums; }
+  th, td { padding: 8px 10px; border-bottom: 1px solid var(--border);
+           white-space: nowrap; text-align: right; }
+  th { color: var(--muted); font-weight: 600; font-size: 12px; }
+  thead tr:first-child th { border-bottom: none; padding-bottom: 2px; }
+  th.grp { text-align: center; color: var(--text); font-size: 12px;
+           border-bottom: 1px solid var(--border); }
+  td.gstart, th.gstart { border-left: 1px solid var(--border); }
+  /* 票名列在横向滚动时钉住（手机上表格比屏幕宽） */
+  th.tk, td.tk { position: sticky; left: 0; background: var(--card); text-align: left; z-index: 1; }
+  td.tk a { color: var(--text); text-decoration: none; font-weight: 700; }
+  td.tk a:hover { color: var(--accent); }
+  td.tk a span { color: var(--muted); font-weight: 400; font-size: 11px; }
+  td.pct { font-weight: 600; }
+  td.na { color: var(--muted); }
+  .skipline { color: var(--muted); font-size: 12px; margin-top: 10px; }
+  .mark { color: var(--warn); font-weight: 700; cursor: help; }
+  [title] { cursor: help; }
+  td.tk a[title] { cursor: pointer; }
+  ul.notes { margin: 10px 0 0 18px; color: var(--muted); font-size: 12px; line-height: 1.8; }
+  details summary { cursor: pointer; }
+  .legend { display: inline-flex; gap: 4px; vertical-align: middle; margin: 0 4px; }
+  .legend i { display: inline-block; width: 16px; height: 12px; border-radius: 3px; }
+  #empty { text-align: center; color: var(--muted); padding: 80px 20px; font-size: 14px; line-height: 2; }
+  @media (max-width: 640px) {
+    th, td { padding: 7px 8px; font-size: 12px; }
+    .card { padding: 14px 12px; }
+  }
+</style>
+</head>
+<body>
+<div class="topbar">
+  <div class="wrap">
+    <div class="brand">
+      <h1>📋 Watchlist PE 分位</h1>
+      <a href="/">← 下载器</a>
+    </div>
+    <span class="meta" id="meta"></span>
+    <span class="spacer"></span>
+    <select id="sort" title="排序">
+      <option value="">票单顺序</option>
+      <option value="gaap.r10">TTM 10 年分位</option>
+      <option value="op.r10">营业线 10 年分位</option>
+      <option value="gaap.r3">TTM 3 年分位</option>
+      <option value="fwd.fy2_pe">下财年 PE</option>
+    </select>
+    <button class="go" id="refresh">刷新</button>
+    <span class="status" id="status"></span>
+  </div>
+</div>
+
+<div class="wrap">
+  <div id="banner" class="banner" style="display:none"></div>
+  <div id="empty" style="display:none">
+    <div style="font-size:40px">📋</div>
+    还没有结果——点右上角「刷新」生成第一份（约 5 分钟）<br>
+    也可以命令行跑 <code>python valuation/pe_rank.py</code>，每周六早上定时任务会自动跑
+  </div>
+  <div id="main" style="display:none">
+    <div class="card">
+      <h2>当前 PE 在自己历史里的位置</h2>
+      <div class="sub">
+        分位底色 P0 <span class="legend" id="legend"></span> P100，越蓝 = 分位越高（在自己历史里越贵）。
+        分位只描述历史位置，不是买卖信号——要和右边的前瞻 PE 一起读。
+        <span class="mark">†</span> 当前窗口被剔、显示末个有效点；
+        <span class="mark">⚠</span> 本财年一致预期疑含一次性收益。表头、格子悬停都有解释，点票名打开财务图表。
+      </div>
+      <div class="scroll"><table id="tbl"></table></div>
+      <div class="skipline" id="skipped"></div>
+    </div>
+    <div class="card">
+      <h2>脚注</h2>
+      <ul class="notes" id="notes"></ul>
+    </div>
+    <div class="card">
+      <details>
+        <summary><h2 style="display:inline">怎么读这张表</h2></summary>
+        <ul class="notes">
+          <li><b>TTM · GAAP P/E</b>（trailing P/E）：收盘 ÷ SEC XBRL 已公告的滚动四季 GAAP 稀释 EPS。防前视（按 filed 日生效）、拆股归一、一次性畸变与近零分母都已剔除。</li>
+          <li><b>营业利润 · P/NOPAT</b>（price-to-NOPAT，NOPAT = Net Operating Profit After Tax）：市值 ÷ 营业利润 ×(1−21%)。营业线以下的一次性收益（如 AMZN/GOOG 的 Anthropic 重估）、利息收支影响不到它。税率是常数，不影响排序；但绝对值不能和 GAAP P/E 直接比。它不是 EV/EBIT（那个用企业价值、税前），也不是标普说的 “operating earnings”（剔除一次性项目后的调整 EPS）。</li>
+          <li><b>10y / 5y / 3y</b>：以 5 年为主，10 年、3 年交叉验证。三个一致才可靠；不一致说明结论取决于窗口，信号弱。业务变过的公司（NVDA、AMZN）10 年窗口要打折。</li>
+          <li><b>P3</b>：有效交易日里约 3% 的日子 PE 比现在低。只算有效日；不是概率；TTM 分位低也可能是 EPS 暴涨。</li>
+          <li><b>近3年 P10 / P50 / P90</b>：把近 3 年每个交易日的 PE 从低到高排——10% 的日子低于 P10，一半低于 P50（中位数），90% 低于 P90。例：NVDA 33 / 51 / 73 = 近 3 年一半时间 PE 低于 51x，只有 10% 的时间低于 33x。</li>
+          <li><b>本财年 / 下财年 PE</b>：收盘 ÷ yfinance 一致预期（分析师口径，通常是调整后）。Yahoo 的 forwardPE 就是「下财年」这一列，不是未来 12 个月——错位财年（NVDA）会领先约 16 个月。</li>
+        </ul>
+      </details>
+    </div>
+  </div>
+</div>
+<script src="/watchlist.js"></script>
+</body>
+</html>

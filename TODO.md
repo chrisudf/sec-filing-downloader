@@ -491,11 +491,14 @@ IBM 估值（base $194 vs 现价 $231）复盘时查出三处**数据层**缺口
 - [x] CLI：pe_band trailing（GAAP + 营业线）10/5/3 年分位 + yfinance 本/下财年 PE 与区间，
       写 `reports/pe_rank/`。首跑 17 票：9 只出分位，SOFI/HOOD（转盈 <1 年）、RKLB、SPCX、
       TSM（无季度 XBRL）只出前瞻列，ETF 跳过。
-- [ ] ⚠（本财年一致预期疑含一次性收益）目前只在脚注——标到「本财年 PE」那一格上，
-      否则读者会以为整行（含营业线分位）都被污染
-- [ ] 网页：`GET /api/pe_rank` 读最近一份 + 刷新按钮（后台重跑 ~5 分钟，照估值任务轮询），
-      首页加 Watchlist PE 区块
-- [ ] 定时：每周一次（布里斯班周六早上 = 周五美股收盘后；盘中跑会拿到未收盘 K 线）
+- [x] ⚠ 标到「本财年 PE」格上（md/csv/网页三处同源 `fwd.fy1_suspect`），不再只在脚注——
+      否则读者会以为整行（含营业线分位）都被污染（2026-09-25）
+- [x] 网页 `/watchlist.html`：`GET /api/pe_rank` 读最近一份 json + `POST /api/pe_rank/refresh`
+      子进程后台重跑、`[i/n] 票` 进度轮询；分位只用明度（不用红绿，免得读成买卖信号）；
+      †/⚠ 悬停给原因；盘中刷新先确认；结果超过 8 天标黄（定时任务没跑）（2026-09-25）
+- [x] 每周定时：`scripts/pe_rank_weekly.ps1` 注册 Windows 任务，周六 08:00 布里斯班 =
+      美东周五收盘后；conhost --headless 不弹窗、StartWhenAvailable 补跑（2026-09-25）
+- [ ] dashboard 单票页加一张小卡片，直接显示该票在批量表里的那一行（复用同一份 json）
 - [ ] 方案 B：并进 droplet 上的 watchlist-scanner，结果进扫描邮件（需把 pe_band 带过去）
 
 ## 🚀 v0.5 — 部署与产品化

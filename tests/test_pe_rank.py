@@ -119,16 +119,24 @@ def _row(**over):
 def test_render_columns_align():
     stale = dict(_row()["gaap"], fresh=False, date="2026-07-30")
     rows = [_row(), _row(ticker="AMZN", gaap=stale),
-            {"ticker": "QQQ", "skip": "index：SEC 无 EPS"},
-            _row(ticker="RKLB", gaap={"err": "样本不足"}, op={"err": "样本不足"})]
+            {"ticker": "QQQ", "kind": "index", "skip": pr.ETF_SKIP},
+            _row(ticker="RKLB", gaap={"err": "样本不足"}, op={"err": "样本不足"}),
+            {"ticker": "GLD", "kind": "etf", "skip": pr.ETF_SKIP},
+            {"ticker": "XYZ", "skip": "yfinance 取不到 XYZ 价格"}]
     text, notes = pr.render(rows, "2026-09-24")
     table = [ln for ln in text.splitlines() if ln.startswith("| ")]
-    assert len(table) == 1 + len(rows)
+    # 跳过的票不占表格行：表头 + 3 只有数的票
+    assert len(table) == 1 + 3
+    assert not any(ln.startswith(("| QQQ", "| GLD", "| XYZ")) for ln in table)
     assert all(ln.count("|") == len(pr.HEADER) + 1 for ln in table)
+    # 汇成表格下方一行，同因合并、不同因分开
+    assert f"未纳入：QQQ、GLD（{pr.ETF_SKIP}）；XYZ（yfinance 取不到 XYZ 价格）" in text
     assert "28.5x†07-30" in text
     assert any("AMZN TTM: 当前 TTM 窗口被剔" in n for n in notes)
-    assert any(n.startswith("QQQ: 跳过") for n in notes)
+    assert not any("QQQ" in n or "GLD" in n for n in notes)   # 脚注也不再逐条列
     assert any("RKLB 营业线: 样本不足" in n for n in notes)
+    assert pr.skipped_line([_row()]) is None
+    assert "未纳入" not in pr.render([_row()], "2026-09-24")[0]
 
 
 def test_csv_rows_flatten_all_kinds():
@@ -144,3 +152,78 @@ def test_load_watchlist(tmp_path):
     assert pr.load_watchlist(f) == [("QQQ", "index"), ("MSFT", "stock")]
     assert pr.load_watchlist(f, "msft, nvda") == [("MSFT", "stock"), ("NVDA", "stock")]
     assert pr.load_watchlist(tmp_path / "missing.toml", "aapl") == [("AAPL", "stock")]
+
+
+# ---- ⚠ 标到「本财年 PE」格 / 盘中判定 / 网页 JSON ----
+
+def _trend(a0, c0, a1, c1):
+    return {"0y": {"90daysAgo": a0, "current": c0}, "+1y": {"90daysAgo": a1, "current": c1}}
+
+
+def test_one_time_flag_marks_only_fy1_cell():
+    # AMZN 2026-08 实测：0y 8.57→12.11（+41%），+1y 只 +5.5%
+    flag = pr.one_time_flag(_trend(8.57, 12.11, 9.90, 10.45))
+    assert round(flag["j0"], 2) == 0.41 and round(flag["j1"], 3) == 0.056
+    assert "+41%" in pr.one_time_note(flag)
+    fw = dict(pr.forward(249.27, {"fy1": {"avg": 12.87, "low": 9, "high": 15, "n": 50},
+                                  "fy2": {"avg": 10.47, "low": 8.69, "high": 15.04, "n": 50}}),
+              fy1_suspect=flag)
+    cells = pr._fwd_cells(fw)
+    assert cells[0].endswith("⚠") and "⚠" not in cells[1] + cells[2]
+    # 基本面上修两年一起抬：不是一次性
+    assert pr.one_time_flag(_trend(8.0, 9.6, 9.0, 10.8)) is None
+    assert pr.one_time_flag(None) is None
+
+
+def test_fy1_suspect_reaches_csv_and_table():
+    flag = {"j0": 0.48, "j1": 0.05}
+    r = _row()
+    r["fwd"] = dict(r["fwd"], fy1_pe=19.4, fy1_suspect=flag)
+    text, _ = pr.render([r], "2026-09-24")
+    assert "19.4x⚠" in text
+    assert pr.csv_rows([r])[0]["fy1_suspect"] is True
+    assert pr.csv_rows([_row()])[0]["fy1_suspect"] is False
+
+
+def test_us_market_open():
+    from datetime import datetime
+    ET = pr.ET
+    assert pr.us_market_open(datetime(2026, 9, 25, 10, 0, tzinfo=ET))       # 周五盘中
+    assert not pr.us_market_open(datetime(2026, 9, 25, 9, 29, tzinfo=ET))
+    assert not pr.us_market_open(datetime(2026, 9, 25, 16, 0, tzinfo=ET))
+    assert not pr.us_market_open(datetime(2026, 9, 26, 11, 0, tzinfo=ET))   # 周六
+    # 定时任务的时点：布里斯班周六 08:00 = 美东周五 18:00（已收盘）
+    from zoneinfo import ZoneInfo
+    assert not pr.us_market_open(datetime(2026, 9, 26, 8, 0, tzinfo=ZoneInfo("Australia/Brisbane")))
+    # 布里斯班周六 00:30 = 美东周五 10:30（盘中）
+    assert pr.us_market_open(datetime(2026, 9, 26, 0, 30, tzinfo=ZoneInfo("Australia/Brisbane")))
+
+
+def test_render_marks_intraday():
+    assert pr.INTRADAY_NOTE in pr.render([_row()], "2026-09-25", intraday=True)[0]
+    assert pr.INTRADAY_NOTE not in pr.render([_row()], "2026-09-25")[0]
+
+
+def test_payload_is_strict_json():
+    import json
+    nan = float("nan")
+    rows = [_row(yh={"tpe": nan, "peg": None}),
+            _row(ticker="MSFT", px_date=TODAY - timedelta(days=3)),
+            {"ticker": "QQQ", "skip": "index"}]
+    p = pr.payload(rows, ["n1"], "2026-09-25", "2026-09-25T08:00:00+10:00", False, "w.toml")
+    s = json.dumps(p, allow_nan=False)            # NaN 残留会在这里抛
+    back = json.loads(s)
+    assert back["px_date"] == TODAY.isoformat()   # 取各票最大价格日
+    assert back["rows"][0]["yh"]["tpe"] is None
+    assert back["rows"][0]["gaap"]["p3"]["50"] == 51           # int 键 -> str 键
+    assert back["rows"][0]["fy_labels"] == ["FY2027(至2027-01)", "FY2028(至2028-01)"]
+    assert back["header"] == pr.HEADER and back["notes"] == ["n1"]
+    assert back["skipped"] == "未纳入：QQQ（index）"          # 网页与 md 同一行文字
+
+
+def test_write_atomic_leaves_no_tmp(tmp_path):
+    f = tmp_path / "pe_rank_2026-09-25.json"
+    pr.write_atomic(f, '{"a": 1}')
+    pr.write_atomic(f, '{"a": 2}')
+    assert f.read_text(encoding="utf-8") == '{"a": 2}'
+    assert [p.name for p in tmp_path.iterdir()] == [f.name]
