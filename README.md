@@ -228,6 +228,8 @@ forwardPE 是**下财年**预期，不是 NTM。美股盘中跑会拿到盘中�
 **网页**：首页右上角「📋 Watchlist PE」→ `/watchlist.html`，读最近一份 json；「刷新」在后台
 重跑（约 5 分钟，逐票进度），可按分位/下财年 PE 排序，点票名开财务图表。
 
+![Watchlist PE 分位页](docs/watchlist.png)
+
 **每周定时**（分母一季度才跳一次，每周一次 + 财报季手动补跑就够）：
 
 ```powershell
