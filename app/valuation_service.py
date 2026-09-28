@@ -1038,7 +1038,36 @@ def _compact_facts(facts: dict) -> str:
     if _lt and _li and list(_lt.items())[-1] == list(_li.items())[-1]:
         lines.append("  ⚠ 「长期有价证券」取自泛标签 LongTermInvestments（常含权益法与非上市股权）："
                      "net_cash 若用了它，其中的战略持股必须标 in_net_cash=true")
+    _nb = _nonmarketable_cost(facts)
+    if _nb:
+        lines.append(f"  非上市股权成本（XBRL 推算，{_nb['end']}）≈ 账面 {_nb['amount']:,.0f} − 累计上调 "
+                     f"{_nb['up']:,.0f} + 累计下调/减值 {_nb['down']:,.0f} = {_nb['cost']:,.0f}M"
+                     "——申报计量替代法这一块持股时用作 cost_basis_musd（只拆出其中一部分时按比例）")
     return "\n".join(lines)
+
+
+def _nonmarketable_cost(facts: dict) -> dict | None:
+    """计量替代法非上市股权的成本（$M）：账面值 − 累计上调 + 累计下调/减值（0034）。
+
+    三个科目必须标在同一期末，否则不推（混期相减没有意义）。下调与减值两个标签可能
+    互相包含（GOOG 的下调行写明 including impairments），取两者较大值而不是相加——
+    宁可成本推低一点多扣点税，也不把同一笔减值加两次把成本推高。
+    没标累计上调（AMZN 只标当期调整）就不推：返回 None，判断层照旧按附注原文找成本。"""
+    amt = facts.get("inv_nonmarketable_equity_instant") or {}
+    up = facts.get("inv_nonmarketable_up_cum_instant") or {}
+    if not amt or not up:
+        return None
+    end, a = list(amt.items())[-1]
+    u = up.get(end)
+    if not _isnum(u) or not _isnum(a) or a <= 0:
+        return None
+    downs = [(facts.get(k) or {}).get(end) for k in ("inv_nonmarketable_down_cum_instant",
+                                                      "inv_nonmarketable_impair_cum_instant")]
+    d = max([abs(x) for x in downs if _isnum(x)], default=0.0)
+    cost = a - u + d
+    if cost <= 0:
+        return None
+    return {"end": end, "amount": a / 1e6, "up": u / 1e6, "down": d / 1e6, "cost": cost / 1e6}
 
 
 def _compact_facts_financials(facts: dict) -> str:

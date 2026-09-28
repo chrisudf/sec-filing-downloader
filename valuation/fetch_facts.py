@@ -183,6 +183,18 @@ SPEC = {
     "inv_equity_method": _item(["EquityMethodInvestments"], i=True),
     "inv_long_term": _item(["LongTermInvestments"], i=True),
     "inv_other_long_term": _item(["OtherLongTermInvestments"], i=True),
+    # 计量替代法的累计调整（0034）：成本 ≈ 账面值 − 累计上调 + 累计下调/减值。判断层据此给
+    # strategic_holdings 的 cost_basis_musd——没给成本时引擎按全额计税，GOOG 124.3B 实测
+    # 因此多扣了约 10B（原文「Total initial cost」47,642M，正好等于这三项推出来的数）
+    "inv_nonmarketable_up_cum": _item(
+        ["EquitySecuritiesWithoutReadilyDeterminableFairValueUpwardPriceAdjustmentCumulativeAmount"],
+        i=True),
+    "inv_nonmarketable_down_cum": _item(
+        ["EquitySecuritiesWithoutReadilyDeterminableFairValueDownwardPriceAdjustmentCumulativeAmount"],
+        i=True),
+    "inv_nonmarketable_impair_cum": _item(
+        ["EquitySecuritiesWithoutReadilyDeterminableFairValueImpairmentLossCumulativeAmount"],
+        i=True),
     # SOFI 2023 起资产负债表 Debt 行只标长短期合并口径；后三个覆盖
     # REIT/保险的无分类资产负债表（O $25B、MET $14.5B 曾整列 null）
     "debt_combined": _item(["DebtLongtermAndShorttermCombinedAmount",
