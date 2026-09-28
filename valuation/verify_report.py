@@ -82,6 +82,10 @@ checks = [
 # 列号按与 build_report 完全相同的规则算出来，而不是写死 D：那边的 _qs 是
 # 「引擎给了哪几档分位就出哪几列」，哪天分位档位变了，写死的列会静默核对到隔壁
 # 分位上——校验层比对错单元格比不比对更坏（会给出"全部一致 ✓"的假保证）。
+# 战略持股（0033）：计入时 情景假设!B29 是 DCF/SOTP 桥的一部分，数值要与引擎同源
+_sh = (d.get("meta") or {}).get("strategic_holdings") or {}
+if _sh.get("status") == "counted" and (_sh.get("value_musd") or 0) > 0:
+    checks.append(("战略持股", ("情景假设", "B29"), _sh["value_musd"], 0.5))
 _tr = d.get("trading_range") or {}
 if (_tr.get("px") or {}).get("50") is not None:
     from openpyxl.utils import get_column_letter

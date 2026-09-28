@@ -93,6 +93,19 @@ if _fw_o != _fw_n:
               "（跨季对比属正常；g/eps1 的分母窗口不同，幅度对比留意口径）\n")
 
 
+# 战略持股（0033）：只进 DCF/SOTP。一次有一次没有（或金额变了）时，这两条腿与综合的
+# 水平差异里有一块是持股，不是经营假设变了
+def _hold_ps(v):
+    sh = (v.get("meta") or {}).get("strategic_holdings") or {}
+    return (sh.get("per_share") or 0) if sh.get("status") == "counted" else 0
+
+
+_hp_o, _hp_n = _hold_ps(old), _hold_ps(new)
+if abs(_hp_n - _hp_o) >= 0.01:
+    print(f"⚠️  战略持股每股值不同（{_hp_o:.2f} → {_hp_n:.2f}）：DCF/SOTP 腿含持股、PE 腿不含，"
+          "③ 里这两条腿与综合的水平差异先扣掉这一块再读\n")
+
+
 def chg(a, b, pct=False):
     if a in (None, 0) or b is None:
         return "—"
