@@ -477,3 +477,52 @@ def test_compact_facts_flags_long_term_investments_overlap():
     assert "泛标签 LongTermInvestments" not in _compact_facts(f)
     f["inv_long_term_instant"] = {"2026-06-30": 36348e6}
     assert "必须标 in_net_cash=true" in _compact_facts(f)
+
+
+# ======================= 计量替代法成本推算（0034）=======================
+
+def _nm_facts(**over):
+    from tests.test_prompt_injection import _facts as inj_facts
+    f = inj_facts()
+    f.update({"inv_nonmarketable_equity_instant": {"2026-06-30": 124259e6},
+              "inv_nonmarketable_up_cum_instant": {"2026-06-30": 85732e6},
+              "inv_nonmarketable_down_cum_instant": {"2026-06-30": 9115e6}})
+    f.update(over)
+    return f
+
+
+def test_nonmarketable_cost_matches_goog_initial_cost():
+    """GOOG 10-Q 2026-06-30：124,259 − 85,732 + 9,115 = 47,642 = 附注「Total initial cost」。"""
+    from app.valuation_service import _nonmarketable_cost
+    nb = _nonmarketable_cost(_nm_facts())
+    assert nb["cost"] == pytest.approx(47642.0) and nb["end"] == "2026-06-30"
+    assert "= 47,642M" in _compact_facts(_nm_facts())
+
+
+def test_nonmarketable_cost_takes_larger_of_down_and_impairment():
+    """下调与减值可能互相包含（GOOG 的下调行 including impairments）：取较大值不相加，
+    宁可成本推低多扣点税，也不把同一笔减值加两次。"""
+    from app.valuation_service import _nonmarketable_cost
+    nb = _nonmarketable_cost(_nm_facts(inv_nonmarketable_impair_cum_instant={"2026-06-30": 3000e6}))
+    assert nb["down"] == pytest.approx(9115.0) and nb["cost"] == pytest.approx(47642.0)
+
+
+@pytest.mark.parametrize("over", [
+    {"inv_nonmarketable_up_cum_instant": {}},                         # AMZN：只标当期调整
+    {"inv_nonmarketable_up_cum_instant": {"2026-03-31": 80000e6}},    # 与账面值不同期
+    {"inv_nonmarketable_up_cum_instant": {"2026-06-30": 200000e6}},   # 推出负成本
+])
+def test_nonmarketable_cost_not_derived_when_unsafe(over):
+    from app.valuation_service import _nonmarketable_cost
+    assert _nonmarketable_cost(_nm_facts(**over)) is None
+    assert "非上市股权成本" not in _compact_facts(_nm_facts(**over))
+
+
+def test_cumulative_adjustment_tags_are_instants():
+    for k in ("inv_nonmarketable_up_cum", "inv_nonmarketable_down_cum", "inv_nonmarketable_impair_cum"):
+        assert SPEC[k]["instant"] is True
+
+
+def test_prompt_explains_measurement_alternative_cost():
+    assert "账面值 − 累计上调 + 累计下调/减值" in PROMPT
+    assert "非上市股权成本（XBRL 推算）" in PROMPT

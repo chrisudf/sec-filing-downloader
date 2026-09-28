@@ -122,6 +122,10 @@
    - `cost_basis_musd`（可选）：附注披露了投资成本就写。引擎按（折价后价值 − 成本）× 21%
      扣未实现收益税；不写就按全额计税。AFS 可转债按公允价值入账，附注会披露计入 AOCI 的
      未实现收益：成本 = 公允价值 − 未实现收益（AMZN 2026-06-30：97.9B − 92.0B = 5.9B）。
+     计量替代法的非上市股权：成本 = 账面值 − 累计上调 + 累计下调/减值。FACTS 能推时会直接
+     给出「非上市股权成本（XBRL 推算）」（GOOG 2026-06-30：124,259 − 85,732 + 9,115 = 47,642，
+     与附注「Total initial cost」一致）；只报其中一部分持股时按账面值比例拆。**能推就推**——
+     不写成本按全额计税，系统性低估。
    - `post_period_investment_musd`（可选）：**报告期末之后**才投进去的现金（AMZN 6/30 之后
      又投 OpenAI $21.3B）。不要并进账面值（XBRL 上限只含报告期末），单独写在这里；而且
      必须在 post_period_capital_events 里有对应的一笔 reflected_in_net_cash=true、
@@ -176,7 +180,8 @@
     {"name": "<被投公司与证券类型，如 Anthropic 优先股>",
      "kind": "private|public",
      "carrying_value_musd": <资产负债表账面值 $M（报告期末）——不是 持股比例×最新一轮估值>,
-     "cost_basis_musd": <可选：附注披露的投资成本 $M（AFS = 公允价值 − 未实现收益）>,
+     "cost_basis_musd": <可选：投资成本 $M（AFS = 公允价值 − 未实现收益；计量替代法 =
+       账面值 − 累计上调 + 累计下调/减值，FACTS 推得出时直接给）>,
      "post_period_investment_musd": <可选：报告期末之后追加投入的现金 $M；须在
        post_period_capital_events 里有对应的 net_cash 扣减>,
      "in_net_cash": <布尔：已算进上面的 net_cash 则 true（引擎不再加）>,

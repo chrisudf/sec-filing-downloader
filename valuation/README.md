@@ -197,6 +197,9 @@ AMZN 的 Anthropic/OpenAI 持股（2026-09-24 面板审计估约 $18.7/股税后
 - **拿不准一律不计入**：两个布尔必须显式 false；XBRL 没有投资类科目可核对 → 黄旗、
   不计入；申报账面值合计超过 XBRL 投资类科目合计（`holdings_xbrl_cap`，只当上限，科目时效
   以 `data_latest` 为锚）→ 红旗打回判断层一次，仍超则不计入。
+- **成本从 XBRL 推**（0034）：计量替代法的累计上调/下调/减值有标准标签，FACTS 直接给
+  「非上市股权成本 ≈ 账面值 − 累计上调 + 累计下调/减值」（三项须同一期末；下调与减值取较大值
+  不相加）。GOOG 推出 47,642，与附注「Total initial cost」一致；没标累计上调的（AMZN）不推。
 - **期后追加投资**（`post_period_investment_musd`）：报告期后才投的现金（AMZN 6/30 后又投
   OpenAI $21.3B）不进上限核对，只在 `post_period_capital_events` 里已确认从 net_cash 扣掉的
   额度内加回；否则期后部分不计入。
