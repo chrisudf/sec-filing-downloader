@@ -396,3 +396,47 @@ def test_no_derived_legend_without_derived_periods():
     # 推导期全在展示窗口之外（很早的年份）也不出图例
     txt = _compact_facts(_facts(op_income_derived={"annual": ["2010-12-31"]}))
     assert "* = 营业利润为推导值" not in txt
+
+
+# ---- 证券行换源（0035）：基线标签停更时改给 DebtSecurities* 债券行 ----
+
+def _bs_line(txt):
+    return next(l for l in txt.splitlines() if l.startswith("资产负债时点"))
+
+
+def test_stale_st_securities_swaps_to_debt_leg_nvda_shape():
+    """NVDA 实测：基线 st_securities 停在 2025-10-26（49,122M），2026 起改标
+    DebtSecuritiesCurrent（2026-07-26 34,143M）。判断层看旧数只能倒推，多算约 5.8B。"""
+    f = _facts(st_securities_instant={"2025-07-27": 45152e6, "2025-10-26": 49122e6},
+               debt_securities_st_instant={"2026-04-26": 37098e6, "2026-07-26": 34143e6},
+               equity_securities_st_instant={"2026-07-26": 42783e6})
+    line = _bs_line(_compact_facts(f))
+    assert "短期证券 ('2026-07-26', 34143000000.0)（取 DebtSecurities* 债券行——基线标签停在 2025-10-26" in line
+    assert "49122000000" not in line
+    # 股票腿不并入净现金参考：只出现在投资类科目那一行
+    assert "42783" not in line
+
+
+def test_same_period_or_fresher_baseline_is_untouched():
+    """同期或基线更新都不换——其余标的输出逐字不变（23 只实测只有 NVDA 触发）。"""
+    base = _facts(st_securities_instant={"2026-06-30": 50e9})
+    for debt in ({"2026-06-30": 30e9}, {"2026-03-31": 30e9}):
+        f = dict(base, debt_securities_st_instant=debt)
+        assert _bs_line(_compact_facts(f)) == _bs_line(_compact_facts(base))
+        assert "DebtSecurities*" not in _compact_facts(f)
+
+
+def test_missing_baseline_uses_debt_leg():
+    f = _facts(debt_securities_st_instant={"2026-06-30": 30e9})
+    assert "短期证券 ('2026-06-30', 30000000000.0)（取 DebtSecurities* 债券行——基线标签停在 （从未标过）" \
+        in _bs_line(_compact_facts(f))
+
+
+def test_lt_swap_suppresses_long_term_investments_hint():
+    """长期有价证券换成债券行后，「取自泛标签 LongTermInvestments」的提示不再成立。"""
+    f = _facts(lt_securities_instant={"2025-06-30": 36e9}, inv_long_term_instant={"2025-06-30": 36e9})
+    assert "泛标签 LongTermInvestments" in _compact_facts(f)
+    f["debt_securities_lt_instant"] = {"2026-06-30": 5e9}
+    txt = _compact_facts(f)
+    assert "长期有价证券 ('2026-06-30', 5000000000.0)（取 DebtSecurities* 债券行" in txt
+    assert "泛标签 LongTermInvestments" not in txt

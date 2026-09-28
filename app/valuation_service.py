@@ -974,6 +974,33 @@ def _oie_lines(facts: dict) -> list[str]:
     return lines
 
 
+# 证券行换源时的注记：判断层要知道这是债券那一腿、股票腿去了哪
+_SEC_SWAP_NOTE = ("（取 DebtSecurities* 债券行——基线标签停在 {base}；同期的股票腿"
+                  "见下方「公允价值计量的股权」，那是战略持股口径，不进净现金）")
+
+
+def _fresher_securities_key(facts: dict, base_key: str, debt_key: str) -> str:
+    """资产负债表证券行给判断层看哪一个标签（0035）。
+
+    NVDA 2026 起把「有价证券」拆成 Marketable debt / equity securities 两行，改标
+    DebtSecuritiesCurrent / EquitySecuritiesFvNi；基线 st_securities 停在 2025-10-26
+    （49,122M）。判断层看到的是九个月前的数，只能按 AFS 合计倒推——实测估成 39.9B，
+    原文 Marketable debt securities 是 34.1B，净现金多算约 5.8B（约 $0.24/股）。
+    规则：债券行的最新期**严格晚于**基线（或基线没有）才换；同期或基线更新都不动，
+    其余标的输出逐字不变。基线候选列表本身不改——它喂给判断层，改了会静默影响所有票。
+    股票腿不并入（图表端会并）：净现金只要类现金的债券；股票腿是战略持股口径。"""
+    base, debt = facts.get(base_key) or {}, facts.get(debt_key) or {}
+    if debt and (not base or list(debt)[-1] > list(base)[-1]):
+        return debt_key
+    return base_key
+
+
+def _stale_end(facts: dict, debt_key: str) -> str:
+    base = facts.get({"debt_securities_st_instant": "st_securities_instant",
+                      "debt_securities_lt_instant": "lt_securities_instant"}[debt_key]) or {}
+    return list(base)[-1] if base else "（从未标过）"
+
+
 def _compact_facts(facts: dict) -> str:
     """给判断层的事实摘要：年度尾6 + 季度尾8（含 净利/营业利润 比，暴露一次性项目）
     + 年度 FCF 利润率表 + OI&E 组件与残差行（v4 注入）。"""
@@ -1008,11 +1035,15 @@ def _compact_facts(facts: dict) -> str:
     lines += _oie_lines(facts)
     lines.append(f"TTM: { {k: (v.get('value') or 0)/1e6 for k, v in facts['ttm'].items()} }")
     bs = []
-    for label, key in (("现金", "cash_instant"), ("短期证券", "st_securities_instant"),
-                       ("长期有价证券", "lt_securities_instant"), ("长期债务", "lt_debt_instant"),
+    # 证券两行在基线标签停更时改给 DebtSecurities* 债券行（0035，同 0032 图表端）
+    _st_key = _fresher_securities_key(facts, "st_securities_instant", "debt_securities_st_instant")
+    _lt_key = _fresher_securities_key(facts, "lt_securities_instant", "debt_securities_lt_instant")
+    for label, key in (("现金", "cash_instant"), ("短期证券", _st_key),
+                       ("长期有价证券", _lt_key), ("长期债务", "lt_debt_instant"),
                        ("流动债务", "current_debt_instant"), ("商业票据", "commercial_paper_instant")):
         d = facts.get(key) or {}
-        bs.append(f"{label} {list(d.items())[-1] if d else '无'}")
+        bs.append(f"{label} {list(d.items())[-1] if d else '无'}"
+                  + (_SEC_SWAP_NOTE.format(base=_stale_end(facts, key)) if key.startswith("debt_") else ""))
     lines.append("资产负债时点(XBRL,可能滞后,净现金以10-Q原文优先): " + ", ".join(bs))
     # 战略持股（0033）：引擎拿这些科目之和当 strategic_holdings 账面值的上限核对。
     # 几个科目可能互相包含，这里只列数，不代表它们都是战略持股、更不是净现金口径
@@ -1035,7 +1066,7 @@ def _compact_facts(facts: dict) -> str:
     # 12,400M），按 prompt 口径算进 net_cash 的这一行里就有战略持股——不点明的话
     # 判断层会把同一笔钱在 strategic_holdings 里再报一遍
     _lt, _li = facts.get("lt_securities_instant") or {}, facts.get("inv_long_term_instant") or {}
-    if _lt and _li and list(_lt.items())[-1] == list(_li.items())[-1]:
+    if _lt_key == "lt_securities_instant" and _lt and _li and list(_lt.items())[-1] == list(_li.items())[-1]:
         lines.append("  ⚠ 「长期有价证券」取自泛标签 LongTermInvestments（常含权益法与非上市股权）："
                      "net_cash 若用了它，其中的战略持股必须标 in_net_cash=true")
     _nb = _nonmarketable_cost(facts)
