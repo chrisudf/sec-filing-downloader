@@ -204,6 +204,10 @@ AMZN 的 Anthropic/OpenAI 持股（2026-09-24 面板审计估约 $18.7/股税后
   「净现金 + 战略持股」公式，`verify_report` 多核一格；`compare` 报每股持股值变化；
   趋势视图把「含持股」样本单独分组。
 
+- **已知现象**：`check_configs` 回放 0033 之前留档的 config 会因缺 `strategic_holdings` 报 BLOCK——
+  与 0025 之前的 config 缺 `accounting_estimate_changes` 同一形态，是新增必填字段，不是规则收紧。
+  回归时按报错文案区分。
+
 **为什么不升语义号**：没申报（缺键或 `[]`）的运行逐位不变（引擎 JSON、stdout、Excel
 逐格对拍过），只改变确实持有非经营性股权的少数标的；持股计入与否在 compare/trend 里
 按自己的字段隔离，不需要让所有标的的历史一起断代。
