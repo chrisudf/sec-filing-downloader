@@ -13,7 +13,7 @@
   2. 逐财年实现 PE（低/中/高）——用来核对某条带子是否真的框住了每一年
   3. --match 的逆向匹配——回答「这组 PE 带是按什么规则定出来的」
 
-四个会静默出错的地方，都已处理：
+五个会静默出错的地方，都已处理：
 - **防前视**：某交易日的 PE 用「当天已经公告的」TTM EPS，按 XBRL 的 filed 日切换，
   不是按报告期末。用期末会让 PE 带假性收窄（把还没公布的业绩提前算进去）。
 - **TTM EPS = TTM 净利 ÷ 四季平均稀释股数**：EPS 和加权平均股数都不可跨季加总
@@ -22,6 +22,8 @@
   后续财报把该期做比较期时才追溯重述——重述是**逐条**的，不是整段的）。按每条记录
   自己的最新 filed 日判定口径：filed 早于拆股生效日的记录必为拆前口径，逐条回补；
   否则 AAPL 4:1 / AMZN 20:1 这类会把拆股前整段 PE 算错一个数量级。
+- **股数量纲**：发行人 iXBRL 漏标 scale 时股数按「百万股」数字入库（MCD 2024 起
+  732.3 而非 7.323 亿），逐期对 净利÷稀释EPS 校正，见 fix_share_scale。
 - **一次性畸变双侧剔除**：near-zero 地板只挡分母塌缩，挡不住分母膨胀——巨额一次性
   收益（AMZN 2026Q2 $53.4B Anthropic 重估）会把实现 EPS 吹大、PE 假性变低，带子的
   min/P10 被拉低后 engine 的越界诊断恰好在最该响的票上失灵。按「单季净利偏离同窗
@@ -109,6 +111,9 @@ def pick(facts, tags, kind, units, prefer_max=False):
     是静默错误（fetch_facts.pick 的 CRCL 教训，此处同规则）。
     两者必须分开：同一期会在后续财报里作为比较期反复出现，若拿最新 filed 当可知日，
     2024 年的季度会被标成 2026 年才可知，整条 PE 序列退化成「远古 EPS 除当期价格」。
+    委托书（DEF 14A 等）的行不取：它不是财报，SCHW 的薪酬-业绩表净利整体错一千倍
+    （判据与 fetch_facts._is_proxy 同）。年度行本来也被下面的 fp=="FY" 挡住（委托书
+    的 fp 是 null），这里显式写出来，不靠那个巧合。
     """
     rows = {}
     for tag in tags:
@@ -118,6 +123,9 @@ def pick(facts, tags, kind, units, prefer_max=False):
             if unit not in units:
                 continue
             for f in entries:
+                _form = f.get("form") or ""
+                if "14A" in _form or "14C" in _form:
+                    continue
                 end, start = f.get("end"), f.get("start")
                 if kind == "instant":
                     # 时点科目（权益/商誉/无形）：无 start，只有期末快照
@@ -302,6 +310,84 @@ def backfill_shares_from_eps(sh, ni, eps_rows):
                                     ev.get("first_filed") or "")}
         added += 1
     return added
+
+
+def share_scale_exp(val, implied, tol=1.5):
+    """申报股数相对隐含股数的量纲偏差 -> 10 的幂次 e（0 = 同量纲或判不了）。
+
+    MCD 实测（CIK 63908）：2024-02 的 10-K 起，加权稀释股数按「百万股」的表内
+    数字直接标成 shares（732.3，不是 732,300,000）——tag 与 unit 都没变，只是
+    iXBRL 的 scale 属性漏了。companyfacts 取 filed 最新值，2021 年以来的期间
+    全被重述成错量纲，TTM EPS 算成 1,231 万、PE 全是 0.0x。
+
+    判据：r = val / implied 落在 10^e × (1/tol, tol) 内、e 为非零的 3 的倍数
+    （千/百万/十亿，scale 属性只会错这几档）。拆股口径差（2:1~20:1，叠加两次
+    的 NVDA 4×10 = 40）落不进任何 10^±3 的 ±50% 容差带，不会被误当量纲错；
+    EPS 两位小数的舍入误差在 |EPS|≥0.05 时 ≤10%，也远在容差内。
+    """
+    if not val or not implied or val <= 0 or implied <= 0:
+        return 0
+    r = val / implied
+    e = 3 * round(math.log10(r) / 3)
+    if e and 1 / tol < r / 10 ** e < tol:
+        return e
+    return 0
+
+
+def unscale(val, e):
+    """val ÷ 10^e。e<0 时乘整数 10^−e：除以 1e-06 会留浮点尾巴（718200000.0000001）。"""
+    return val / 10 ** e if e > 0 else val * 10 ** -e
+
+
+def _nearest(pool, k):
+    """pool=[(date, 期末)] 里离期末 k 最近的那个期末。"""
+    d = date.fromisoformat(k)
+    return min(pool, key=lambda c: abs((c[0] - d).days))[1]
+
+
+def fix_share_scale(sh, ni, eps_rows):
+    """股数量纲校正（原地）-> [(period_end, e)]，val 已除以 10^e。
+
+    第一个证人是同期 净利÷稀释EPS（与 backfill_shares_from_eps 同一隐含股数）。
+    相邻期跳变单独不能当证人——它只说明两边口径不同，说不出哪边错。
+    但只信 EPS 一个证人也会错：净利那边错量纲时，它会把**对的**股数改错（SCHW 实测：
+    委托书的年度净利按千美元入库，EPS 证人说股数大了一千倍）。所以要第二个证人：
+    最近一个「EPS 说没问题」的期的股数，与本期的**量级**差也得是 10^e（只比量级不卡
+    ±50%：隔几年的真实股数变化在量级之内）。两个证人不一致就不动。整条序列都被
+    EPS 判错（MCD 近几年就是）时没有第二个证人可问，照 EPS 改。
+    无 EPS 可对的期（缺净利/EPS、|EPS|<0.05 舍入太粗、两证人不一致）最后对最近一个
+    已定论期的股数：同一发行人相邻期差到 10^±3 级不可能是经营事件。
+    必须在 normalize_splits 与 derive_q4_avg **之前**跑：Q4 均值式要求 FY 与三季
+    同量纲，混量纲时 gate 会拒掉 Q4，滚动窗整段缺角（MCD 5 年窗 455 天陈旧点）。
+    """
+    exps = {}
+    for k, sv in sh.items():
+        nv, ev = ni.get(k), eps_rows.get(k)
+        if not nv or not ev or not ev.get("val") or abs(ev["val"]) < 0.05:
+            continue
+        if nv["val"] / ev["val"] <= 0 or sv["val"] <= 0:   # 异号/非正：对不上
+            continue
+        exps[k] = share_scale_exp(sv["val"], nv["val"] / ev["val"])
+    ok = [(date.fromisoformat(k), k) for k, e in exps.items() if not e]
+    fixed = []
+    for k, e in exps.items():
+        if not e:
+            continue
+        if ok and 3 * round(math.log10(sh[k]["val"] / sh[_nearest(ok, k)]["val"]) / 3) != e:
+            continue                                     # 两个证人不一致
+        sh[k]["val"] = unscale(sh[k]["val"], e)
+        fixed.append((k, e))
+    settled = ok + [(date.fromisoformat(k), k) for k, _ in fixed]
+    if settled:
+        done = {k for _, k in settled}
+        for k, sv in sh.items():
+            if k in done:
+                continue
+            e = share_scale_exp(sv["val"], sh[_nearest(settled, k)]["val"])
+            if e:
+                sv["val"] = unscale(sv["val"], e)
+                fixed.append((k, e))
+    return sorted(fixed)
 
 
 def _loo_worst(items):
@@ -659,6 +745,9 @@ def compute_band(ticker, email, years=5, basis="forward", include_series=False,
     else:
         ni4sh_a = pick(facts, NI_TAGS, "annual", {"USD"})
         ni4sh_q = derive_q4(pick(facts, NI_TAGS, "quarterly", {"USD"}), dict(ni4sh_a))
+    # 量纲校正在兜底之前：只改申报值，兜底补进来的隐含股数天然是对的量纲
+    scl_q = fix_share_scale(sh_q, ni4sh_q, eps_q)
+    scl_a = fix_share_scale(sh_a, ni4sh_a, eps_a)
     imp_q = backfill_shares_from_eps(sh_q, ni4sh_q, eps_q)
     imp_a = backfill_shares_from_eps(sh_a, ni4sh_a, eps_a)
     # 归一必须在 derive_q4_avg **之前**：Q4 = 4×FY − Σ3Q 的均值式要求 FY 与三个
@@ -666,6 +755,12 @@ def compute_band(ticker, email, years=5, basis="forward", include_series=False,
     # 再对垃圾整段乘系数——两步各错一次
     split_notes = normalize_splits(sh_q, splits)
     normalize_splits(sh_a, splits)
+    if scl_q or scl_a:
+        _scl = sorted(scl_q + scl_a)
+        _exps = "/".join(f"10^{e}" for e in sorted({e for _, e in _scl}))
+        split_notes.append(f"股数量纲: {len(scl_q)} 个季度 + {len(scl_a)} 个财年的加权稀释股数"
+                           f"是同期 净利÷稀释EPS 的 {_exps} 倍（{_scl[0][0]}~{_scl[-1][0]}，"
+                           "XBRL scale 属性漏标），已校正到隐含量纲")
     if imp_q or imp_a:
         split_notes.append(f"股数兜底: {imp_q} 个季度 + {imp_a} 个财年由 净利÷稀释EPS 反推"
                            "（股数 XBRL 仅按股份类别维度申报，companyfacts 无合并口径；"
@@ -678,11 +773,20 @@ def compute_band(ticker, email, years=5, basis="forward", include_series=False,
     # 残留口径跳变哨兵：逐条 filed 规则的兜底（yfinance 拆股日偏差、罕见的不重述
     # 再申报都会在相邻期股数上留下台阶）。只留痕不修数——修数需要能定位口径边界，
     # 启发式做不到，上面的教训就是这么来的
+    # 百倍以上的台阶例外：不是增发回购、也不是拆股归一残留，是 fix_share_scale 没有
+    # 锚可对的量纲错。它不能只留痕——错量纲那一侧的 PE 差 10^3~10^6 倍，近零地板
+    # 还会把**对的**那一侧当"分母塌缩"剔掉（MCD 修前：147 天真值被剔、留下一带 0.0x），
+    # 而哪一侧错判不了，只能整条不出
     _sq = sorted(sh_q.items())
     for (k1, v1), (k2, v2) in zip(_sq, _sq[1:]):
         r = v2["val"] / v1["val"] if v1["val"] else 0
+        if r and not 0.01 < r < 100:
+            raise RuntimeError(
+                f"{ticker} {k1}→{k2} 相邻期股数跳变 {r:.3g}x——百倍以上不是经营事件，"
+                "疑似 XBRL 股数量纲错（scale 漏标）且无同期 净利÷稀释EPS 可校正，"
+                "哪一段是错量纲判不了，PE 带不出")
         if r and not 2 / 3 < r < 1.5:
-            split_notes.append(f"⚠ {k1}→{k2} 相邻期股数跳变 {r:.2f}x——若非大额增发/"
+            split_notes.append(f"⚠ {k1}→{k2} 相邻期股数跳变 {r:.3g}x——若非大额增发/"
                                "回购/并购，拆股口径归一可能有残留，请核对该期 filed 与拆股日")
 
     # 畸变守卫只对 eps 生效：ANOM_K=1.25 按净利一次性损益校准（AMZN 1.40x），

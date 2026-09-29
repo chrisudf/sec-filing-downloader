@@ -16,6 +16,7 @@
   tag 映射 + 现汇折算美元（yfinance），历史序列按同一现汇折算（恒定汇率口径）
 """
 import json
+import math
 import os
 import sys
 import time
@@ -247,13 +248,27 @@ def resolve_cik(ticker: str, headers: dict) -> int:
         "若已知 CIK，可用 build_facts(ticker, email, cik=...) 绕过映射重试")
 
 
+def _is_proxy(form: str) -> bool:
+    """委托书（Schedule 14A/14C：DEF 14A、PRE 14A、DEFA14A、DEFC14A…）。
+
+    2023 年起的薪酬-业绩对照表（pay versus performance）在委托书里给近 5 个财年的
+    NetIncomeLoss 打 XBRL。委托书 4 月才交、filed 晚于 10-K，「同期取 filed 最新」
+    会让它压过 10-K——而它不是财报：114 票实测 257 行里 98 行是取整值，SCHW 的
+    5 行整体错一千倍（按千美元入库：FY2023 净利 5,067,000）。年度净利错一千倍，
+    Q4 = 年度 − 前三季 推出 −$6.4B，SCHW 的 TTM 净利从 ~$10.1B 变成 $1.25B。
+    VZ/GM/CRWD 的则是把含少数股东的合并净利（= ProfitLoss）标成 NetIncomeLoss，
+    Q4 推导把全年少数股东损益塞进 Q4（VZ TTM 净利多 $434M、+2.7%）。"""
+    return "14A" in form or "14C" in form
+
+
 def pick(facts: dict, tag_names, kind, prefer_max=False, units=USD_UNITS, fx=1.0):
     """多候选 tag 合并：同期取 filed 最新值。
 
     prefer_max（仅营收使用）：同期同 filed 日打平时取较大者——总营收 tag 与其
     分项 tag（合同收入）可能同时申报（CRCL：Revenues $2,747M vs
     RevenueFromContractWithCustomer $110M），总营收 ⊇ 分项，取小值是静默错误。
-    units/fx：非美元申报时按申报货币取单位并按现汇折算（股数不折算）。"""
+    units/fx：非美元申报时按申报货币取单位并按现汇折算（股数不折算）。
+    委托书的行不取（见 _is_proxy）。"""
     rows = {}
     for tag in tag_names:
         if tag not in facts:
@@ -264,6 +279,8 @@ def pick(facts: dict, tag_names, kind, prefer_max=False, units=USD_UNITS, fx=1.0
             continue
         scale = 1.0 if unit == "shares" else fx
         for f in tag_units[unit]:
+            if _is_proxy(f.get("form") or ""):
+                continue
             end, start = f.get("end"), f.get("start")
             if kind == "instant":
                 if start is not None:
@@ -389,6 +406,79 @@ def assemble_series(facts: dict, name: str, spec=None, units=USD_UNITS,
             if len(in_year) == 3 and a_end not in quarterly:
                 quarterly[a_end] = a_val - sum(in_year.values())
     return annual, dict(sorted(quarterly.items()))
+
+
+def _share_scale_exp(val, implied, tol=1.5) -> int:
+    """申报股数相对隐含股数的量纲偏差 -> 10 的幂次 e（0 = 同量纲或判不了）。
+
+    与 pe_band.share_scale_exp 逐字同判据（tests/test_share_scale.py 钉住两处一致）：
+    r = val/implied 落在 10^e×(1/tol, tol)、e 为非零的 3 的倍数。拆股口径差
+    （≤40 倍）落不进任何 10^±3 的 ±50% 带，不会被误当量纲错。"""
+    if not val or not implied or val <= 0 or implied <= 0:
+        return 0
+    r = val / implied
+    e = 3 * round(math.log10(r) / 3)
+    if e and 1 / tol < r / 10 ** e < tol:
+        return e
+    return 0
+
+
+def _unscale(val, e):
+    """val ÷ 10^e（同 pe_band.unscale：e<0 乘整数，免得留 718200000.0000001 的尾巴）。"""
+    return val / 10 ** e if e > 0 else val * 10 ** -e
+
+
+def _fix_share_scale(out: dict) -> None:
+    """稀释股数量纲校正（原地）：逐期对 净利÷稀释EPS，差 10^±3/6/9 倍即除回去。
+
+    MCD（CIK 63908）2024-02 的 10-K 起把加权稀释股数按「百万股」表内数字标成
+    shares（732.3 而非 732,300,000），tag/unit 都没变。不校正时三处下游全错：
+    估值管道 shares_ord = 0.0007 百万股，被 _adr_calibration 当成 1 ADR = 10^-6 股；
+    图表「稀释股本」在 2023 年断崖；_guard_derived_q4_eps 的隐含 EPS 差百万倍，
+    把 FY2021 起每个 Q4 EPS 都当拆股混口径删掉。
+    两个证人（与 pe_band.fix_share_scale 同规则，理由见那边 docstring）：EPS 说差
+    10^e，且最近一个 EPS 说没问题的期的股数量级也差 10^e，才改——只信 EPS 会在
+    净利错量纲时把对的股数改错。无 EPS 可对/两证人不一致的期最后对最近一个已定论期。
+    校正过的期记进 shares_diluted_rescaled，与 op_income_derived 同样留痕。"""
+    def _near(pool, k):
+        d = date.fromisoformat(k)
+        return min(pool, key=lambda c: abs((c[0] - d).days))[1]
+
+    rescaled = {}
+    for suffix in ("quarterly", "annual"):
+        sh = out.get("shares_diluted_" + suffix) or {}
+        ni = out.get("net_income_" + suffix) or {}
+        eps = out.get("eps_diluted_" + suffix) or {}
+        exps = {}
+        for k, v in sh.items():
+            if ni.get(k) is None or not eps.get(k) or abs(eps[k]) < 0.05:
+                continue
+            if ni[k] / eps[k] <= 0 or v <= 0:     # 异号/非正：对不上
+                continue
+            exps[k] = _share_scale_exp(v, ni[k] / eps[k])
+        ok = [(date.fromisoformat(k), k) for k, e in exps.items() if not e]
+        fixed = {}
+        for k, e in exps.items():
+            if not e:
+                continue
+            if ok and 3 * round(math.log10(sh[k] / sh[_near(ok, k)]) / 3) != e:
+                continue                                  # 两个证人不一致
+            sh[k] = _unscale(sh[k], e)
+            fixed[k] = e
+        settled = ok + [(date.fromisoformat(k), k) for k in fixed]
+        if settled:
+            done = {k for _, k in settled}
+            for k, v in sh.items():
+                if k in done:
+                    continue
+                e = _share_scale_exp(v, sh[_near(settled, k)])
+                if e:
+                    sh[k] = _unscale(v, e)
+                    fixed[k] = e
+        if fixed:
+            rescaled[suffix] = dict(sorted(fixed.items()))
+    if rescaled:
+        out["shares_diluted_rescaled"] = rescaled
 
 
 def _guard_derived_q4_eps(out: dict) -> None:
@@ -828,6 +918,8 @@ def build_facts(ticker: str, email: str, cik: int | None = None) -> dict:
         out[name + "_annual"] = annual
         out[name + "_quarterly"] = quarterly
 
+    # 量纲校正必须在 Q4 EPS 守卫之前：守卫拿年度股数算隐含 EPS
+    _fix_share_scale(out)
     _guard_derived_q4_eps(out)
 
     # TTM 全部科目锚定到营收窗口末季：某科目标签断更时（COHR 的营业利润曾停在
@@ -1001,6 +1093,11 @@ def main() -> None:
     # 分类（新上市/停报/从未申报）见 classify_core_gaps（0020）
     problems, warnings = [], []
     problems += classify_core_gaps(out)
+    for suffix, fixed in (out.get("shares_diluted_rescaled") or {}).items():
+        ks = sorted(fixed)
+        exps = "/".join(f"10^{e}" for e in sorted(set(fixed.values())))
+        warnings.append(f"稀释股数 {len(ks)} 期（{suffix}，{ks[0]}~{ks[-1]}）XBRL 量纲错"
+                        f"（申报值是 净利÷稀释EPS 的 {exps} 倍，scale 属性漏标），已校正")
     if out["mode"] == "financials" and not out.get("equity_instant"):
         problems.append("缺股东权益时点数据，P/TBV 法无法计算")
     if out["data_latest"]:
