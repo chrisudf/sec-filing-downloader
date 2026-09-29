@@ -176,6 +176,26 @@ SPEC = {
     # 保险公司的债券组合常只标 AFS 总口径（MET ~$316B），图表端按覆盖度选源
     "afs_securities_total": _item(["AvailableForSaleSecuritiesDebtSecurities"],
                                   i=True),
+    # 战略持股的上限核对（0033，engine.holdings_xbrl_cap）：只当上限用，不进净现金、
+    # 不喂判断层的净现金口径。非上市股权（计量替代法账面值）是 AMZN 的 Anthropic 优先股
+    # 所在科目；几个科目之间可能互相包含，加总只会让上限更松
+    "inv_nonmarketable_equity": _item(
+        ["EquitySecuritiesWithoutReadilyDeterminableFairValueAmount"], i=True),
+    "inv_equity_method": _item(["EquityMethodInvestments"], i=True),
+    "inv_long_term": _item(["LongTermInvestments"], i=True),
+    "inv_other_long_term": _item(["OtherLongTermInvestments"], i=True),
+    # 计量替代法的累计调整（0034）：成本 ≈ 账面值 − 累计上调 + 累计下调/减值。判断层据此给
+    # strategic_holdings 的 cost_basis_musd——没给成本时引擎按全额计税，GOOG 124.3B 实测
+    # 因此多扣了约 10B（原文「Total initial cost」47,642M，正好等于这三项推出来的数）
+    "inv_nonmarketable_up_cum": _item(
+        ["EquitySecuritiesWithoutReadilyDeterminableFairValueUpwardPriceAdjustmentCumulativeAmount"],
+        i=True),
+    "inv_nonmarketable_down_cum": _item(
+        ["EquitySecuritiesWithoutReadilyDeterminableFairValueDownwardPriceAdjustmentCumulativeAmount"],
+        i=True),
+    "inv_nonmarketable_impair_cum": _item(
+        ["EquitySecuritiesWithoutReadilyDeterminableFairValueImpairmentLossCumulativeAmount"],
+        i=True),
     # SOFI 2023 起资产负债表 Debt 行只标长短期合并口径；后三个覆盖
     # REIT/保险的无分类资产负债表（O $25B、MET $14.5B 曾整列 null）
     "debt_combined": _item(["DebtLongtermAndShorttermCombinedAmount",
@@ -204,6 +224,8 @@ SPEC_IFRS = {
     "lt_debt": _item(["NoncurrentBorrowings", "LongtermBorrowings"], i=True),
     "current_debt": _item(["CurrentBorrowings", "ShorttermBorrowings"], i=True),
     "equity": _item(["EquityAttributableToOwnersOfParent", "Equity"], i=True),
+    # 战略持股上限核对（0033）：IFRS 只有权益法这一项有稳定的标准概念
+    "inv_equity_method": _item(["InvestmentsAccountedForUsingEquityMethod"], i=True),
     "shares_diluted": _item(["AdjustedWeightedAverageShares", "WeightedAverageShares"],
                             no_q4=True),
 }

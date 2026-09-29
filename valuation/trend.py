@@ -122,6 +122,10 @@ def main():
                     _k += "｜m=" + "/".join(sorted(_bm))
                 elif s.get("sotp_in_blend") is not None:
                     _k += "｜sotp=" + ("in" if s["sotp_in_blend"] else "ref")
+                # 战略持股（0033）：DCF/SOTP 腿含持股与不含是两个口径，不能混聚。
+                # 只分「有/无」不按金额分——账面值逐季变动是基本面，不是口径
+                if s.get("strategic_holdings_ps"):
+                    _k += "｜持股"
                 groups.setdefault(_k, []).append(s)
             if len(groups) > 1:
                 mixed = {k: len(v) for k, v in groups.items()}
