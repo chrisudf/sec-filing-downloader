@@ -550,18 +550,21 @@ IBM 估值（base $194 vs 现价 $231）复盘时查出三处**数据层**缺口
       （TSLA）不走这里。今天会 snap 的值一个不变
 - [x] 季度稀释股数序列停更（落后年度一年以上）时改用年度：HMC 停在 2021-12（拆股前）、
       TM 2020-12、IX 2023-12。股数落后财务数据一年以上（BIDU 2010）时 caliber 写明
-- [ ] 大比例整数 snap 是就近取整：n ≥ 7 相邻整数的间距已小于口径噪声，snap 等于没 snap。
-      实测 JOYY 21.75→22（封面 20）、AMX 20.65→21（20）、EDN 18.39→18（20）、
-      VOD 11.31→11（10）、CMCM 49.4→49（50）、TM 11.19→11（10）。改候选成「1~10 +
-      15/20/25/30/40/50…」之前先想好 ONC 13 这类真比例怎么办
-- [ ] 20-F 封面作第二个证人：dei:Security12bTitle 或封面脚注载明比例（「each representing
-      five-ninths of one share」「every three ADSs representing two」「each representing 0.2」
-      「each three representing one」），与 raw 对拍——一致用封面；差一个整数倍判拆股/送股
-      （HDB 3 vs 1.49）；都不是就是噪声（CANF 封面 2 vs raw 0.768）。带内分数窗口连成片，
-      只靠数字分不出 CANF 这类
-- [ ] 外圈原样放行、没有旗的错比例：NCTY 149（封面 300）、BLRX 476（600）、IMRN 28.6（40）
-      是小盘股增发后加权股数追不上；XTLB 287（100）方向相反，未查；BIDU 0.1025（8，XBRL
-      股数停在 2010）
+- [x] 年报封面作第二个证人（`app/adr_cover.py`）：从已下载的 10-K/20-F 主文档读 Section 12(b)
+      一栏载明的比例，51 份实测全部解析正确；与 raw 对拍（`_adr_cover_check`）——8% 内用封面；
+      1.5 倍内是股本漂移，封面比例 + XBRL 口径 + 黄旗；差拆股倍数 2/3/4/5/10 是口径断层，
+      封面×倍数 + 断层黄旗；都不是时 XBRL 股数陈旧就信市值，同期就停。50 只 ADR 回放变 21 只：
+      大比例就近取整全改正（JOYY 22→20、AMX 21→20、EDN 18→20、VOD 11→10、CMCM 49→50、
+      TM 11→10），外圈无旗错比例都带上旗（NCTY/XTLB/BIDU 断层、BLRX/IMRN 漂移）
+- [ ] CANF 类现在停止估值：封面 2、raw 0.768，差 2.6 倍、不是拆股倍数、股数与财务同期。
+      要出报告得有第三个证人判断是增发（加权股数追不上）还是 yfinance 市值错——候选：
+      dei:EntityCommonStockSharesOutstanding（封面日股数）、期后 6-K 股本公告
+- [ ] 封面认不出时（TAK 标题只写「ADS Representing Common Stock」）仍走纯数字规则，大比例
+      仍就近取整。正文定义句（「“ADS” means … representing 0.5 ordinary shares」）能补，
+      但要先挡住正文里的比例变更句
+- [ ] MFG 封面自己写错（1 ADS = 2 股，东京股价折算 0.198）：现在落在断层档、数值跟市场、
+      黄旗两边都说。封面过时这种情况目前只能靠旗提醒人工核
+- [ ] HDB：SEC 收进 FY26 XBRL（送股后追溯重述）后，raw 应接近 3、与封面一致——届时复查
 
 ## 🚀 v0.5 — 部署与产品化
 
