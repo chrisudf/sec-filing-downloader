@@ -526,9 +526,11 @@ IBM 估值（base $194 vs 现价 $231）复盘时查出三处**数据层**缺口
 - [x] 残留的百倍以上相邻期跳变（无锚可校正）改为拒绝出带，不再只留痕
 - [x] 两个 `pick` 排除委托书（DEF 14A 等）：SCHW 薪酬-业绩表净利按千美元入库、filed
       晚于 10-K 压过了它，TTM 净利 $1.25B（应 ~$10.1B）；其余票是取整值换回 10-K 精确值
-- [ ] `_adr_calibration` 外圈（raw ≤ 0.5）原样放行：修前 MCD 被当成「1 ADR = 1.005e-06 股」
-      吸收掉，股数碰巧对、prompt 里多一条荒谬的 ADR 口径说明。ADR 比例不可能 < 0.1，
-      该报错/黄旗而不是放行
+- [x] `_adr_calibration` 外圈（raw ≤ 0.5）原样放行：修前 MCD 被当成「1 ADR = 1.005e-06 股」
+      吸收掉，股数碰巧对、prompt 里多一条荒谬的 ADR 口径说明。→ PR #29：raw 出了
+      [0.07, 7×10^4] 抛 RuntimeError（紧跟取价，判断层之前）；边界按 69 只 ADR 实测定，
+      取 70×10^∓3 避开 r×10^±3 格点（0.05 恰压在 ENIC 的 0.050003 上）。盲区：比例 < 70
+      的票多三个零（本土 raw ≈ 1000）与真实大比例 ADR 量级上分不开
 - [ ] `compute_ptbv_band` 的加权股数兜底分支（无时点股数 tag 的金融股）没接校正；
       时点股数（CommonStockSharesOutstanding / dei）没有 EPS 锚，要另想办法
 - [ ] `WeightedAverageNumberOfSharesOutstandingBasic` 同样错量纲（MCD 实测），目前无消费方
