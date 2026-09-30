@@ -1567,12 +1567,37 @@ def test_cover_stale_shares_trusts_market():
     assert "停在 2010-12-31" in note and "早 5479 天" in note and "市值隐含股数" in note
 
 
+def test_cover_stale_shares_beats_drift_band():
+    """FENG：XBRL 股数停在 2011，封面 48、raw 43.2（差 10%，本在漂移档）。陈旧股数先判：
+    不许按 15 年前的股数折算、还挂「按 XBRL 股数口径」的黄旗。"""
+    from fractions import Fraction as F
+    from app.valuation_service import _adr_cover_check
+    m, mismatch, note = _adr_cover_check(43.22, F(48), shares_asof="2011-12-31",
+                                         shares_lag=5114, data_latest="2025-12-31")
+    assert m == 43.22 and mismatch is None and "停在 2011-12-31" in note
+    # 陈旧但两证人一致：照用封面
+    assert _adr_cover_check(47.5, F(48), shares_asof="2011-12-31", shares_lag=5114,
+                            data_latest="2025-12-31") == (48.0, None, None)
+
+
 def test_cover_irreconcilable_raises():
     """CANF：封面 2、raw 0.768、股数与财务数据同期——差 2.6 倍又不是拆股倍数，停。"""
     with pytest.raises(RuntimeError) as ei:
         _cover(0.7683, "2")
     msg = str(ei.value)
     assert "差 2.6 倍" in msg and "停止估值" in msg and "1 ADS = 2 股" in msg
+    assert "原文" not in msg                      # 没给原文片段就不写
+
+
+def test_cover_quote_in_raise_and_split_note():
+    """停止估值与断层说明都带上解析出比例的封面原文：解析器读错时人能一眼看出来。"""
+    from fractions import Fraction as F
+    from app.valuation_service import _adr_cover_check
+    kw = dict(shares_asof="2025-12-31", shares_lag=0, data_latest="2025-12-31")
+    with pytest.raises(RuntimeError, match="原文「each representing 2 Ordinary Shares」"):
+        _adr_cover_check(0.7683, F(2), quote="each representing 2 Ordinary Shares", **kw)
+    note = _adr_cover_check(0.2053, F(2), quote="each of which represents two shares", **kw)[2]
+    assert "原文「each of which represents two shares」" in note
 
 
 @pytest.mark.parametrize("q, kind", [
@@ -1588,6 +1613,41 @@ def test_cover_band_edges(q, kind):
     got = ("agree" if mismatch is None and note is None else
            "drift" if mismatch is not None else "split")
     assert got == kind
+
+
+def _stale(**kw):
+    from app.valuation_service import _prev_stale_reason
+    prev = dict(ticker="JOYY", semantics_version=4, manifest_latest="2025-12-31",
+                price=80.0, adr_multiple=22.0)
+    prev.update(kw.pop("prev", {}))
+    args = dict(ticker="JOYY", mode="standard", latest_report="2025-12-31", price=80.0,
+                adr_multiple=22.0)
+    args.update(kw)
+    return _prev_stale_reason(prev, **args)
+
+
+def test_prev_stale_reason_existing_triggers():
+    """抽成纯函数前后同答：标的、语义版本、新报告期、现价 >15%。"""
+    assert _stale() is None
+    assert _stale(ticker="BIDU") == "标的不符"
+    assert "语义版本 v4 != v3" in _stale(mode="financials")
+    assert "出现新报告期 2026-06-30" in _stale(latest_report="2026-06-30")
+    assert "+19%" in _stale(price=95.0)
+    assert _stale(price=91.0) is None                 # +13.75% 不失效
+
+
+def test_prev_stale_reason_adr_basis_change():
+    """ADR 折算口径变了（JOYY 22→20）：上次的 fwd_shares 是另一个口径的数，不许沿用。"""
+    r = _stale(adr_multiple=20.0)
+    assert "ADR 折算口径变了" in r and "1 ADR = 22 股" in r and "本次 20 股" in r
+    assert _stale(adr_multiple=22.1) is None          # 0.5% 内是同一口径
+    # 旧 config 没有 adr_multiple 键：按 1 处理——本土票不变，改成 ADR 的失效
+    from app.valuation_service import _prev_stale_reason
+    old = dict(ticker="SKM", semantics_version=4, price=35.0)
+    assert _prev_stale_reason(old, ticker="SKM", mode="standard", latest_report="",
+                              price=35.0, adr_multiple=1.0) is None
+    assert "5/9" in _prev_stale_reason(old, ticker="SKM", mode="standard", latest_report="",
+                                       price=35.0, adr_multiple=5 / 9)
 
 
 def test_annual_report_file_picks_primary_annual():
@@ -1648,6 +1708,11 @@ def test_cover_witness_wired_into_pipeline():
     assert "cover=adr_cover," in src and "basis_note=adr_basis_note" in src
     assert "if annual and (fdir / annual).exists():" in src
     assert "if parsed and _ADR_RATIO_MIN <= parsed[0] <= _ADR_RATIO_MAX:" in src
+    assert 'data_latest=facts.get("data_latest"), quote=parsed[1])' in src
+    # 连续性失效判断走纯函数，并且带上本次的 ADR 折算口径
+    assert "stale = _prev_stale_reason(prev, ticker=ticker, mode=mode," in src
+    assert "adr_multiple=adr_multiple)" in src
+    assert src.index("_adr_cover_check(") < src.index("stale = _prev_stale_reason(")
     try_blk = src[src.index("parsed = parse_ads_ratio("):chk]
     assert "except Exception" in try_blk      # 解析器 bug 降级
     assert "except" not in src[chk:src.index("shares = round(shares_ord / adr_multiple)")]
