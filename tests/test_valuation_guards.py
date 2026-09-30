@@ -1189,7 +1189,7 @@ def test_adr_noise_upper_side():
 
 
 def test_adr_outside_tightened_range_unchanged():
-    # (0, 0.5] 外圈维持原行为：既不 snap 也不回退（收紧范围只有 (0.5, 2)）
+    # (0, 0.5] 外圈在真实 ADR 量级内维持原行为：既不 snap 也不回退
     m, mismatch = _adr(0.30)
     assert m == pytest.approx(0.30) and mismatch is None
 
@@ -1197,6 +1197,124 @@ def test_adr_outside_tightened_range_unchanged():
 def test_adr_zero_mcap_defaults_to_one():
     from app.valuation_service import _adr_calibration
     assert _adr_calibration(100.0, 0.0, 1000.0) == (1.0, None)
+
+
+# ---- 外圈量级闸 —— MCD 修前：XBRL 稀释股数 711.1（应为 711.1M），raw = 1.005e-06
+# 被当成「1 ADR = 1e-06 普通股」放行，股数 rebase 后碰巧对。真实比例的量级之外抛错。
+
+def test_adr_mcd_share_scale_error_raises():
+    """原样复现修前 MCD 的输入：必须抛错，文案给出量级与病因。"""
+    from app.valuation_service import _adr_calibration
+    with pytest.raises(RuntimeError) as ei:
+        _adr_calibration(233.60, 233.60 * 707.6e6, 711.1 / 1e6)
+    msg = str(ei.value)
+    assert "10^-6" in msg and "多半是 XBRL 股数量纲错" in msg
+    assert "711 股" in msg and "707,600,000 股" in msg   # 两侧原数照印
+    assert "1e-06" in msg                                 # 不许被格式舍成 0
+
+
+def test_adr_thousand_scale_error_raises():
+    """千股按原数入库：raw ≈ 1e-03，同样落在千进制格点上。"""
+    with pytest.raises(RuntimeError, match=r"10\^-3）.*多半是 XBRL 股数量纲错"):
+        _adr(1.0e-3 * 1.04)
+    # 常量注释的承诺：比例 < 70 的 ADR 少三个零也抓得到（CMCM 实测 49.4）
+    with pytest.raises(RuntimeError):
+        _adr(49.4e-3)
+
+
+def test_adr_upper_scale_error_raises():
+    """反方向：XBRL 股数多六个零（或 yfinance 市值少六个零）。"""
+    with pytest.raises(RuntimeError) as ei:
+        _adr(1.0e6 * 0.97)
+    msg = str(ei.value)
+    assert "10^6）" in msg and "多乘了一次 scale" in msg
+    assert "按原数入库" not in msg          # 少零的病因不许套到多零的方向上
+    # 常量注释的承诺：比例 >= 0.1 的 ADR 多六个零也抓得到（BIDU 实测 0.1025），
+    # 且与下限对称地扛得住 25% 的两侧口径噪声
+    with pytest.raises(RuntimeError):
+        _adr(0.1e6 * 0.75)
+
+
+def test_adr_smallest_real_ratio_survives_noise():
+    """下限的余量：最小真实比例 0.1 叠加 25% 向下的口径噪声仍放行（与上限对称）。"""
+    assert _adr(0.1 * 0.75)[0] == pytest.approx(0.075)
+
+
+def test_adr_real_ifrs_scale_errors_raise():
+    """2026-09-30 实测抓到的两只真量纲错（生产 fetch_facts + yfinance 原数）：
+    PAM 股数按百万入库（1360），ENIC 按千股入库（69,166,557，应为 691.7 亿）。
+    两者都是 ADR 比例叠加量纲错（25×10^-6、50×10^-3），不在千进制格点上。
+    ENIC 的 raw = 0.050003——下限若取 0.05 就压在它身上，结论随噪声翻。"""
+    from app.valuation_service import _adr_calibration
+    for price, mcap, shares in ((76.84, 4.119e9, 1360.0),
+                                (4.24, 5.865e9, 69_166_557.0)):
+        with pytest.raises(RuntimeError, match="不在千进制格点上.*ADR 比例叠加量纲错"):
+            _adr_calibration(price, mcap, shares / 1e6)
+
+
+@pytest.mark.parametrize("raw", [0.1025, 0.2, 0.25, 1 / 3])
+def test_adr_real_small_ratios_pass(raw):
+    """真实的小比例原样放行，不许误伤：BIDU 0.1025（XBRL 稀释股数停在 2010 年，
+    当时 10 ADS = 1 股，今天实跑就是这个数）、MFG/VIPS 0.2、PKX 0.25、TAL 1/3。"""
+    m, mismatch = _adr(raw)
+    assert m == pytest.approx(raw) and mismatch is None
+
+
+@pytest.mark.parametrize("raw", [20.0, 149.0, 200.0, 476.0])
+def test_adr_real_large_ratios_pass(raw):
+    """真实的大比例（实测）：YMM 20、NCTY 149、BCH 200、BLRX 476——照旧放行。"""
+    assert _adr(raw) == (raw, None)
+
+
+def test_adr_bounds_are_inclusive_and_tight():
+    """边界两侧各一点：闸就在常量上，不多不少。"""
+    from app.valuation_service import _ADR_RATIO_MIN, _ADR_RATIO_MAX
+    assert _adr(_ADR_RATIO_MIN)[0] == pytest.approx(_ADR_RATIO_MIN)
+    assert _adr(_ADR_RATIO_MAX)[0] == pytest.approx(_ADR_RATIO_MAX)
+    with pytest.raises(RuntimeError):
+        _adr(_ADR_RATIO_MIN * 0.99)
+    with pytest.raises(RuntimeError):
+        _adr(_ADR_RATIO_MAX * 1.01)
+
+
+def test_adr_bounds_sit_between_scale_grid_points():
+    """边界压在千进制格点上等于抛硬币（口径噪声几个百分点就翻结论）。两个边界
+    离最近格点都要 >= 10^0.5 倍：比例 1 的票乘 10^±3 的量纲错，±30% 噪声内结论不变。"""
+    import math
+    from app.valuation_service import _ADR_RATIO_MIN, _ADR_RATIO_MAX
+    for b in (_ADR_RATIO_MIN, _ADR_RATIO_MAX):
+        lg = math.log10(b)
+        assert abs(lg - 3 * round(lg / 3)) >= 0.5, b
+
+
+def test_adr_off_grid_out_of_range_names_other_causes():
+    """不在千进制格点上的越界（如 0.02）不许一口咬定是量纲错。"""
+    with pytest.raises(RuntimeError) as ei:
+        _adr(0.02)
+    msg = str(ei.value)
+    assert "不在千进制格点上" in msg and "多半是" not in msg
+    assert "10^-1.7" in msg
+
+
+@pytest.mark.parametrize("price", [float("nan"), 0.0, -5.0])
+def test_adr_nonfinite_or_nonpositive_price_raises_runtime_error(price):
+    """NaN/0/负价：修前 NaN 在 round() 里炸 ValueError，文案无从下手。"""
+    from app.valuation_service import _adr_calibration
+    with pytest.raises(RuntimeError, match="不是正的有限数"):
+        _adr_calibration(price, 1e12, 1000.0)
+
+
+def test_adr_guard_runs_before_filings_and_judgment():
+    """接线哨兵：标定紧跟取价，在下载 filings 与判断层之前——量级错时不白跑
+    几分钟下载、更不花 LLM 调用；只留一处调用（挪位时旧位置不许残留）。"""
+    import inspect
+    from app import valuation_service as vs
+    src = inspect.getsource(vs._pipeline)
+    assert src.count("_adr_calibration(") == 1
+    call = src.index("_adr_calibration(")
+    assert src.index("asyncio.to_thread(_price)") < call
+    assert call < src.index('job["step"] = "filings"')
+    assert call < src.index('job["step"] = "judgment"')
 
 
 # =====================================================================

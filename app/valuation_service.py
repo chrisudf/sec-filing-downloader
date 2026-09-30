@@ -12,6 +12,7 @@ import asyncio
 import csv
 import io
 import json
+import math
 import os
 import re
 import shutil
@@ -1365,6 +1366,24 @@ def _trading_range_payload(mode: str, facts: dict, val: dict):
     return None, note
 
 
+# 真实 ADR 比例（1 ADR = raw 普通股）的量级边界。XBRL 股数量纲错把真实比例 r 乘上
+# 10^±3/±6，边界不能压在 r×10^±3 上——压上去等于抛硬币，口径噪声动几个百分点
+# 结论就翻（0.05 这个直觉值恰是 ENIC 的 50×10^-3，实测 raw = 0.050003）。
+# 2026-09-30 用生产 fetch_facts + yfinance 对 69 只 ADR 实测，出得了数的 50 只：
+# 真实比例最小 0.1025（BIDU：XBRL 稀释股数停在 2010 年，当时 10 ADS = 1 股），
+# 最大 476（BLRX）；FENG 43、CMCM 49 之后下一只就是 NCTY 149，50~149 之间没有。
+# 另两只是真量纲错：PAM 股数按百万入库（1360，raw 2.5e-05）、ENIC 按千股入库
+# （raw 0.0500）。两个边界都取 70×10^∓3，落在 50 与 149 两簇的缝里：
+# 下限 0.07：离最小真实比例 0.1 有 1.4 倍余量（TSLA 两侧口径噪声实测 10.4%）；
+#   比例 < 70 的票少三个零、少六个零都抓得到（MCD、PAM、ENIC）。
+# 上限 7×10^4：任何比例 >= 0.1 的票多六个零都 >= 10^5，抓得到；离实测最大的
+#   476 有两个数量级。
+# 盲区：比例 < 70 的票多三个零抓不到（本土票比例 1 → raw ≈ 1000）——真实比例
+# 实测已到 476，这个方向在量级上与真 ADR 分不开；PR #27 对拍 114 只票查出的
+# 量纲错全是少零的方向。
+_ADR_RATIO_MIN, _ADR_RATIO_MAX = 0.07, 7e4
+
+
 def _adr_calibration(price: float, mcap: float,
                      shares_ord_m: float) -> tuple[float, float | None]:
     """ADR 比例标定 -> (adr_multiple, 口径失配比例|None)。纯函数（0018 抽出可单测）。
@@ -1377,10 +1396,17 @@ def _adr_calibration(price: float, mcap: float,
     分叉）。此前这类值原样放行：TSLA 实测 0.8963 被当成「1 ADR=0.896 普通股」
     发货——美股普通票挂上假 ADR 口径、shares 被 rebase、带子与每股值口径混掉。
     现在回退 adr_multiple=1.0 并返回失配比例（进 caliber 说明 + 引擎全局黄旗），
-    shares 保持 XBRL 稀释口径。(0, 0.5] 与 [2, ∞) 之外圈维持原行为（整数 snap /
-    原样放行），不在本次收紧范围。"""
+    shares 保持 XBRL 稀释口径。
+
+    外圈 (0, 0.5] 与 [2, ∞) 只在真实 ADR 的量级内（_ADR_RATIO_MIN~MAX）维持原行为
+    （整数 snap / 原样放行）；出了这个量级抛 RuntimeError。此前外圈无条件放行：
+    MCD 的 XBRL 股数少六个零（711.1 股），raw = 1.005e-06 被当成「1 ADR = 1e-06
+    普通股」，股数 rebase 后碰巧对、prompt 里多一条荒谬口径。两侧谁错这里分不清，
+    回退 1.0 会让每股值差 10^6 倍，照旧放行是把错吸收成看似合理的输出——只能停。"""
     implied = mcap / (shares_ord_m * 1e6)
     raw = price / implied if implied > 0 else 1.0
+    if not _ADR_RATIO_MIN <= raw <= _ADR_RATIO_MAX:  # NaN 也落这里
+        raise RuntimeError(_adr_scale_message(price, mcap, shares_ord_m, raw))
     if abs(raw - 1) < 0.08:
         return 1.0, None
     snapped = round(raw)
@@ -1392,6 +1418,34 @@ def _adr_calibration(price: float, mcap: float,
     if 0.5 < raw < 2.0:
         return 1.0, abs(raw - 1)
     return raw, None
+
+
+def _adr_scale_message(price: float, mcap: float, shares_ord_m: float,
+                       raw: float) -> str:
+    """_adr_calibration 越界时的报错文案：两侧股数原数照印（不许让格式把 10^-6
+    舍成 0.00x，见 MCD 跳变哨兵的教训），并按是否落在千进制格点上区分病因。"""
+    xbrl = shares_ord_m * 1e6
+    if not (raw > 0 and math.isfinite(raw)):
+        return (f"现价/市值/股数不是正的有限数（现价 {price!r}、市值 {mcap!r}、"
+                f"XBRL 稀释股数 {xbrl!r}），无法标定 ADR 比例，停止估值、不进判断层")
+    lg = math.log10(raw)
+    on_grid = abs(lg - 3 * round(lg / 3)) <= 0.2
+    if not on_grid:
+        cause = ("不在千进制格点上，可能是 ADR 比例叠加量纲错、多类股/Up-C 两侧计入的"
+                 "股本范围不同，或 yfinance 市值本身错")
+    elif raw < 1:
+        cause = ("恰落在千进制格点上，多半是 XBRL 股数量纲错（千股/百万股按原数入库、"
+                 "iXBRL scale 漏标，如 MCD 2024 起的 732.3）")
+    else:
+        cause = ("恰落在千进制格点上，多半是量纲错（XBRL 股数多乘了一次 scale，"
+                 "或 yfinance 市值少了同样的零）")
+    return (f"市值与 XBRL 股数的量级对不上：XBRL 稀释股数 {xbrl:,.0f} 股，"
+            f"市值÷现价隐含 {mcap / price:,.0f} 股，前者是后者的 {raw:.3g} 倍"
+            f"（约 10^{round(lg) if on_grid else f'{lg:.1f}'}），超出真实 ADR 比例的"
+            f"量级（本闸放行 1 ADR = {_ADR_RATIO_MIN:g}~{_ADR_RATIO_MAX:g} 普通股）。"
+            f"{cause}。分不清哪一侧错：按这个比例折算股数、回退 1 ADR = 1 股各押一边，"
+            "押错了每股值就差同样倍数——停止估值、不进判断层；"
+            "先核对 facts.json 的 shares_diluted_* 与 yfinance marketCap")
 
 
 # 期后 filing 索引只留资本结构类表单：424B*（增发定价）/S-*（注册）/8-K（事件）/
@@ -1608,6 +1662,13 @@ async def _pipeline(job: dict, ticker: str, email: str) -> None:
         return float(fi["lastPrice"]), float(fi["marketCap"])
     # yfinance 无超时：Yahoo 卡住会永久占死唯一的任务槽（_running 不复位）
     price, mcap = await asyncio.wait_for(asyncio.to_thread(_price), timeout=60)
+    shares_ord = list(shares_series.values())[-1] / 1e6  # 普通股口径（百万股）
+    # ADR 换算见 _adr_calibration：整数/半数比例 snap，(0.5,2) 内的其余值是股数
+    # 口径噪声而非 ADR，回退 1.0 并把失配比例带进 caliber 与引擎全局黄旗；
+    # 超出真实 ADR 量级（XBRL 股数量纲错）直接抛错——紧跟取价，下载 filings、
+    # 抽章节、判断层都还没开始
+    adr_multiple, adr_mismatch = _adr_calibration(price, mcap, shares_ord)
+    shares = round(shares_ord / adr_multiple)  # ADR 等效股数：mcap ≈ price × shares
     info = await edgar.company_info(ticker, email)
 
     job["step"] = "filings"
@@ -1664,11 +1725,6 @@ async def _pipeline(job: dict, ticker: str, email: str) -> None:
     sections = (wd / "sections.json").read_text(encoding="utf-8")
 
     job["step"] = "judgment"
-    shares_ord = list(shares_series.values())[-1] / 1e6  # 普通股口径（百万股）
-    # ADR 换算见 _adr_calibration：整数/半数比例 snap，(0.5,2) 内的其余值是股数
-    # 口径噪声而非 ADR，回退 1.0 并把失配比例带进 caliber 与引擎全局黄旗
-    adr_multiple, adr_mismatch = _adr_calibration(price, mcap, shares_ord)
-    shares = round(shares_ord / adr_multiple)  # ADR 等效股数：mcap ≈ price × shares
     prompt_file = ("judgment_prompt_financials.md" if mode == "financials"
                    else "judgment_prompt.md")
     base_prompt = (VAL / prompt_file).read_text(encoding="utf-8")
