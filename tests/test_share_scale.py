@@ -131,6 +131,87 @@ def test_fix_share_scale_fetch_facts(name, sh, ni, eps, fixed, after):
     assert tuple(q[k] for k in _Q[:len(sh)]) == pytest.approx(after)
 
 
+# ------------------------------------------ EPS 地板按申报货币判（ENIC，2026-09-30）
+# pick 已把 EPS 折成美元；|EPS|<0.05 的地板防的是申报货币里的两位小数舍入。
+# 按美元判时，ENIC（2.1 CLP/股 → $0.0021）整条序列都没有 EPS 证人，千股量纲错从没被查过。
+
+_A = ("2022-12-31", "2023-12-31", "2024-12-31")
+
+
+def _annual_out(sh, ni, eps, fx=None):
+    out = {"shares_diluted_annual": dict(zip(_A, sh)),
+           "net_income_annual": dict(zip(_A, ni)),
+           "eps_diluted_annual": dict(zip(_A, eps))}
+    if fx is not None:
+        out["fx_to_usd"] = fx
+    return out
+
+
+def test_fx_floor_weak_currency_eps_is_a_witness():
+    """ENIC 原数（折美元后，fx=0.001）：股数按千股入库，三期都改 −3。"""
+    out = _annual_out((69166557.0,) * 3, (1252082258.0, 633455775.0, 145112153.0),
+                      (0.0181, 0.00916, 0.0021), fx=0.001)
+    ff._fix_share_scale(out)
+    assert out["shares_diluted_rescaled"] == {"annual": dict.fromkeys(_A, -3)}
+    assert out["shares_diluted_annual"]["2024-12-31"] == 69166557000.0
+
+
+def test_fx_floor_strong_currency_tiny_eps_still_skipped():
+    """反方向：GBP（fx=1.27）申报 0.04/股、折后 $0.0508——按美元判会越过地板，
+    按申报货币判仍是舍入太粗的 0.04，不当证人；没有别的锚，就不动。"""
+    out = _annual_out((717.6,), (20e6 * 1.27,), (0.04 * 1.27,), fx=1.27)
+    ff._fix_share_scale(out)
+    assert "shares_diluted_rescaled" not in out
+    assert out["shares_diluted_annual"]["2022-12-31"] == 717.6
+
+
+@pytest.mark.parametrize("eps_local, witness", [(0.06, True), (0.04, False)])
+def test_fx_floor_boundary_in_reporting_currency(eps_local, witness):
+    """地板本身钉在申报货币的 0.05 两侧（此前没有用例钉这个数）：CLP 0.06/股
+    折后 $0.00006 仍是证人，0.04 不是。单期、无别的锚：是证人才会被改。"""
+    fx = 0.001
+    out = _annual_out((717.6,), (717.6e6 * eps_local * fx,), (eps_local * fx,), fx=fx)
+    ff._fix_share_scale(out)
+    assert ("shares_diluted_rescaled" in out) is witness
+
+
+def test_fx_floor_usd_unchanged():
+    """美元申报（缺 fx_to_usd 或 =1.0）地板仍是 0.05：tiny EPS 不当证人。"""
+    for fx in (None, 1.0):
+        out = _annual_out((717.6,), (20e6,), (0.03,), fx=fx)
+        ff._fix_share_scale(out)
+        assert "shares_diluted_rescaled" not in out
+
+
+ENIC = json.loads((FIX.parent / "enic_companyfacts_min.json").read_text(encoding="utf-8"))
+
+
+def test_enic_build_facts_rescales_and_passes_adr_guard(monkeypatch):
+    """真实 ENIC companyfacts（CLP，20-F 只有年度）：2022-04-28 那份 20-F 起按千股
+    申报（69,166,557），2019/2020 比较期一并被重述成错量纲；2015-2018 是对的
+    （491 亿股，2018 增资后 639 亿），必须不动。修前估值管道算出 raw = 0.050003，
+    被 _adr_calibration 的量级闸拦下；修后是 691.7 亿股，raw ≈ 50——正是 ENIC 的
+    真实 ADR 比例（1 ADS = 50 股）。"""
+    import yfinance
+    from types import SimpleNamespace
+    from app.valuation_service import _adr_calibration
+    syms = []
+    monkeypatch.setattr(ff, "_companyfacts", lambda *a, **k: ENIC)
+    monkeypatch.setattr(yfinance, "Ticker", lambda s: syms.append(s) or
+                        SimpleNamespace(fast_info={"lastPrice": 0.001}))
+    out = ff.build_facts("ENIC", "x@example.com", cik=1659939)
+    assert syms == ["CLPUSD=X"] and out["currency"] == "CLP"
+    sha = out["shares_diluted_annual"]
+    assert sha["2024-12-31"] == 69166557000.0
+    rs = out["shares_diluted_rescaled"]["annual"]
+    assert rs == {f"{y}-12-31": -3 for y in range(2019, 2025)}
+    assert sha["2017-12-31"] == 49092772762.0          # 本来就对的期不动
+    assert sha["2018-12-31"] == 63913359484.0
+    # 2026-09-30 实测的 ENIC 现价 $4.24、yfinance 市值 $5.865B
+    m, mismatch = _adr_calibration(4.24, 5.865e9, sha["2024-12-31"] / 1e6)
+    assert (m, mismatch) == (50.0, None)
+
+
 # ---------------------------------------------------------------- 委托书不是财报
 
 def _proxy_facts():
