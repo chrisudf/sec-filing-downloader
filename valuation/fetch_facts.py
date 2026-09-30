@@ -461,11 +461,17 @@ def _fix_share_scale(out: dict) -> None:
     两个证人（与 pe_band.fix_share_scale 同规则，理由见那边 docstring）：EPS 说差
     10^e，且最近一个 EPS 说没问题的期的股数量级也差 10^e，才改——只信 EPS 会在
     净利错量纲时把对的股数改错。无 EPS 可对/两证人不一致的期最后对最近一个已定论期。
-    校正过的期记进 shares_diluted_rescaled，与 op_income_derived 同样留痕。"""
+    校正过的期记进 shares_diluted_rescaled，与 op_income_derived 同样留痕。
+
+    |EPS| < 0.05 不当证人（两位小数舍入误差 >10%）——舍入发生在**申报货币**里，而
+    pick 已按现汇把 EPS 折成美元，地板必须折回去判：ENIC 申报 2.1 CLP/股、折后
+    $0.0021，按美元判会让弱币种发行人整条序列都没有 EPS 证人（ENIC 股数按千股入库
+    69,166,557，应为 691.7 亿，因此从没被查过）。"""
     def _near(pool, k):
         d = date.fromisoformat(k)
         return min(pool, key=lambda c: abs((c[0] - d).days))[1]
 
+    eps_floor = 0.05 * (out.get("fx_to_usd") or 1.0)
     rescaled = {}
     for suffix in ("quarterly", "annual"):
         sh = out.get("shares_diluted_" + suffix) or {}
@@ -473,7 +479,7 @@ def _fix_share_scale(out: dict) -> None:
         eps = out.get("eps_diluted_" + suffix) or {}
         exps = {}
         for k, v in sh.items():
-            if ni.get(k) is None or not eps.get(k) or abs(eps[k]) < 0.05:
+            if ni.get(k) is None or not eps.get(k) or abs(eps[k]) < eps_floor:
                 continue
             if ni[k] / eps[k] <= 0 or v <= 0:     # 异号/非正：对不上
                 continue

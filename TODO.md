@@ -531,6 +531,12 @@ IBM 估值（base $194 vs 现价 $231）复盘时查出三处**数据层**缺口
       [0.07, 7×10^4] 抛 RuntimeError（紧跟取价，判断层之前）；边界按 69 只 ADR 实测定，
       取 70×10^∓3 避开 r×10^±3 格点（0.05 恰压在 ENIC 的 0.050003 上）。盲区：比例 < 70
       的票多三个零（本土 raw ≈ 1000）与真实大比例 ADR 量级上分不开
+- [x] `fetch_facts._fix_share_scale` 的 |EPS|<0.05 地板在折美元**之后**判：ENIC 申报
+      2.1 CLP/股、折后 $0.0021，整条序列没有 EPS 证人，千股量纲错（69,166,557，应为
+      691.7 亿）#27 没查到，只靠 #29 的量级闸拦下。地板改按申报货币判（0.05×fx）；
+      ENIC 2019–2024 六期 −3，raw 0.050003 → 50（真实 1 ADS = 50 股）
+- [ ] `_guard_derived_q4_eps` 的 5 美分豁免同样在折美元之后判：弱币种发行人的推导 Q4
+      EPS 差多少都落在豁免里、守卫形同关闭。20-F 发行人几乎没有季度 XBRL，暂未见实例
 - [ ] `compute_ptbv_band` 的加权股数兜底分支（无时点股数 tag 的金融股）没接校正；
       时点股数（CommonStockSharesOutstanding / dei）没有 EPS 锚，要另想办法
 - [ ] `WeightedAverageNumberOfSharesOutstandingBasic` 同样错量纲（MCD 实测），目前无消费方
