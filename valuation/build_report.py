@@ -8,10 +8,20 @@
 import json
 import os
 import sys
+from fractions import Fraction
 
 import openpyxl
 from openpyxl.styles import Font, PatternFill, Alignment, Border, Side
 from openpyxl.utils import get_column_letter
+
+
+def _adr_label(m):
+    """5/9、2/3 这类除不尽的 ADR 比例写成 p/q（与 valuation_service._adr_ratio_label 同规则）。"""
+    f = Fraction(m).limit_denominator(9)
+    if f.denominator in (3, 6, 7, 9) and abs(float(f) - m) < 1e-9:
+        return f"{f.numerator}/{f.denominator}"
+    return f"{m:g}"
+
 
 SP = os.path.dirname(os.path.abspath(__file__))
 d = json.load(open(sys.argv[1], encoding="utf-8"))
@@ -248,7 +258,7 @@ if MODE == "financials":
                   "；口径注意：本份为 fin v3 之前的旧语义（情景盈利×情景倍数，"
                   "无一致性联动）"))
     if M.get("adr_multiple", 1.0) != 1.0:
-        caliber += f"；价格为 ADR（1 ADR = {M['adr_multiple']:g} 普通股，股本已折算）"
+        caliber += f"；价格为 ADR（1 ADR = {_adr_label(M['adr_multiple'])} 普通股，股本已折算）"
     if M.get("currency", "USD") != "USD":
         caliber += f"；申报货币 {M['currency']}，已按现汇折算美元"
     put(ws, "A3", caliber, GREEN, border=False)
@@ -651,7 +661,7 @@ put(ws, "A1", f"{d['name']} / {T} 估值分析", TITLE, border=False)
 put(ws, "A2", f"sec-filing-downloader + SEC XBRL · {d['date']} · 分析工具输出，不构成投资建议", GREEN, border=False)
 _caliber = "目标价口径：综合目标价 = 当前公允价值（锚定前瞻期 NTM 盈利与 DCF 现值，窗口见情景假设表）"
 if d["meta"].get("adr_multiple", 1.0) != 1.0:
-    _caliber += f"；价格为 ADR（1 ADR = {d['meta']['adr_multiple']:g} 普通股，股本已折算）"
+    _caliber += f"；价格为 ADR（1 ADR = {_adr_label(d['meta']['adr_multiple'])} 普通股，股本已折算）"
 if d["meta"].get("currency", "USD") != "USD":
     _caliber += f"；申报货币 {d['meta']['currency']}，已按现汇折算美元"
 put(ws, "A3", _caliber, GREEN, border=False)
