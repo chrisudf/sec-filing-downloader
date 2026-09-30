@@ -29,6 +29,7 @@ from fastapi.responses import FileResponse
 from pydantic import BaseModel
 
 from . import edgar
+from .adr_cover import cover_text, parse_ads_ratio
 
 ROOT = Path(__file__).resolve().parent.parent
 if str(ROOT) not in sys.path:
@@ -1437,8 +1438,7 @@ def _adr_calibration(price: float, mcap: float, shares_ord_m: float, *,
     MCD 的 XBRL 股数少六个零（711.1 股），raw = 1.005e-06 被当成「1 ADR = 1e-06
     普通股」，股数 rebase 后碰巧对、prompt 里多一条荒谬口径。两侧谁错这里分不清，
     回退 1.0 会让每股值差 10^6 倍，照旧放行是把错吸收成看似合理的输出——只能停。"""
-    implied = mcap / (shares_ord_m * 1e6)
-    raw = price / implied if implied > 0 else 1.0
+    raw = _adr_raw(price, mcap, shares_ord_m)
     if not _ADR_RATIO_MIN <= raw <= _ADR_RATIO_MAX:  # NaN 也落这里
         raise RuntimeError(_adr_scale_message(price, mcap, shares_ord_m, raw))
     if abs(raw - 1) < 0.08:
@@ -1459,21 +1459,101 @@ def _adr_calibration(price: float, mcap: float, shares_ord_m: float, *,
     return raw, None
 
 
+def _adr_raw(price: float, mcap: float, shares_ord_m: float) -> float:
+    """XBRL 稀释股数 ÷ 市值隐含股数 = 每 ADS 折多少 XBRL 口径普通股（市值为 0 时按 1）。"""
+    implied = mcap / (shares_ord_m * 1e6)
+    return price / implied if implied > 0 else 1.0
+
+
+# 年报封面比例（第二个证人）与 raw 对拍。封面是 ADS 与**当前**普通股的比例，raw 是
+# ADS 与 **XBRL 口径**普通股的比例，两者之比 q 说明 XBRL 股数与现在差多少：
+# - 8% 内：一致，用封面比例
+# - 对不上、XBRL 股数又陈旧（BIDU 停在 2010，q = 1/78；FENG 停在 2011，q = 0.90）：
+#   XBRL 口径本身已不代表今天，信市值隐含股数，黄旗说明。放在漂移档之前——否则
+#   FENG 会按 15 年前的股数折算，黄旗还写「按 XBRL 股数口径」
+# - 1.5 倍内：股本漂移（回购/增发/可转债摊薄，实测 JOYY 8.8%、VOD 13%、HMC 20%、
+#   IMRN 28.5%），按封面比例 + XBRL 口径，失配比例进黄旗——与 TSLA 回退同一语义
+# - 离拆股倍数 2/3/4/5/10（或其倒数）8% 内：XBRL 股数与封面不在同一股本口径上
+#   （HDB 1:1 送股在 XBRL 期之后，q = 0.497），按 XBRL 口径折成 封面×倍数，黄旗说明。
+#   封面自己也会错：MFG 2026-06 的 20-F 封面（dei:Security12bTitle）写 1 ADS = 2 股，
+#   东京 8411.T 股价折算实为 0.198（疑为 2020 年 1 合 10 之前的旧比例没改，未核）——
+#   q = 0.103，同样落在这一档：数值跟市场，旗把两边都说出来
+# - 都不是（XBRL 股数与财务数据同期）（CANF 封面 2、raw 0.768，差 2.6 倍）：分不清哪边
+#   错，押错了每股值就差这么多倍——停（与 _ADR_RATIO_MIN/MAX 越界同型）
+_ADR_COVER_DRIFT = 1.5
+_ADR_SPLIT_FACTORS = (2, 3, 4, 5, 10)
+
+
+def _adr_cover_check(raw: float, cover: Fraction, *, shares_asof: str, shares_lag: int,
+                     data_latest: str | None, quote: str = "") -> tuple[float, float | None, str | None]:
+    """封面比例与 raw 对拍 -> (adr_multiple, 口径失配比例|None, 口径断层说明|None)。纯函数。
+    quote 是解析出比例的封面原文片段：进断层说明和停止估值的报错——解析器读错时，
+    人要能一眼看出来。"""
+    c = float(cover)
+    q = raw / c
+    if abs(q - 1) < 0.08:
+        return c, None, None
+    lab = _adr_ratio_label(c)
+    src = f"（原文「{quote[:80]}」）" if quote else ""
+    if shares_lag > _SHARES_STALE_DAYS:
+        return raw, None, (
+            f"XBRL 稀释股数停在 {shares_asof}（比财务数据 {data_latest} 早 {shares_lag} 天），"
+            f"与年报封面 1 ADS = {lab} 股对不上（每 ADS 折 {raw:.3g} 股）——shares 按市值隐含股数")
+    if 1 / _ADR_COVER_DRIFT <= q <= _ADR_COVER_DRIFT:
+        return c, abs(q - 1), None
+    for k in _ADR_SPLIT_FACTORS:
+        for f in (k, 1 / k):
+            if abs(q / f - 1) < 0.08:
+                m = c * f
+                return m, None, (
+                    f"年报封面载明 1 ADS = {lab} 股{src}，按 XBRL 稀释股数（{shares_asof}）反推每 ADS "
+                    f"折 {raw:.3g} 股，{'少' if f < 1 else '多'}了约 {k} 倍——XBRL 股数与封面不在"
+                    "同一股本口径上：拆股/送股/合股发生在 XBRL 期之后、股本大幅变动、"
+                    "yfinance 市值口径错，或封面比例本身没更新。已按 XBRL 口径折成 "
+                    f"1 ADR = {_adr_ratio_label(m)} 股（shares ≈ 市值隐含股数），请对照原始股价核实")
+    raise RuntimeError(
+        f"年报封面载明 1 ADS = {lab} 股{src}，按 XBRL 稀释股数（{shares_asof}）反推每 ADS 折 "
+        f"{raw:.3g} 股，差 {max(q, 1 / q):.2g} 倍——不是拆股/送股的整数倍，XBRL 股数又与财务"
+        "数据同期：分不清是 XBRL 期后股本大变（增发/回购）还是 yfinance 市值错。按封面比例"
+        "折股、按市值隐含股数各押一边，押错了每股值就差这么多倍——停止估值、不进判断层；"
+        "先核对 facts.json 的 shares_diluted_* 与 yfinance marketCap")
+
+
+def _annual_report_file(manifest_csv: str) -> str | None:
+    """filings 清单里最新一份年报主文档（10-K / 20-F，不含 EX-13 等附件）的文件名。"""
+    rows = [r for r in csv.DictReader(io.StringIO(manifest_csv))
+            if (r.get("form") or "").strip() in ("10-K", "20-F")]
+    if not rows:
+        return None
+    return max(rows, key=lambda r: r.get("reportDate") or r.get("filingDate") or "")["file"]
+
+
 def _share_caliber(adr_multiple: float, adr_mismatch: float | None,
-                   shares_asof: str, shares_lag: int, data_latest: str | None) -> str:
-    """股数/ADR 口径的 caliber 说明（进判断层 prompt）。纯函数，便于单测。"""
+                   shares_asof: str, shares_lag: int, data_latest: str | None,
+                   cover: Fraction | None = None, basis_note: str | None = None) -> str:
+    """股数/ADR 口径的 caliber 说明（进判断层 prompt）。纯函数，便于单测。
+    cover 是年报封面载明的比例（adr_cover.parse_ads_ratio），basis_note 是
+    _adr_cover_check 判出的口径断层说明。"""
     out = ""
-    if adr_multiple != 1.0:
+    if cover is not None and (cover != 1 or adr_multiple != 1.0):
+        out += f"\n口径说明：价格为 ADR 价（年报封面载明 1 ADS = {_adr_ratio_label(float(cover))} 普通股"
+        if abs(adr_multiple - float(cover)) > 1e-9:
+            out += f"，按 XBRL 股数口径折成 1 ADR = {_adr_ratio_label(adr_multiple)} 股"
+        out += "），shares 已折为 ADR 等效股数；你输出的 fwd_shares 也用 ADR 等效口径。"
+        if basis_note:
+            out += basis_note
+    elif adr_multiple != 1.0:
         out += (f"\n口径说明：价格为 ADR 价（1 ADR = {_adr_ratio_label(adr_multiple)} "
                 "普通股），shares 已折为 ADR 等效股数；你输出的 fwd_shares 也用 ADR 等效口径。")
         if Fraction(adr_multiple).limit_denominator(9) in _ADR_FRACTIONS:
             out += ("该比例由市值隐含股数反推、取最近的简单分数（非 20-F 原文）；"
                     "SECTIONS 若载明不同的 ADS 比例，在 rationale 里指出。")
     if adr_mismatch is not None:
-        out += (f"\n口径说明：市值隐含股数与 XBRL 稀释股数差 {adr_mismatch:.1%}"
-                "（未落在可认定的 ADR 比例上，判定为股数口径噪声而非 ADR，已按 1 ADR=1 股处理）"
+        why = ("按年报封面比例折算后" if cover is not None else
+               "未落在可认定的 ADR 比例上，判定为股数口径噪声而非 ADR，已按 1 ADR=1 股处理")
+        out += (f"\n口径说明：市值隐含股数与 XBRL 稀释股数差 {adr_mismatch:.1%}（{why}）"
                 "——shares 取 XBRL 加权稀释股数，net_cash/每股值一律按 XBRL 股数口径。")
-    if shares_lag > _SHARES_STALE_DAYS:
+    if shares_lag > _SHARES_STALE_DAYS and not basis_note:
         out += (f"\n口径说明：XBRL 稀释股数最新一期是 {shares_asof}，比财务数据"
                 f"（{data_latest}）早 {shares_lag} 天——期间的拆股/送股/回购"
                 "都没进 shares；fwd_shares 以 SECTIONS 原文的最新股本推算。")
@@ -1703,6 +1783,30 @@ def _prev_core(prev: dict) -> dict:
     return {k: prev[k] for k in _PREV_CORE_KEYS if k in prev}
 
 
+def _prev_stale_reason(prev: dict, *, ticker: str, mode: str, latest_report: str,
+                       price: float, adr_multiple: float) -> str | None:
+    """上次运行的 config 还能不能当连续性基准 -> 失效原因|None。纯函数。
+
+    ADR 折算口径那条（2026-09-30）：fwd_shares/net_cash 等是 ADR 等效口径的数，折算
+    比例一变（#31/#32 改了 21 只 ADR 的比例，JOYY 22→20；以后 HDB 的 FY26 XBRL 进来
+    也会 1.5→3），上次的 fwd_shares 就差同样的倍数——连续性纪律「无新证据不改数」
+    会把它原样锚住。"""
+    sem = (4 if mode == "standard" else 3)  # 与 cfg 构造点同一映射（test_prompt_injection 钉住）
+    if prev.get("ticker") != ticker:
+        return "标的不符"
+    if prev.get("semantics_version", 1) != sem:
+        return f"语义版本 v{prev.get('semantics_version', 1)} != v{sem}"
+    if prev.get("manifest_latest") and latest_report and prev["manifest_latest"] != latest_report:
+        return f"出现新报告期 {latest_report}（上次基于 {prev['manifest_latest']}）"
+    if prev.get("price") and abs(price / prev["price"] - 1) > 0.15:
+        return f"现价较上次变动 {price / prev['price'] - 1:+.0%}（>15%）"
+    old = prev.get("adr_multiple", 1.0)
+    if abs(old / adr_multiple - 1) > 0.01:
+        return (f"ADR 折算口径变了（上次 1 ADR = {_adr_ratio_label(old)} 股，本次 "
+                f"{_adr_ratio_label(adr_multiple)} 股）——上次的 fwd_shares 等 ADR 等效口径的数不能沿用")
+    return None
+
+
 def _persist_prev_config(ticker: str, cfg: dict, reds: list, latest_report) -> None:
     """连续性锚持久化（v2）：只有 gate-clean（无 red 红旗）的 config 才能成为下次
     运行的基准——带病假设冻结成锚会让偏差跨运行复利（方差可见，偏差不可见）。
@@ -1775,7 +1879,6 @@ async def _pipeline(job: dict, ticker: str, email: str) -> None:
     adr_multiple, adr_mismatch = _adr_calibration(
         price, mcap, shares_ord, files_20f=_files_20f(info["latest"]),
         shares_current=shares_lag <= _SHARES_STALE_DAYS)
-    shares = round(shares_ord / adr_multiple)  # ADR 等效股数：mcap ≈ price × shares
 
     job["step"] = "filings"
     groups = [edgar.QUARTER_FORMS, edgar.ANNUAL_FORMS]
@@ -1789,6 +1892,24 @@ async def _pipeline(job: dict, ticker: str, email: str) -> None:
         zf.extractall(fdir)
     htms = sorted(str(p) for p in fdir.iterdir() if p.suffix.lower() in (".htm", ".html"))
     manifest = (fdir / "manifest.csv").read_text(encoding="utf-8")
+    # ADR 标定的第二个证人：年报封面 Section 12(b) 载明的比例（年报已在 filings 里，
+    # 不另发请求）。认得出就与 raw 对拍，封面比例定案；认不出沿用上面的纯数字结果。
+    # 两证人对不上又分不清哪边错时 _adr_cover_check 抛错——仍在判断层之前
+    adr_cover = adr_basis_note = None
+    annual = _annual_report_file(manifest)
+    if annual and (fdir / annual).exists():
+        try:
+            parsed = parse_ads_ratio(cover_text((fdir / annual).read_text(
+                encoding="utf-8", errors="replace")), ticker)
+        except Exception as e:  # noqa: BLE001 —— 解析器的 bug 不许杀任务，退回纯数字结果
+            parsed = None
+            job["detail"] = f"年报封面 ADS 比例解析失败（{type(e).__name__}: {e!r:.80}），沿用市值反推"
+        if parsed and _ADR_RATIO_MIN <= parsed[0] <= _ADR_RATIO_MAX:
+            adr_cover = parsed[0]
+            adr_multiple, adr_mismatch, adr_basis_note = _adr_cover_check(
+                _adr_raw(price, mcap, shares_ord), adr_cover, shares_asof=shares_asof,
+                shares_lag=shares_lag, data_latest=facts.get("data_latest"), quote=parsed[1])
+    shares = round(shares_ord / adr_multiple)  # ADR 等效股数：mcap ≈ price × shares
     latest_report = max((r.get("reportDate") or "" for r in
                          csv.DictReader(io.StringIO(manifest))), default="")
     pending_8k = next((r for r in csv.DictReader(io.StringIO(manifest))
@@ -1835,7 +1956,8 @@ async def _pipeline(job: dict, ticker: str, email: str) -> None:
                    else "judgment_prompt.md")
     base_prompt = (VAL / prompt_file).read_text(encoding="utf-8")
     caliber = _share_caliber(adr_multiple, adr_mismatch, shares_asof, shares_lag,
-                             facts.get("data_latest"))
+                             facts.get("data_latest"), cover=adr_cover,
+                             basis_note=adr_basis_note)
     if facts.get("currency", "USD") != "USD":
         caliber += (f"\n口径说明：申报货币 {facts['currency']}，FACTS 已按现汇 "
                     f"{facts.get('fx_to_usd', 1):.5f} 折算美元（恒定汇率）；"
@@ -1889,23 +2011,16 @@ async def _pipeline(job: dict, ticker: str, email: str) -> None:
     #   2) 出现更新的报告期（新财报=新证据，禁止锚死在旧假设上——连续性最危险的
     #      失效模式就是财报后按构造低反应）
     #   3) 现价较上次运行变动 >15%（市场环境已变，倍数/wacc 假设需重估）
+    #   4) ADR 折算口径变了（见 _prev_stale_reason）
     prev_section = ""
     if not os.environ.get("VALUATION_NO_CONTINUITY"):
         prev_path = os.environ.get("VALUATION_PREV_CONFIG") or str(PREV_DIR / f"{ticker}.json")
         if Path(prev_path).exists():
             try:
                 prev = json.loads(Path(prev_path).read_text(encoding="utf-8"))
-                stale = None
-                if prev.get("ticker") != ticker:
-                    stale = "标的不符"
-                elif prev.get("semantics_version", 1) != (4 if mode == "standard" else 3):
-                    stale = (f"语义版本 v{prev.get('semantics_version', 1)} != "
-                             f"v{4 if mode == 'standard' else 3}")
-                elif prev.get("manifest_latest") and latest_report \
-                        and prev["manifest_latest"] != latest_report:
-                    stale = f"出现新报告期 {latest_report}（上次基于 {prev['manifest_latest']}）"
-                elif prev.get("price") and abs(price / prev["price"] - 1) > 0.15:
-                    stale = f"现价较上次变动 {price / prev['price'] - 1:+.0%}（>15%）"
+                stale = _prev_stale_reason(prev, ticker=ticker, mode=mode,
+                                           latest_report=latest_report, price=price,
+                                           adr_multiple=adr_multiple)
                 if stale:
                     prev_section = (f"\n\n# 假设连续性说明\n上次运行（{prev.get('date')}）的假设"
                                     f"已失效：{stale}。本次独立重建全部假设。")
@@ -2069,6 +2184,9 @@ async def _pipeline(job: dict, ticker: str, email: str) -> None:
         # 写键——不给历史 config 无端加一个恒 null 字段
         if adr_mismatch is not None:
             c["share_count_mismatch"] = round(adr_mismatch, 4)
+        # 年报封面与 XBRL 股数的口径断层（拆股倍数 / XBRL 股数陈旧）：同上，引擎打全局黄旗
+        if adr_basis_note:
+            c["share_basis_note"] = adr_basis_note
         # fwd_label 是可由 report_end 纯日期推导的事实，与 price/shares 同类：
         # 在此**覆盖**判断层的输出，让"选错财年"这个失败模式从构造上不存在。
         # 判断层若仍输出了该字段，静默被盖掉即可——prompt 已明确要求不要输出。

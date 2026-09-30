@@ -1498,6 +1498,9 @@ if MODE == "financials":
             ["yellow", f"市值隐含股数与 XBRL 稀释股数差 {cfg['share_count_mismatch']:.1%}"
                        "——两侧口径不一致（yfinance 市值 vs XBRL 加权稀释股数），"
                        "net_cash/每股值按 XBRL 股数口径"])
+    # 年报封面比例与 XBRL 股数的口径断层（服务层 _adr_cover_check 写的说明，同一条黄旗）
+    if cfg.get("share_basis_note"):
+        out["warnings_global"].append(["yellow", cfg["share_basis_note"]])
 
     # 敏感性：base 口径 justified P/TBV 每股价值 = f(WACC, 永续g)
     s = cfg["scenarios"]["base"]
@@ -1755,6 +1758,10 @@ if cfg.get("share_count_mismatch"):
         ["yellow", f"市值隐含股数与 XBRL 稀释股数差 {cfg['share_count_mismatch']:.1%}"
                    "——两侧口径不一致（yfinance 市值 vs XBRL 加权稀释股数），"
                    "net_cash/每股值按 XBRL 股数口径"])
+# 年报封面比例与 XBRL 股数的口径断层（服务层 _adr_cover_check）：XBRL 股数与封面差整数倍
+# （拆股/送股在 XBRL 期后）或 XBRL 股数陈旧，shares 已按市值口径折——同样必须可见
+if cfg.get("share_basis_note"):
+    out["warnings_global"].append(["yellow", cfg["share_basis_note"]])
 out["warnings_global"] += seg_share_crosscheck(
     cfg.get("seg1_share"), cfg.get("segment_revenue_share"),
     cfg.get("segment_count"), sotp_in_blend)

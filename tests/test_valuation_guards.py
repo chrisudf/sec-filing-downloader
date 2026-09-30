@@ -1505,6 +1505,220 @@ def test_adr_fraction_evidence_wired_into_pipeline():
 
 
 # =====================================================================
+# 年报封面比例作第二个证人（2026-09-30）：51 份 10-K/20-F 封面全部解析正确。与 raw
+# 对拍：一致用封面；1.5 倍内是股本漂移（XBRL 口径 + 黄旗）；差拆股倍数是口径断层
+# （封面×倍数 + 断层旗）；都不是时 XBRL 陈旧就信市值、同期就停。原数全部实测。
+# =====================================================================
+
+def _cover(raw, cover, lag=0):
+    from fractions import Fraction as F
+    from app.valuation_service import _adr_cover_check
+    return _adr_cover_check(raw, F(cover), shares_asof="2025-12-31", shares_lag=lag,
+                            data_latest="2025-12-31")
+
+
+@pytest.mark.parametrize("raw, cover, want", [
+    (0.5558, "5/9", 5 / 9),     # SKM
+    (0.6940, "2/3", 2 / 3),     # GOTU
+    (0.2578, "1/4", 0.25),      # PKX：修前原样放行 0.2578
+    (0.3478, "1/3", 1 / 3),     # TAL
+    (49.41, "50", 50.0),        # CMCM：修前就近取整成 49
+    (20.65, "20", 20.0),        # AMX：修前 21
+])
+def test_cover_agrees_uses_cover(raw, cover, want):
+    m, mismatch, note = _cover(raw, cover)
+    assert m == pytest.approx(want, rel=1e-12) and mismatch is None and note is None
+
+
+@pytest.mark.parametrize("raw, cover, drift", [
+    (21.75, "20", 0.0875),      # JOYY：修前就近取整成 22
+    (18.39, "20", 0.0805),      # EDN：修前 18
+    (11.31, "10", 0.131),       # VOD：修前 11
+    (11.19, "10", 0.119),       # TM
+    (3.600, "3", 0.200),        # HMC：修前原样放行 3.6
+    (28.61, "40", 0.2848),      # IMRN
+    (1.093, "1", 0.093),        # WB
+])
+def test_cover_drift_keeps_cover_and_flags(raw, cover, drift):
+    """两证人差在 1.5 倍内：股本漂移。按封面比例 + XBRL 口径，失配进黄旗（TSLA 同语义）。"""
+    m, mismatch, note = _cover(raw, cover)
+    assert m == float(cover) and mismatch == pytest.approx(drift, abs=1e-3) and note is None
+
+
+@pytest.mark.parametrize("raw, cover, want, word", [
+    (1.4903, "3", 1.5, "少了约 2 倍"),      # HDB：1:1 送股在 XBRL 期之后
+    (148.9, "300", 150.0, "少了约 2 倍"),   # NCTY
+    (286.5, "100", 300.0, "多了约 3 倍"),   # XTLB
+    (0.2053, "2", 0.2, "少了约 10 倍"),     # MFG：封面写 2，东京股价折算 0.198
+])
+def test_cover_split_factor_is_basis_break(raw, cover, want, word):
+    m, mismatch, note = _cover(raw, cover)
+    assert m == pytest.approx(want) and mismatch is None
+    assert word in note and "封面比例本身没更新" in note and "1 ADR = " in note
+
+
+def test_cover_stale_shares_trusts_market():
+    """BIDU：XBRL 股数停在 2010，封面 8、raw 0.1025（差 78 倍，不是拆股倍数）——信市值。"""
+    from fractions import Fraction as F
+    from app.valuation_service import _adr_cover_check
+    m, mismatch, note = _adr_cover_check(0.10253, F(8), shares_asof="2010-12-31",
+                                         shares_lag=5479, data_latest="2025-12-31")
+    assert m == 0.10253 and mismatch is None
+    assert "停在 2010-12-31" in note and "早 5479 天" in note and "市值隐含股数" in note
+
+
+def test_cover_stale_shares_beats_drift_band():
+    """FENG：XBRL 股数停在 2011，封面 48、raw 43.2（差 10%，本在漂移档）。陈旧股数先判：
+    不许按 15 年前的股数折算、还挂「按 XBRL 股数口径」的黄旗。"""
+    from fractions import Fraction as F
+    from app.valuation_service import _adr_cover_check
+    m, mismatch, note = _adr_cover_check(43.22, F(48), shares_asof="2011-12-31",
+                                         shares_lag=5114, data_latest="2025-12-31")
+    assert m == 43.22 and mismatch is None and "停在 2011-12-31" in note
+    # 陈旧但两证人一致：照用封面
+    assert _adr_cover_check(47.5, F(48), shares_asof="2011-12-31", shares_lag=5114,
+                            data_latest="2025-12-31") == (48.0, None, None)
+
+
+def test_cover_irreconcilable_raises():
+    """CANF：封面 2、raw 0.768、股数与财务数据同期——差 2.6 倍又不是拆股倍数，停。"""
+    with pytest.raises(RuntimeError) as ei:
+        _cover(0.7683, "2")
+    msg = str(ei.value)
+    assert "差 2.6 倍" in msg and "停止估值" in msg and "1 ADS = 2 股" in msg
+    assert "原文" not in msg                      # 没给原文片段就不写
+
+
+def test_cover_quote_in_raise_and_split_note():
+    """停止估值与断层说明都带上解析出比例的封面原文：解析器读错时人能一眼看出来。"""
+    from fractions import Fraction as F
+    from app.valuation_service import _adr_cover_check
+    kw = dict(shares_asof="2025-12-31", shares_lag=0, data_latest="2025-12-31")
+    with pytest.raises(RuntimeError, match="原文「each representing 2 Ordinary Shares」"):
+        _adr_cover_check(0.7683, F(2), quote="each representing 2 Ordinary Shares", **kw)
+    note = _adr_cover_check(0.2053, F(2), quote="each of which represents two shares", **kw)[2]
+    assert "原文「each of which represents two shares」" in note
+
+
+@pytest.mark.parametrize("q, kind", [
+    (1.079, "agree"), (1.081, "drift"), (1.5, "drift"), (1 / 1.5, "drift"),
+    (1.52, "raise"), (0.66, "raise"), (1.85, "split"), (0.463, "split"), (0.455, "raise"),
+])
+def test_cover_band_edges(q, kind):
+    if kind == "raise":
+        with pytest.raises(RuntimeError):
+            _cover(10.0 * q, "10")
+        return
+    m, mismatch, note = _cover(10.0 * q, "10")
+    got = ("agree" if mismatch is None and note is None else
+           "drift" if mismatch is not None else "split")
+    assert got == kind
+
+
+def _stale(**kw):
+    from app.valuation_service import _prev_stale_reason
+    prev = dict(ticker="JOYY", semantics_version=4, manifest_latest="2025-12-31",
+                price=80.0, adr_multiple=22.0)
+    prev.update(kw.pop("prev", {}))
+    args = dict(ticker="JOYY", mode="standard", latest_report="2025-12-31", price=80.0,
+                adr_multiple=22.0)
+    args.update(kw)
+    return _prev_stale_reason(prev, **args)
+
+
+def test_prev_stale_reason_existing_triggers():
+    """抽成纯函数前后同答：标的、语义版本、新报告期、现价 >15%。"""
+    assert _stale() is None
+    assert _stale(ticker="BIDU") == "标的不符"
+    assert "语义版本 v4 != v3" in _stale(mode="financials")
+    assert "出现新报告期 2026-06-30" in _stale(latest_report="2026-06-30")
+    assert "+19%" in _stale(price=95.0)
+    assert _stale(price=91.0) is None                 # +13.75% 不失效
+
+
+def test_prev_stale_reason_adr_basis_change():
+    """ADR 折算口径变了（JOYY 22→20）：上次的 fwd_shares 是另一个口径的数，不许沿用。"""
+    r = _stale(adr_multiple=20.0)
+    assert "ADR 折算口径变了" in r and "1 ADR = 22 股" in r and "本次 20 股" in r
+    assert _stale(adr_multiple=22.1) is None          # 0.5% 内是同一口径
+    # 旧 config 没有 adr_multiple 键：按 1 处理——本土票不变，改成 ADR 的失效
+    from app.valuation_service import _prev_stale_reason
+    old = dict(ticker="SKM", semantics_version=4, price=35.0)
+    assert _prev_stale_reason(old, ticker="SKM", mode="standard", latest_report="",
+                              price=35.0, adr_multiple=1.0) is None
+    assert "5/9" in _prev_stale_reason(old, ticker="SKM", mode="standard", latest_report="",
+                                       price=35.0, adr_multiple=5 / 9)
+
+
+def test_annual_report_file_picks_primary_annual():
+    """清单里只挑年报主文档：EX-13、6-K 附件、8-K 新闻稿都不算。"""
+    from app.valuation_service import _annual_report_file
+    man = ("file,form,reportDate,filingDate,accessionNumber,sourceUrl\n"
+           "X_10-K_2024-12-31.htm,10-K,2024-12-31,2025-02-01,a,u\n"
+           'X_10-K_2025-12-31_ex13_a.htm,"10-K (exhibit 13, 年报正文)",2025-12-31,2026-02-01,b,u\n'
+           "X_10-K_2025-12-31.htm,10-K,2025-12-31,2026-02-01,b,u\n"
+           "X_10-Q_2026-06-30.htm,10-Q,2026-06-30,2026-08-01,c,u\n")
+    assert _annual_report_file(man) == "X_10-K_2025-12-31.htm"
+    assert _annual_report_file(man.replace("10-K,", "20-F,")) == "X_10-K_2025-12-31.htm"
+    assert _annual_report_file("file,form,reportDate,filingDate\nX.htm,6-K,2026-06-30,x\n") is None
+
+
+def test_share_caliber_with_cover_drift():
+    from fractions import Fraction as F
+    from app.valuation_service import _share_caliber
+    c = _share_caliber(20.0, 0.0875, "2025-12-31", 0, "2025-12-31", cover=F(20))
+    assert "年报封面载明 1 ADS = 20 普通股" in c and "折成" not in c
+    assert "差 8.8%（按年报封面比例折算后）" in c and "按 1 ADR=1 股处理" not in c
+
+
+def test_share_caliber_with_cover_basis_break():
+    from fractions import Fraction as F
+    from app.valuation_service import _share_caliber
+    c = _share_caliber(1.5, None, "2025-03-31", 0, "2025-03-31", cover=F(3),
+                       basis_note="NOTE-HDB")
+    assert "年报封面载明 1 ADS = 3 普通股，按 XBRL 股数口径折成 1 ADR = 1.5 股" in c
+    assert "NOTE-HDB" in c
+    # 陈旧说明已在断层说明里，不重复
+    s = _share_caliber(0.10253, None, "2010-12-31", 5479, "2025-12-31", cover=F(8),
+                       basis_note="NOTE-BIDU")
+    assert "NOTE-BIDU" in s and "XBRL 稀释股数最新一期" not in s
+
+
+def test_share_caliber_cover_fraction_has_no_inference_note():
+    """封面载明的 5/9 不是反推的，不许再说「非 20-F 原文」；1:1 封面不出 ADR 行。"""
+    from fractions import Fraction as F
+    from app.valuation_service import _share_caliber
+    c = _share_caliber(5 / 9, None, "2024-12-31", 0, "2024-12-31", cover=F(5, 9))
+    assert "1 ADS = 5/9 普通股" in c and "反推" not in c
+    assert "ADR" not in _share_caliber(1.0, None, "2025-12-31", 0, "2025-12-31", cover=F(1))
+
+
+def test_cover_witness_wired_into_pipeline():
+    """接线哨兵：封面对拍在 filings 解压之后、抽章节之前；shares 在对拍之后才算；
+    断层说明进 cfg；解析器出错只降级，对拍的抛错不吞。"""
+    import inspect
+    from app import valuation_service as vs
+    src = inspect.getsource(vs._pipeline)
+    chk = src.index("_adr_cover_check(")
+    assert src.index('manifest = (fdir / "manifest.csv")') < chk
+    assert chk < src.index('job["step"] = "sections"')
+    assert chk < src.index("shares = round(shares_ord / adr_multiple)")
+    assert src.count("shares = round(shares_ord / adr_multiple)") == 1
+    assert 'c["share_basis_note"] = adr_basis_note' in src
+    assert "cover=adr_cover," in src and "basis_note=adr_basis_note" in src
+    assert "if annual and (fdir / annual).exists():" in src
+    assert "if parsed and _ADR_RATIO_MIN <= parsed[0] <= _ADR_RATIO_MAX:" in src
+    assert 'data_latest=facts.get("data_latest"), quote=parsed[1])' in src
+    # 连续性失效判断走纯函数，并且带上本次的 ADR 折算口径
+    assert "stale = _prev_stale_reason(prev, ticker=ticker, mode=mode," in src
+    assert "adr_multiple=adr_multiple)" in src
+    assert src.index("_adr_cover_check(") < src.index("stale = _prev_stale_reason(")
+    try_blk = src[src.index("parsed = parse_ads_ratio("):chk]
+    assert "except Exception" in try_blk      # 解析器 bug 降级
+    assert "except" not in src[chk:src.index("shares = round(shares_ord / adr_multiple)")]
+
+
+# =====================================================================
 # override 的口径闸（0019）—— TSM 实测：ttm_revenue_override 只换营收基准，
 # TTM cfo/capex 还停在旧 XBRL 窗口（FCF 率 19.6% 旧 vs 25.8% 真），margins
 # 谷底下限（0.4×当前）与上界（1.2×当前）都锚在过期分母上。偏离 >10% 时
