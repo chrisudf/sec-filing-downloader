@@ -535,6 +535,28 @@ IBM 估值（base $194 vs 现价 $231）复盘时查出三处**数据层**缺口
       时点股数（CommonStockSharesOutstanding / dei）没有 EPS 锚，要另想办法
 - [ ] `WeightedAverageNumberOfSharesOutstandingBasic` 同样错量纲（MCD 实测），目前无消费方
 
+## 🌐 ADR 比例标定（2026-09-30，SKM/GOTU/HDB 核 20-F 封面）
+
+- [x] (0.5, 2) 带内的非整数比例一律按「股数口径噪声」回退 1.0：SKM（封面 1 ADS = 5/9 股）、
+      GOTU（3 ADS = 2 股）、HDB（1 ADS = 3 股，XBRL 停在 1:1 送股前 → 3/2）每股值差
+      1.5~1.8 倍、只剩一条黄旗。→ 20-F 发行人另认单位数分子分母、离 1:1 ≥ 1.35 倍的简单
+      分数（分母 ≤ 3 容差 8%，其余 1%，窗口内取最近）；要求股数与财务数据同期。10-K 发行人
+      （TSLA）不走这里。今天会 snap 的值一个不变
+- [x] 季度稀释股数序列停更（落后年度一年以上）时改用年度：HMC 停在 2021-12（拆股前）、
+      TM 2020-12、IX 2023-12。股数落后财务数据一年以上（BIDU 2010）时 caliber 写明
+- [ ] 大比例整数 snap 是就近取整：n ≥ 7 相邻整数的间距已小于口径噪声，snap 等于没 snap。
+      实测 JOYY 21.75→22（封面 20）、AMX 20.65→21（20）、EDN 18.39→18（20）、
+      VOD 11.31→11（10）、CMCM 49.4→49（50）、TM 11.19→11（10）。改候选成「1~10 +
+      15/20/25/30/40/50…」之前先想好 ONC 13 这类真比例怎么办
+- [ ] 20-F 封面作第二个证人：dei:Security12bTitle 或封面脚注载明比例（「each representing
+      five-ninths of one share」「every three ADSs representing two」「each representing 0.2」
+      「each three representing one」），与 raw 对拍——一致用封面；差一个整数倍判拆股/送股
+      （HDB 3 vs 1.49）；都不是就是噪声（CANF 封面 2 vs raw 0.768）。带内分数窗口连成片，
+      只靠数字分不出 CANF 这类
+- [ ] 外圈原样放行、没有旗的错比例：NCTY 149（封面 300）、BLRX 476（600）、IMRN 28.6（40）
+      是小盘股增发后加权股数追不上；XTLB 287（100）方向相反，未查；BIDU 0.1025（8，XBRL
+      股数停在 2010）
+
 ## 🚀 v0.5 — 部署与产品化
 
 - [ ] 部署到 Railway / Fly.io（参考站即 Railway）
