@@ -517,6 +517,22 @@ IBM 估值（base $194 vs 现价 $231）复盘时查出三处**数据层**缺口
 - [ ] dashboard 单票页加一张小卡片，直接显示该票在批量表里的那一行（复用同一份 json）
 - [ ] 方案 B：并进 droplet 上的 watchlist-scanner，结果进扫描邮件（需把 pe_band 带过去）
 
+## 🧮 XBRL 股数量纲错（MCD，2026-09-29，见 LESSONS.md）
+
+- [x] `pe_band.fix_share_scale` / `fetch_facts._fix_share_scale`：加权稀释股数逐期对
+      净利÷稀释EPS，差 10^±3/6/9 倍、且邻期股数量级同意（两个证人）才校正并留痕；
+      无 EPS 可对的期对最近已定论期。MCD TTM EPS 12,313,621 → 12.31、PE 0.0x → 19.0x、
+      陈旧日 455 → 0；KO/CHD 的 10 年带陈旧日 457/201 → 0
+- [x] 残留的百倍以上相邻期跳变（无锚可校正）改为拒绝出带，不再只留痕
+- [x] 两个 `pick` 排除委托书（DEF 14A 等）：SCHW 薪酬-业绩表净利按千美元入库、filed
+      晚于 10-K 压过了它，TTM 净利 $1.25B（应 ~$10.1B）；其余票是取整值换回 10-K 精确值
+- [ ] `_adr_calibration` 外圈（raw ≤ 0.5）原样放行：修前 MCD 被当成「1 ADR = 1.005e-06 股」
+      吸收掉，股数碰巧对、prompt 里多一条荒谬的 ADR 口径说明。ADR 比例不可能 < 0.1，
+      该报错/黄旗而不是放行
+- [ ] `compute_ptbv_band` 的加权股数兜底分支（无时点股数 tag 的金融股）没接校正；
+      时点股数（CommonStockSharesOutstanding / dei）没有 EPS 锚，要另想办法
+- [ ] `WeightedAverageNumberOfSharesOutstandingBasic` 同样错量纲（MCD 实测），目前无消费方
+
 ## 🚀 v0.5 — 部署与产品化
 
 - [ ] 部署到 Railway / Fly.io（参考站即 Railway）
