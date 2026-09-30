@@ -383,3 +383,9 @@ def test_fin_report_prints_fraction_adr_ratio(tmp_path):
     assert r.returncode == 0, r.stdout + r.stderr
     a3 = openpyxl.load_workbook(xlsx)["摘要"]["A3"].value
     assert "1 ADR = 2/3 普通股" in a3
+
+
+def test_fin_share_basis_note_yellow(tmp_path):
+    """金融股分支（HDB 走这里）同样把口径断层说明放进全局黄旗。"""
+    out = run_fin_engine(tmp_path, _fin_cfg(share_basis_note="年报封面载明 1 ADS = 3 股，按 XBRL 稀释股数（2025-03-31）反推每 ADS 折 1.49 股，少了约 2 倍"), _fin_facts())
+    assert ["yellow", "年报封面载明 1 ADS = 3 股，按 XBRL 稀释股数（2025-03-31）反推每 ADS 折 1.49 股，少了约 2 倍"] in out["warnings_global"]

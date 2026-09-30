@@ -207,3 +207,16 @@ def test_report_prints_fraction_adr_ratio(tmp_path):
     assert r.returncode == 0, r.stdout + r.stderr
     a3 = openpyxl.load_workbook(xlsx)["摘要"]["A3"].value
     assert "1 ADR = 5/9 普通股" in a3
+
+
+def test_share_basis_note_yellow_in_global_channel(tmp_path):
+    """封面比例与 XBRL 股数的口径断层（HDB 送股在 XBRL 期后）：服务层写的说明原样进全局黄旗。"""
+    facts = _std_facts()
+    facts["pe_band"]["span"]["lag_days"] = 100
+    facts["pe_band"]["recent"]["span"]["lag_days"] = 100
+    out = _run_engine(tmp_path, _std_cfg(share_basis_note="年报封面载明 1 ADS = 3 股，按 XBRL 稀释股数（2025-03-31）反推每 ADS 折 1.49 股，少了约 2 倍"), facts)
+    assert ["yellow", "年报封面载明 1 ADS = 3 股，按 XBRL 稀释股数（2025-03-31）反推每 ADS 折 1.49 股，少了约 2 倍"] in out["warnings_global"]
+    for sc in ("bear", "base", "bull"):
+        assert not any(m == "年报封面载明 1 ADS = 3 股，按 XBRL 稀释股数（2025-03-31）反推每 ADS 折 1.49 股，少了约 2 倍" for _, m in out["scenarios"][sc]["warnings"])
+    out2 = _run_engine(tmp_path, _std_cfg(), facts)
+    assert not any(m == "年报封面载明 1 ADS = 3 股，按 XBRL 稀释股数（2025-03-31）反推每 ADS 折 1.49 股，少了约 2 倍" for _, m in out2["warnings_global"])
