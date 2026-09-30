@@ -191,3 +191,19 @@ def test_no_mismatch_key_no_flag(tmp_path):
     facts["pe_band"]["recent"]["span"]["lag_days"] = 100
     out = _run_engine(tmp_path, _std_cfg(), facts)
     assert not any("市值隐含股数" in m for _, m in out["warnings_global"])
+
+
+# =====================================================================
+# ADR 比例的报告文案：20-F 简单分数（SKM 5/9）印成 p/q，不是 0.555556
+# =====================================================================
+
+def test_report_prints_fraction_adr_ratio(tmp_path):
+    openpyxl = pytest.importorskip("openpyxl")
+    _run_engine(tmp_path, _std_cfg(adr_multiple=5 / 9), _std_facts())
+    xlsx = tmp_path / "report.xlsx"
+    r = subprocess.run([sys.executable, str(BUILD), str(tmp_path / "out.json"), str(xlsx)],
+                       capture_output=True, text=True, encoding="utf-8", errors="replace",
+                       env=dict(os.environ, PYTHONIOENCODING="utf-8"))
+    assert r.returncode == 0, r.stdout + r.stderr
+    a3 = openpyxl.load_workbook(xlsx)["摘要"]["A3"].value
+    assert "1 ADR = 5/9 普通股" in a3

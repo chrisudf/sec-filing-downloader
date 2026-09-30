@@ -369,3 +369,17 @@ def test_fin_share_count_mismatch_yellow(tmp_path):
     hits = [m for lv, m in out["warnings_global"]
             if lv == "yellow" and "市值隐含股数" in m]
     assert hits and "11.0%" in hits[0]
+
+
+def test_fin_report_prints_fraction_adr_ratio(tmp_path):
+    """金融股报告的口径行（HDB 走这条）：20-F 简单分数印成 p/q，不是 0.666667。"""
+    openpyxl = pytest.importorskip("openpyxl")
+    run_fin_engine(tmp_path, _fin_cfg(adr_multiple=2 / 3), _fin_facts())
+    xlsx = tmp_path / "report.xlsx"
+    r = subprocess.run([sys.executable, str(ROOT / "valuation" / "build_report.py"),
+                        str(tmp_path / "out.json"), str(xlsx)],
+                       capture_output=True, text=True, encoding="utf-8", errors="replace",
+                       env=dict(os.environ, PYTHONIOENCODING="utf-8"))
+    assert r.returncode == 0, r.stdout + r.stderr
+    a3 = openpyxl.load_workbook(xlsx)["摘要"]["A3"].value
+    assert "1 ADR = 2/3 普通股" in a3

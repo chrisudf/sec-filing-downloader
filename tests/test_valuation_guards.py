@@ -1318,6 +1318,193 @@ def test_adr_guard_runs_before_filings_and_judgment():
 
 
 # =====================================================================
+# 20-F 发行人的简单分数 ADR 比例（2026-09-30，20-F 封面核实）：SKM 1 ADS = 5/9 股、
+# GOTU 3 ADS = 2 股；HDB 1 ADS = 3 股但 XBRL 股数停在 1:1 送股前 → 3/2。
+# 修前三者都按「股数口径噪声」回退 1.0，每股值差 1.5~1.8 倍、只剩一条黄旗。
+# 分数只在最新年报是 20-F、且 XBRL 股数与财务数据同期时才试（TSLA 不许回来）。
+# =====================================================================
+
+def _adr20(raw, **kw):
+    """_adr 的 20-F 版：最新年报是 20-F，股数与财务数据同期（除非 kw 覆盖）。"""
+    from app.valuation_service import _adr_calibration
+    kw = {"files_20f": True, **kw}
+    return _adr_calibration(price=1000.0 * raw, mcap=1e12, shares_ord_m=1000.0, **kw)
+
+
+@pytest.mark.parametrize("price, mcap, shares, want", [
+    (35.91, 1.379e10, 2.13429e8, (5, 9)),    # SKM raw 0.556
+    (2.44, 5.735e8, 1.63119e8, (2, 3)),      # GOTU raw 0.694：离 2/3 4.1%、离 5/7 2.8%
+    (22.64, 1.164e11, 7.65943e9, (3, 2)),    # HDB raw 1.490
+])
+def test_adr_20f_real_fractions_snap(price, mcap, shares, want):
+    """实测原数（生产 fetch_facts + yfinance，2026-09-30）：snap 到 20-F 封面载明的
+    比例，不报失配。GOTU 是容差分档的理由：统一 5% 取最近会判成 5/7。"""
+    from app.valuation_service import _adr_calibration
+    m, mismatch = _adr_calibration(price, mcap, shares / 1e6, files_20f=True)
+    assert m == pytest.approx(want[0] / want[1], rel=1e-12) and mismatch is None
+
+
+def test_adr_fraction_needs_20f_filer():
+    """同样的 raw，10-K 发行人（默认）照旧回退 1.0 + 失配：分数只给 20-F。"""
+    from app.valuation_service import _adr_calibration
+    m, mismatch = _adr_calibration(35.91, 1.379e10, 213.429)
+    assert m == 1.0 and mismatch == pytest.approx(0.444, abs=1e-3)
+
+
+def test_adr_tsla_stays_noise_even_as_20f():
+    """TSLA 0.8963 离 1:1 太近，就算申报类型判错成 20-F 也不许变成 8/9。"""
+    m, mismatch = _adr20(0.8963)
+    assert m == 1.0 and mismatch == pytest.approx(0.1037, abs=1e-4)
+
+
+@pytest.mark.parametrize("raw", [
+    1.093,     # WB：封面 1 ADS = 1 股，XBRL 稀释含可转债摊薄
+    1.112,     # IX：用停更的季度股数算出来的（封面 2025-02 起 1 ADS = 1 股）
+    0.768342,  # CANF：封面 1 ADS = 2 股，股本一年内大幅扩张
+    1.30,
+])
+def test_adr_20f_noise_not_turned_into_fraction(raw):
+    """20-F 发行人的已知噪声样本：照旧回退 1.0 + 失配。WB/IX/1.30 离 1:1 太近，
+    不进任何候选窗口；CANF 离 2/3 15%、离 5/7 7.6%，两档窗口都进不去。"""
+    m, mismatch = _adr20(raw)
+    assert m == 1.0 and mismatch == pytest.approx(abs(raw - 1))
+
+
+def test_adr_fraction_needs_current_shares():
+    """股数比财务数据早一年以上（拆股/送股可能夹在中间）：不认分数。"""
+    m, mismatch = _adr20(0.555964, shares_current=False)
+    assert m == 1.0 and mismatch is not None
+
+
+def test_adr_fraction_candidates_pinned():
+    """候选集是设计决定，钉死：单位数分子分母、离 1:1 至少 1.35 倍；8/9、9/8、
+    4/3、3/4、7/9 与噪声分不开，1/2、2 由原有分支处理。"""
+    from fractions import Fraction as F
+    from app.valuation_service import _ADR_FRACTIONS
+    assert _ADR_FRACTIONS == tuple(sorted({
+        F(5, 9), F(4, 7), F(3, 5), F(5, 8), F(2, 3), F(5, 7),
+        F(7, 5), F(3, 2), F(8, 5), F(5, 3), F(7, 4), F(9, 5)}))
+
+
+@pytest.mark.parametrize("raw, want", [
+    (0.615, 2 / 3),   # 2/3 的 8% 窗口内（离 5/8 1.6%、3/5 2.5%，都出了 1% 窗口）
+    (0.610, None),    # 出 2/3 窗口，也不在 3/5、5/8 的 1% 窗口里 → 回退
+    (0.715, 5 / 7),   # 两档窗口都命中时取最近：离 5/7 0.1%、离 2/3 7.3%
+    (0.5605, 5 / 9),  # 1% 窗口内
+    (0.5625, None),   # 离 5/9 1.25%、离 4/7 1.6% → 回退
+    (1.387, 7 / 5),
+    (1.370, None),    # 离 7/5 2.1%、离 3/2 8.7%；4/3 不是候选 → 回退
+    (1.600, 8 / 5),
+    (1.830, None),    # 离 9/5 1.7%、离 5/3 9.8%、离整数 2 8.5% → 回退
+])
+def test_adr_fraction_band_edges(raw, want):
+    """分两档的窗口边界：分母 <= 3 为 ±8%，其余 ±1%，窗口内取最近。"""
+    m, mismatch = _adr20(raw)
+    if want is None:
+        assert m == 1.0 and mismatch is not None
+    else:
+        assert m == pytest.approx(want) and mismatch is None
+
+
+def test_adr_fraction_only_takes_over_fallback_cases():
+    """不变式：今天会 snap/放行的值，20-F 版一个不变；分数只接管原先落进回退
+    分支（返回失配）的那些 raw。对数均匀扫 [0.07, 7e4]。"""
+    import math
+    for i in range(4001):
+        raw = 0.07 * 10 ** (i * math.log10(7e4 / 0.07) / 4000)
+        old = _adr(raw)
+        new = _adr20(raw)
+        if old[1] is None:
+            assert new == old, raw
+        else:
+            assert new[1] is None or new == old, raw
+
+
+@pytest.mark.parametrize("m, label", [
+    (5 / 9, "5/9"), (2 / 3, "2/3"), (5 / 7, "5/7"), (5 / 3, "5/3"),
+    (1.5, "1.5"), (0.5, "0.5"), (5.0, "5"), (0.348, "0.348"), (0.1025, "0.1025"),
+])
+def test_adr_ratio_label(m, label):
+    """除不尽的分数写成 p/q，其余照 :g——0.555556 认不出是封面上的 five-ninths。"""
+    from app.valuation_service import _adr_ratio_label
+    assert _adr_ratio_label(m) == label
+
+
+@pytest.mark.parametrize("latest, want", [
+    ({"20-F": {"filingDate": "2026-04-29"}, "6-K": {"filingDate": "2026-08-01"}}, True),
+    ({"10-K": {"filingDate": "2026-01-29"}, "10-Q": {"filingDate": "2026-07-23"}}, False),
+    # 改报 10-K 的前外国发行人（ONC、ZLAB 仍挂 ADS）：按最新一份算
+    ({"20-F": {"filingDate": "2022-04-01"}, "10-K": {"filingDate": "2026-02-26"}}, False),
+    ({"20-F": {"filingDate": "2026-04-01"}, "10-K": {"filingDate": "2022-02-26"}}, True),
+    ({"6-K": {"filingDate": "2026-08-01"}}, False),
+    ({}, False),
+])
+def test_files_20f(latest, want):
+    from app.valuation_service import _files_20f
+    assert _files_20f(latest) is want
+
+
+def test_share_series_prefers_quarterly_unless_stopped():
+    """季度优先；季度停更（落后年度一年以上，HMC 实测 2021-12 vs 2025-03）才换年度。
+    10-K 刚公布、季度只落后一个季度时不换——全年加权比最近一季更旧。"""
+    from app.valuation_service import _diluted_share_series
+    q = {"2021-09-30": 1.72e9, "2021-12-31": 1.716e9}
+    a = {"2024-03-31": 4.9e9, "2025-03-31": 4.671e9}
+    assert _diluted_share_series({"shares_diluted_quarterly": q,
+                                  "shares_diluted_annual": a}) is a
+    q2 = {"2025-06-30": 1.0e9, "2025-09-30": 0.99e9}
+    a2 = {"2025-12-31": 1.01e9}
+    assert _diluted_share_series({"shares_diluted_quarterly": q2,
+                                  "shares_diluted_annual": a2}) is q2
+    assert _diluted_share_series({"shares_diluted_annual": a2}) is a2
+    assert _diluted_share_series({"shares_diluted_quarterly": q2}) is q2
+    assert not _diluted_share_series({})
+
+
+def test_share_caliber_fraction_names_ratio_and_source():
+    """分数比例印成 p/q，并说明是反推的（判断层读 SECTIONS 时能对照 20-F 原文）。"""
+    from app.valuation_service import _share_caliber
+    c = _share_caliber(5 / 9, None, "2024-12-31", 0, "2024-12-31")
+    assert "1 ADR = 5/9 普通股" in c and "由市值隐含股数反推" in c
+    assert "未落在可认定" not in c and "XBRL 稀释股数最新一期" not in c
+
+
+def test_share_caliber_integer_ratio_no_inference_note():
+    from app.valuation_service import _share_caliber
+    c = _share_caliber(3.0, None, "2025-12-31", 0, "2025-12-31")
+    assert "1 ADR = 3 普通股" in c and "反推" not in c
+
+
+def test_share_caliber_mismatch_fallback():
+    from app.valuation_service import _share_caliber
+    c = _share_caliber(1.0, 0.1037, "2026-06-30", 0, "2026-06-30")
+    assert "1 ADR =" not in c
+    assert "差 10.4%" in c and "未落在可认定的 ADR 比例上" in c
+
+
+def test_share_caliber_stale_shares_note():
+    """股数落后财务数据一年以上才出陈旧说明（BIDU 实测：2010-12-31 vs 2025-12-31）。"""
+    from app.valuation_service import _share_caliber
+    c = _share_caliber(0.10253, None, "2010-12-31", 5479, "2025-12-31")
+    assert "2010-12-31" in c and "2025-12-31" in c and "早 5479 天" in c
+    assert "XBRL 稀释股数最新一期" not in _share_caliber(
+        1.0, None, "2025-03-31", 366, "2026-04-01")
+
+
+def test_adr_fraction_evidence_wired_into_pipeline():
+    """接线哨兵：company_info 挪到标定之前、两道门都传进去，股数序列走新的挑选。"""
+    import inspect
+    from app import valuation_service as vs
+    src = inspect.getsource(vs._pipeline)
+    call = src.index("_adr_calibration(")
+    assert src.index("edgar.company_info(") < call
+    assert 'files_20f=_files_20f(info["latest"])' in src
+    assert "shares_current=shares_lag <= _SHARES_STALE_DAYS" in src
+    assert "_diluted_share_series(facts)" in src
+    assert "caliber = _share_caliber(adr_multiple, adr_mismatch, shares_asof, shares_lag," in src
+
+
+# =====================================================================
 # override 的口径闸（0019）—— TSM 实测：ttm_revenue_override 只换营收基准，
 # TTM cfo/capex 还停在旧 XBRL 窗口（FCF 率 19.6% 旧 vs 25.8% 真），margins
 # 谷底下限（0.4×当前）与上界（1.2×当前）都锚在过期分母上。偏离 >10% 时

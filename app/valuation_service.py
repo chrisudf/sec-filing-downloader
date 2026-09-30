@@ -21,6 +21,7 @@ import time
 import uuid
 import zipfile
 from datetime import date, timedelta
+from fractions import Fraction
 from pathlib import Path
 
 from fastapi import APIRouter
@@ -1383,20 +1384,53 @@ def _trading_range_payload(mode: str, facts: dict, val: dict):
 # 量纲错全是少零的方向。
 _ADR_RATIO_MIN, _ADR_RATIO_MAX = 0.07, 7e4
 
+# (0.5, 2) 带内的非整数 ADR 比例。2026-09-30 核 20-F 封面：SKM「each representing
+# five-ninths of one share」（raw 0.556）、GOTU「every three ADSs representing two
+# Class A」（raw 0.694）；HDB 封面是 1 ADS = 3 股，但 XBRL 稀释股数停在 2025 年 1:1
+# 送股之前，对 XBRL 口径就是 3/2（raw 1.490）。此前一律按「股数口径噪声」回退 1.0，
+# 每股值差 1.5~1.8 倍，只剩一条黄旗。
+# 候选：单位数分子分母的最简分数，且离 1:1 至少 1.35 倍（门槛落在 4/3 与 7/5 之间）。
+# 更近的与股数口径噪声分不开：比例已核实的票，新鲜序列上的噪声实测到 13%（VOD）、
+# 10.4%（TSLA）、9.3%（WB，1 ADS = 1 股）——TSLA 0.8963 离 8/9 只有 0.8%；4/3 的
+# 窗口 (1.23, 1.44) 会吞掉 HMC 用停更季度股数算出的 1.32。
+# 容差分两档，窗口内取最近：分母 <= 3 的（2/3、3/2、5/3）与整数/半数同为 8%；分母
+# 4~9 的只认 1% 内的命中——1% 让这 9 个窗口互不重叠，SKM 离 5/9 只有 0.1%。不能一刀切
+# 取最近：GOTU 0.694 离 2/3 4.1%、离 5/7 只有 2.8%，统一 5% 就判成 5/7（先写的版本
+# 栽在这里）。CANF（封面 1 ADS = 2 股、股本一年内大幅扩张，raw 0.768）离 2/3 15%、
+# 离 5/7 7.6%，两档都进不去，留在回退分支。
+# 分母 <= 3 的窗口把 (0.61, 0.72) 与 (1.38, 1.80) 整段盖住，这两段里分数本身几乎不提供
+# 证据——证据来自调用方的两道门：最新年报是 20-F（TSLA 这类 10-K 发行人不走这里）；
+# XBRL 股数与财务数据同期——股数停在拆股/送股之前、财务数据却已过去，raw 就被拆股
+# 倍数带偏（HMC 季度序列停在 2021 年拆股前，raw 1.32），落到哪个分数上都是巧合。
+# HDB 过得了这道门：它的财务数据同样停在送股前，3/2 对这套口径是对的。
+# 两道门都过、分数又对不上的，照旧回退 1.0 + 黄旗。
+_ADR_FRAC_MIN_DEV = 1.35
+_ADR_FRAC_TOL_SIMPLE, _ADR_FRAC_TOL_TIGHT = 0.08, 0.01
+_ADR_FRACTIONS = tuple(sorted({
+    Fraction(p, q) for p in range(1, 10) for q in range(2, 10)
+    if 0.5 < p / q < 2 and Fraction(p, q).denominator > 1
+    and max(p / q, q / p) >= _ADR_FRAC_MIN_DEV}))
 
-def _adr_calibration(price: float, mcap: float,
-                     shares_ord_m: float) -> tuple[float, float | None]:
+
+def _adr_calibration(price: float, mcap: float, shares_ord_m: float, *,
+                     files_20f: bool = False,
+                     shares_current: bool = True) -> tuple[float, float | None]:
     """ADR 比例标定 -> (adr_multiple, 口径失配比例|None)。纯函数（0018 抽出可单测）。
 
     yfinance 价是 ADR 价、XBRL 股数是普通股（TTM 加权稀释）：mcap÷普通股数反推
-    每普通股隐含价，price÷隐含价即 ADR 比例（TSM 1:5）。真实 ADR 比例只会是
-    整数或简单半数（2 普通股=1 ADR → 2；1 ADR=0.5 普通股 → 0.5），(0.5, 2) 内
-    既不落 1±8% 也不落半数容差的值不是 ADR，是两侧股数口径的噪声——yfinance
-    市值隐含股数与 XBRL 加权稀释股数本就能差几个百分点（回购/增发期两口径结构性
-    分叉）。此前这类值原样放行：TSLA 实测 0.8963 被当成「1 ADR=0.896 普通股」
-    发货——美股普通票挂上假 ADR 口径、shares 被 rebase、带子与每股值口径混掉。
-    现在回退 adr_multiple=1.0 并返回失配比例（进 caliber 说明 + 引擎全局黄旗），
-    shares 保持 XBRL 稀释口径。
+    每普通股隐含价，price÷隐含价即 ADR 比例（TSM 1:5）。ADR 比例绝大多数是整数或
+    半数（2 普通股=1 ADR → 2；1 ADR=0.5 普通股 → 0.5），(0.5, 2) 内既不落 1±8% 也
+    不落半数容差的值多半不是 ADR，是两侧股数口径的噪声——yfinance 市值隐含股数与
+    XBRL 加权稀释股数本就能差几个百分点（回购/增发期两口径结构性分叉）。此前这类值
+    原样放行：TSLA 实测 0.8963 被当成「1 ADR=0.896 普通股」发货——美股普通票挂上
+    假 ADR 口径、shares 被 rebase、带子与每股值口径混掉。现在回退 adr_multiple=1.0
+    并返回失配比例（进 caliber 说明 + 引擎全局黄旗），shares 保持 XBRL 稀释口径。
+
+    例外是 20-F 发行人的简单分数（SKM 5/9、GOTU 2/3，见 _ADR_FRACTIONS）：只在
+    files_20f（最新年报是 20-F）且 shares_current（XBRL 股数与财务数据同期）时才试，
+    落进候选窗口（分母 <= 3 为 ±8%，其余 ±1%）就按分数折股、不报失配。10-K 发行人
+    即使挂 ADS（ONC 13、ZLAB 10）比例也是整数，整数分支照管，不需要分数。今天会被
+    snap 的值一个不变：分数只接管原先落进回退分支的那部分。
 
     外圈 (0, 0.5] 与 [2, ∞) 只在真实 ADR 的量级内（_ADR_RATIO_MIN~MAX）维持原行为
     （整数 snap / 原样放行）；出了这个量级抛 RuntimeError。此前外圈无条件放行：
@@ -1416,8 +1450,74 @@ def _adr_calibration(price: float, mcap: float,
     if abs(raw - 0.5) < 0.04:
         return 0.5, None
     if 0.5 < raw < 2.0:
+        if files_20f and shares_current:
+            hits = [f for f in _ADR_FRACTIONS if abs(raw / f - 1) < (
+                _ADR_FRAC_TOL_SIMPLE if f.denominator <= 3 else _ADR_FRAC_TOL_TIGHT)]
+            if hits:
+                return float(min(hits, key=lambda f: abs(raw / f - 1))), None
         return 1.0, abs(raw - 1)
     return raw, None
+
+
+def _share_caliber(adr_multiple: float, adr_mismatch: float | None,
+                   shares_asof: str, shares_lag: int, data_latest: str | None) -> str:
+    """股数/ADR 口径的 caliber 说明（进判断层 prompt）。纯函数，便于单测。"""
+    out = ""
+    if adr_multiple != 1.0:
+        out += (f"\n口径说明：价格为 ADR 价（1 ADR = {_adr_ratio_label(adr_multiple)} "
+                "普通股），shares 已折为 ADR 等效股数；你输出的 fwd_shares 也用 ADR 等效口径。")
+        if Fraction(adr_multiple).limit_denominator(9) in _ADR_FRACTIONS:
+            out += ("该比例由市值隐含股数反推、取最近的简单分数（非 20-F 原文）；"
+                    "SECTIONS 若载明不同的 ADS 比例，在 rationale 里指出。")
+    if adr_mismatch is not None:
+        out += (f"\n口径说明：市值隐含股数与 XBRL 稀释股数差 {adr_mismatch:.1%}"
+                "（未落在可认定的 ADR 比例上，判定为股数口径噪声而非 ADR，已按 1 ADR=1 股处理）"
+                "——shares 取 XBRL 加权稀释股数，net_cash/每股值一律按 XBRL 股数口径。")
+    if shares_lag > _SHARES_STALE_DAYS:
+        out += (f"\n口径说明：XBRL 稀释股数最新一期是 {shares_asof}，比财务数据"
+                f"（{data_latest}）早 {shares_lag} 天——期间的拆股/送股/回购"
+                "都没进 shares；fwd_shares 以 SECTIONS 原文的最新股本推算。")
+    return out
+
+
+def _adr_ratio_label(m: float) -> str:
+    """ADR 比例的展示文案：5/9、2/3 这类除不尽的分数写成 p/q，其余照 :g。
+    0.555556 印在 prompt/报告里没人认得出是 20-F 封面上的 five-ninths。"""
+    f = Fraction(m).limit_denominator(9)
+    if f.denominator in (3, 6, 7, 9) and abs(float(f) - m) < 1e-9:
+        return f"{f.numerator}/{f.denominator}"
+    return f"{m:g}"
+
+
+def _files_20f(latest: dict) -> bool:
+    """最新一份年报是 20-F（外国私人发行人）而不是 10-K。latest 是
+    edgar.company_info()["latest"]：{form: {"filingDate", "reportDate"}}。
+    改报 10-K 的（ONC、ZLAB，仍挂 ADS）按最新一份算 10-K。"""
+    f20 = (latest.get("20-F") or {}).get("filingDate") or ""
+    f10 = (latest.get("10-K") or {}).get("filingDate") or ""
+    return f20 > f10  # 没有 20-F 时 "" 不大于任何日期
+
+
+# 股数序列「停更/陈旧」的门槛：落后一年以上（季度序列落后年度序列、股数落后财务数据）
+_SHARES_STALE_DAYS = 366
+
+
+def _diluted_share_series(facts: dict) -> dict:
+    """估值用的稀释股数序列：季度优先（最近一季的加权），季度序列停更——最新一期
+    落后年度序列一年以上——才改用年度。HMC 的季度序列停在 2021-12（拆股前 17.2 亿
+    股）而年度到 2025-03，TM 停在 2020-12、IX 停在 2023-12；旧写法 quarterly or
+    annual 拿停更的季度股数去算 ADR raw（HMC 1.32，真实比例 3）。
+    只在停更时才换：10-K 公布后到下一份 10-Q 之前，年度期末本来就比季度新一个季度，
+    但全年加权比最近一季的加权更旧，那时不能换。"""
+    q = facts.get("shares_diluted_quarterly") or {}
+    a = facts.get("shares_diluted_annual") or {}
+    if q and a and _days_between(list(q)[-1], list(a)[-1]) > _SHARES_STALE_DAYS:
+        return a
+    return q or a
+
+
+def _days_between(earlier: str, later: str) -> int:
+    return (date.fromisoformat(later) - date.fromisoformat(earlier)).days
 
 
 def _adr_scale_message(price: float, mcap: float, shares_ord_m: float,
@@ -1648,8 +1748,8 @@ async def _pipeline(job: dict, ticker: str, email: str) -> None:
     missing = [k for k in need if (ttm.get(k) or {}).get("value") is None]
     if mode == "financials" and not facts.get("equity_instant"):
         missing.append("股东权益（TBV 原料）")
-    # 外国发行人常只有年度股数（20-F 无季度 XBRL），退回年度序列
-    shares_series = facts.get("shares_diluted_quarterly") or facts.get("shares_diluted_annual")
+    # 外国发行人常只有年度股数（20-F 无季度 XBRL），退回年度序列；季度序列停更时同样
+    shares_series = _diluted_share_series(facts)
     if missing or not shares_series:
         raise RuntimeError(
             f"XBRL 数据不完整（缺 TTM: {', '.join(missing) or '—'}"
@@ -1662,14 +1762,20 @@ async def _pipeline(job: dict, ticker: str, email: str) -> None:
         return float(fi["lastPrice"]), float(fi["marketCap"])
     # yfinance 无超时：Yahoo 卡住会永久占死唯一的任务槽（_running 不复位）
     price, mcap = await asyncio.wait_for(asyncio.to_thread(_price), timeout=60)
-    shares_ord = list(shares_series.values())[-1] / 1e6  # 普通股口径（百万股）
-    # ADR 换算见 _adr_calibration：整数/半数比例 snap，(0.5,2) 内的其余值是股数
-    # 口径噪声而非 ADR，回退 1.0 并把失配比例带进 caliber 与引擎全局黄旗；
-    # 超出真实 ADR 量级（XBRL 股数量纲错）直接抛错——紧跟取价，下载 filings、
-    # 抽章节、判断层都还没开始
-    adr_multiple, adr_mismatch = _adr_calibration(price, mcap, shares_ord)
-    shares = round(shares_ord / adr_multiple)  # ADR 等效股数：mcap ≈ price × shares
     info = await edgar.company_info(ticker, email)
+    shares_ord = list(shares_series.values())[-1] / 1e6  # 普通股口径（百万股）
+    shares_asof = list(shares_series)[-1]
+    # 股数比财务数据早一年以上：拆股/送股/回购都可能发生在中间，raw 不能拿来认分数
+    shares_lag = (_days_between(shares_asof, facts["data_latest"])
+                  if facts.get("data_latest") else 0)
+    # ADR 换算见 _adr_calibration：整数/半数比例 snap，20-F 发行人另认简单分数，
+    # (0.5,2) 内的其余值是股数口径噪声而非 ADR，回退 1.0 并把失配比例带进 caliber
+    # 与引擎全局黄旗；超出真实 ADR 量级（XBRL 股数量纲错）直接抛错——紧跟取价，
+    # 下载 filings、抽章节、判断层都还没开始
+    adr_multiple, adr_mismatch = _adr_calibration(
+        price, mcap, shares_ord, files_20f=_files_20f(info["latest"]),
+        shares_current=shares_lag <= _SHARES_STALE_DAYS)
+    shares = round(shares_ord / adr_multiple)  # ADR 等效股数：mcap ≈ price × shares
 
     job["step"] = "filings"
     groups = [edgar.QUARTER_FORMS, edgar.ANNUAL_FORMS]
@@ -1728,14 +1834,8 @@ async def _pipeline(job: dict, ticker: str, email: str) -> None:
     prompt_file = ("judgment_prompt_financials.md" if mode == "financials"
                    else "judgment_prompt.md")
     base_prompt = (VAL / prompt_file).read_text(encoding="utf-8")
-    caliber = ""
-    if adr_multiple != 1.0:
-        caliber += (f"\n口径说明：价格为 ADR 价（1 ADR = {adr_multiple:g} 普通股），"
-                    f"shares 已折为 ADR 等效股数；你输出的 fwd_shares 也用 ADR 等效口径。")
-    if adr_mismatch is not None:
-        caliber += (f"\n口径说明：市值隐含股数与 XBRL 稀释股数差 {adr_mismatch:.1%}"
-                    "（非整数/半数比例，判定为股数口径噪声而非 ADR，已按 1 ADR=1 股处理）"
-                    "——shares 取 XBRL 加权稀释股数，net_cash/每股值一律按 XBRL 股数口径。")
+    caliber = _share_caliber(adr_multiple, adr_mismatch, shares_asof, shares_lag,
+                             facts.get("data_latest"))
     if facts.get("currency", "USD") != "USD":
         caliber += (f"\n口径说明：申报货币 {facts['currency']}，FACTS 已按现汇 "
                     f"{facts.get('fx_to_usd', 1):.5f} 折算美元（恒定汇率）；"
