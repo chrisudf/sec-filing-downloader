@@ -85,8 +85,11 @@ def _mkfin(**over):
 
 # ---- 数字契约：wacc−tg 间距（prompt 写的数 = 校验器的行为边界，两模式各一）----
 
+# 显式 ids：默认 ID 会把整份 prompt 转义进去（standard 约 3.97 万字符），pytest 写
+# PYTEST_CURRENT_TEST 时超出 Windows 环境变量 32767 上限 → setup/teardown 报 ValueError
 @pytest.mark.parametrize("mode,prompt,mk", [("standard", STD_PROMPT, _mk),
-                                            ("financials", FIN_PROMPT, _mkfin)])
+                                            ("financials", FIN_PROMPT, _mkfin)],
+                         ids=["standard", "financials"])
 def test_tg_gap_prompt_value_is_enforced_boundary(mode, prompt, mk):
     m = re.search(r"须比wacc小至少([0-9.]+)", prompt)
     assert m, "prompt 未写明 wacc−tg 执法间距"
