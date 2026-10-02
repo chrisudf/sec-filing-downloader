@@ -129,7 +129,7 @@ function bodyRow(r) {
   const cells = [...bandCells(r.gaap), ...bandCells(r.op), ...fwdCells(r.fwd, r.fy_labels),
                  el("td", { text: fmtNum(yh.tpe) }), el("td", { text: fmtNum(yh.peg, 2) })];
   cells.forEach((c, i) => GSTART.has(i) && c.classList.add("gstart"));
-  return el("tr", {}, tk, el("td", { text: r.close.toFixed(2) }), ...cells);
+  return el("tr", {}, tk, el("td", { text: r.close == null ? "—" : r.close.toFixed(2) }), ...cells);
 }
 
 // 排序档位：有值(0) < 缺值(1)，同档再按数值——不能用 Infinity 当哨兵，

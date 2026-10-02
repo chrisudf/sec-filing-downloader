@@ -150,6 +150,18 @@ def yahoo_info(t):
             "last_fy_end": date.fromtimestamp(fye).isoformat() if fye else None}
 
 
+def last_close(hist):
+    """最后一个有效收盘 -> (close, date)。纯函数。
+
+    yfinance 的当天日线在 Yahoo 结算前会给出 Open/Volume 齐全、Close=NaN 的残行
+    （2026-10-02 全表实测：10/01 行 Close 全 NaN）。直接取 iloc[-1] 会让 close 与
+    全部前瞻 PE 变 NaN -> JSON null，网页 toFixed 直接抛。退回上一个有效收盘。"""
+    px = hist["Close"].dropna()
+    if px.empty:
+        raise RuntimeError("yfinance 历史价没有有效收盘")
+    return float(px.iloc[-1]), px.index[-1].date()
+
+
 def collect(t, kind, email):
     """一只票的全部读数（联网）。异常逐项兜住，一票失败不拖垮整张表。"""
     if kind in SKIP_KINDS:
@@ -157,9 +169,7 @@ def collect(t, kind, email):
     row = {"ticker": t, "notes": []}
     try:
         inputs = pb.load_inputs(t, email, 10)
-        hist = inputs["hist"]
-        row["close"] = float(hist["Close"].iloc[-1])
-        row["px_date"] = hist.index[-1].date()
+        row["close"], row["px_date"] = last_close(inputs["hist"])
     except Exception as e:
         return {"ticker": t, "skip": str(e).splitlines()[0][:100]}
     b10_eps = None
