@@ -103,6 +103,18 @@ def test_forward_loss_and_nan():
     assert pr._fwd_cells(fw)[1:] == [">999x", ">999–含亏损"]
 
 
+def test_last_close_skips_unsettled_nan_row():
+    import pandas as pd
+    nan = float("nan")
+    idx = pd.to_datetime(["2026-09-29", "2026-09-30", "2026-10-01"]).tz_localize("America/New_York")
+    hist = pd.DataFrame({"Open": [230.97, 229.27, 229.95], "Close": [227.21, 228.38, nan]},
+                        index=idx)
+    assert pr.last_close(hist) == (228.38, date(2026, 9, 30))
+    import pytest
+    with pytest.raises(RuntimeError):
+        pr.last_close(hist.assign(Close=nan))
+
+
 def _row(**over):
     m = {"pe": 28.5, "date": TODAY.isoformat(), "fresh": True, "ttm_period": "2026-07-26",
          "days10": 2000, "thin": False, "r10": 7.0, "r5": 2.0, "r3": 2.0,

@@ -974,3 +974,63 @@ MFG 的 20-F 封面（dei:Security12bTitle）写「each of which represents two 
 - **变异要写成你怕的那个 bug。** 本轮第一次跑有两个「幸存」是等价变异（改完行为不变），
   另一个是测试数据没走生产的序列化（手写 CSV 没给带逗号的字段加引号，EX-13 那行被拆错列，
   测试因为错的原因通过）。
+
+---
+
+## 2026-10-02 · NaN 收盘：pe_band 早就防住了，pe_rank 拿同一份数据又踩了一次
+
+### 现象
+
+10-02 上午（布里斯班）手点刷新后，watchlist.html 整张表不渲染，右上角报
+`Cannot read properties of null (reading 'toFixed')`。`/api/pe_rank` 里 17 只票的
+`close`、`fy1_pe`、`fy2_pe` 全是 null；GAAP / op 分位带的数字正常。
+
+### 机制
+
+Yahoo 当天日线结算前，yfinance 给出 Open / Volume 齐全、**Close = NaN** 的残行：
+
+```
+2026-09-30  Open 229.27  Close 228.38  Volume 121732200
+2026-10-01  Open 229.95  Close    NaN  Volume  97538145   ← 美东 20:50 仍未结算
+```
+
+`pe_rank.collect` 取 `hist["Close"].iloc[-1]`。NaN 先流进 `forward()`（close ÷ EPS
+还是 NaN），再被 `_jsonable` 转成 null；`watchlist.js` 的 `r.close.toFixed(2)` 在第一行
+就抛错，后面的行一行都没画。markdown 报告那边这一列会是 `nan`。
+
+### 为什么没早发现
+
+1. **这个坑三周前就踩过、防过，但防线写在消费点里。** 09-07 起 `compute_band` 逐行剔除
+   NaN 收盘并计 `nan_close_days`（注释写着 KO/AAPL 实测）。09-25 写 `pe_rank` 时，它是
+   同一份 `inputs["hist"]` 的第二个消费者，自己去取最后一行，那条防线没跟过来。
+   分位带正常、收盘全空，正是这个分工的样子。
+2. **序列化层的兜底让错误变「合法」了。** `_jsonable` 把 NaN 转 null 是为了不让
+   `JSON.parse` 抛（`test_payload_is_strict_json` 钉的就是这个转换），目的达到了，
+   代价是一个数据错误变成了格式合法的 null。「非 skip 行的 close 一定是数」这个约定
+   从来没写下来，前端默认它成立。
+3. **取收盘那一行在测试范围之外。** `test_pe_rank.py` 文件头写明联网部分不测，
+   `collect` 整个算联网；纯函数用例里的 close 全是有限数。
+4. **前后端的容错粒度不一致。** 后端「一票失败不拖垮整张表」，每票各自 try；前端
+   一行抛错，整张表白屏。
+5. 残行只在收盘后某个窗口里出现，之前的刷新大概没撞上。**周六 08:00 的定时任务
+   （= 美东周五 18:00）是否每周都撞，未核实。**
+
+### 改了什么
+
+- 新增纯函数 `last_close(hist)`：dropna 后取最后一个有效收盘与日期；没有有效收盘就抛错，
+  走既有的 skip。
+- **没在 `load_inputs` 统一 dropna**：那样 `nan_close_days` 的留痕会恒为 0，
+  `compute_band` 的计数就失去意义了。
+- `watchlist.js`：close 为 null 时显示「—」。
+- 回归用例 `test_last_close_skips_unsettled_nan_row`，按 10-01 的残行形态构造。
+  pytest 914 passed。本机刷新后全表退回 9/30 收盘（NVDA 前瞻 24.5x / 14.6x）。
+- PR #33。
+
+### 可复用的规则
+
+- **给已有数据加新消费者时，先 grep 老消费者怎么处理同一个字段。** 写在循环里的防线，
+  第二个读同一份数据的人看不见。
+- **序列化层把坏值转成合法值，不能替代上游的不变量。** 它让格式合法了，也让错误合法了；
+  该在产出数据的地方断言，或者在消费端显式处理 null。
+- **容错粒度要一层层对齐。** 后端逐票兜底，前端就要逐行兜底；否则最下游那层决定了
+  整体的鲁棒性。
