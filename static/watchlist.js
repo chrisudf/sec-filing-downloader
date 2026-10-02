@@ -9,13 +9,17 @@ let data = null;
 const fmtPE = (v) => v == null ? "—" : v >= 1000 ? ">999x" : `${v.toFixed(1)}x`;
 const fmtNum = (v, d = 1) => v == null ? "—" : v >= 1000 ? ">999" : v.toFixed(d);
 const pctPct = (v) => `${v >= 0 ? "+" : ""}${Math.round(v * 100)}%`;
-// 分位 = 量的大小 → 单色相顺序色阶。不用红绿：那是好坏/状态的编码，会被读成买卖信号。
-// 深色底上低值融进卡片底色、高值越蓝；#3987e5 = dashboard 的 --s1。P100 处白字对比度
-// 4.70:1（dataviz validate_palette 的 contrast() 实算，≥ WCAG AA 4.5），明度单调递增
-const CARD_RGB = [20, 21, 28], SEQ_RGB = [57, 135, 229];
+// 分位有天然中点（P50 = 自己历史的常态），两头才是信息 → 发散色阶：低 = 蓝、高 = 铜，
+// 中间退到底色。单色顺序色阶会把一头融进卡片底色、和「—」缺值格分不开（原先 AMZN P1）。
+// 不用红绿：那是好坏/状态的编码，会被读成买卖信号；不用橙：离 --warn 的 ⚠ 太近。
+// #3987e5 = dashboard 的 --s1。两臂明度各自单调、端点对齐（OKLab L 0.500 / 0.496），
+// 端点白字对比度 4.94 / 5.20:1（≥ WCAG AA 4.5）。中点铺一层淡灰，P50 仍与缺值格可分
+const mix = (a, b, t) => a.map((c, i) => Math.round(c * (1 - t) + b[i] * t));
+const BASE_RGB = mix([20, 21, 28], [128, 128, 140], 0.10);
+const LO_RGB = [57, 135, 229], HI_RGB = [200, 102, 60];
 const shade = (p) => {
-  const a = 0.08 + 0.64 * p / 100;
-  return `rgb(${CARD_RGB.map((c, i) => Math.round(c * (1 - a) + SEQ_RGB[i] * a)).join(", ")})`;
+  const d = (p - 50) / 50;
+  return `rgb(${mix(BASE_RGB, d < 0 ? LO_RGB : HI_RGB, 0.66 * Math.abs(d)).join(", ")})`;
 };
 
 function usMarketOpen(d = new Date()) {
