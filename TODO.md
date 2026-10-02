@@ -510,12 +510,19 @@ IBM 估值（base $194 vs 现价 $231）复盘时查出三处**数据层**缺口
 - [x] ⚠ 标到「本财年 PE」格上（md/csv/网页三处同源 `fwd.fy1_suspect`），不再只在脚注——
       否则读者会以为整行（含营业线分位）都被污染（2026-09-25）
 - [x] 网页 `/watchlist.html`：`GET /api/pe_rank` 读最近一份 json + `POST /api/pe_rank/refresh`
-      子进程后台重跑、`[i/n] 票` 进度轮询；分位只用明度（不用红绿，免得读成买卖信号）；
+      子进程后台重跑、`[i/n] 票` 进度轮询；分位用发散色阶（蓝低 / 铜高，#34；不用红绿，免得读成买卖信号）；
       †/⚠ 悬停给原因；盘中刷新先确认；结果超过 8 天标黄（定时任务没跑）（2026-09-25）
 - [x] 每周定时：`scripts/pe_rank_weekly.ps1` 注册 Windows 任务，周六 08:00 布里斯班 =
       美东周五收盘后；conhost --headless 不弹窗、StartWhenAvailable 补跑（2026-09-25）
 - [ ] dashboard 单票页加一张小卡片，直接显示该票在批量表里的那一行（复用同一份 json）
 - [ ] 方案 B：并进 droplet 上的 watchlist-scanner，结果进扫描邮件（需把 pe_band 带过去）
+- [x] GAAP TTM 一次性项还原口径（2026-10-02，见 LESSONS.md）：营业外 / 税率取自身 12 季常态，
+      偏离 >10% 整组换还原口径（≈PE + ⚠、分位斜纹），历史逐窗同口径还原（`clean_band`）
+- [ ] 营业利润以内的一次性项（重组、减值、诉讼和解）：GAAP 与营业线一起被污染，现在两组都抓不到
+- [ ] 还原 PE 没扣持股价值：AMZN/GOOG 价格里含 Anthropic/OpenAI/SpaceX 持股，分母却剔了它们的
+      重估收益，还原 PE 偏高（AMZN 主业约 31x vs 表上 33.8x）。数据在估值引擎的 SOTP 那边
+- [ ] pe_band 的 `ANOM_K` 往下实际不可触发（K ≥ 1 时只有转亏才触发）：engine 的 `pe_band_check`
+      仍用含一次性项的带——评估要不要让带子本身也接 `clean_band` 的逐窗还原
 
 ## 🧮 XBRL 股数量纲错（MCD，2026-09-29，见 LESSONS.md）
 

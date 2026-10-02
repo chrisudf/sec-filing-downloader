@@ -189,6 +189,8 @@ def test_true_one_off_still_culled():
                         inputs=_inputs(_facts(q, vals), _hist()))
     hit = q[13].isoformat()
     assert [w["quarter"] for w in band["anom_windows"]] == [hit] * 4  # 含该季的 4 扇窗
+    # pe_rank 还原 † 行要用被剔窗口的 TTM EPS 与可知日
+    assert all(w["ttm_eps"] > 0 and w["known_from"] for w in band["anom_windows"])
     assert band["seasonal_windows"] == []
     assert band["anom_days"]["trailing"] > 0
     assert band["anom_fys"] == [f"{q[13].year}-12-31"]               # FY 层同判

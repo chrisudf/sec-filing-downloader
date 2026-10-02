@@ -24,6 +24,10 @@ json 供网页 /watchlist.html 读（app/pe_rank_service.py），原子写入。
     收盘÷预期 low，low ≤ 0 的上沿写「含亏损」。
   ⚠ —— 标在「本财年 PE」格上：本财年一致预期 90 天内大跳而下财年没动（ref_table 的
     一次性判据），疑似一次性收益进了预期。只污染这一格，不波及营业线分位。
+    也标在「TTM PE」格上：当前 TTM 窗口的营业外收支 / 有效税率偏离自身常态，还原后
+    GAAP PE 偏离超过 ONETIME_IMPACT（gaap_onetime / onetime_reading）。这时 GAAP 那组
+    整组换成还原口径（≈ 标记、网页上分位格加斜纹）：当前值和历史逐窗用同一公式扣除
+    一次性项后再算分位（clean_band），原值进脚注 / 悬停。
   分位与前瞻 PE 回答的是两个问题（历史位置 vs 预期兑现后的倍数），要一起读。
 """
 import argparse
@@ -35,6 +39,7 @@ import sys
 import tomllib
 from datetime import date, datetime
 from pathlib import Path
+from statistics import median
 from zoneinfo import ZoneInfo
 
 ROOT = Path(__file__).resolve().parent.parent
@@ -51,6 +56,14 @@ MIN_DAYS = 250    # 与 pe_band 的 thin_coverage 同一门槛（约一个财年
 SKIP_KINDS = ("etf", "index")
 METRICS = (("gaap", "eps", "pe_trailing"), ("op", "opeps", "peop_trailing"))
 ET = ZoneInfo("America/New_York")
+# GAAP TTM 窗口的一次性成分（gaap_onetime）。税前利润两个 tag 与 fetch_facts 同序
+PRETAX_TAGS = [
+    "IncomeLossFromContinuingOperationsBeforeIncomeTaxesExtraordinaryItemsNoncontrollingInterest",
+    "IncomeLossFromContinuingOperationsBeforeIncomeTaxesMinorityInterestAndIncomeLossFromEquityMethodInvestments"]
+TAX_TAGS = ["IncomeTaxExpenseBenefit"]
+ONETIME_BASE_Q = 12   # 常态 = 截至窗口末 12 季的中位：窗口 4 季全畸变也拖不动
+ONETIME_MIN_Q = 8
+ONETIME_IMPACT = 0.10
 
 
 def us_market_open(now=None):
@@ -71,6 +84,132 @@ def one_time_flag(trend):
 def one_time_note(flag):
     return (f"本财年一致预期 90 天内 {flag['j0']:+.0%}、下财年仅 {flag['j1']:+.0%}——"
             "疑似一次性收益进了预期，本财年 PE 偏低不可信，看下财年")
+
+
+def _quarterly(facts, tags):
+    return pb.derive_q4(pb.pick(facts, tags, "quarterly", {"USD"}),
+                        pb.pick(facts, tags, "annual", {"USD"}))
+
+
+def _onetime_series(facts):
+    """gaap_onetime 用到的四条季度序列，一次取好供逐窗复用。"""
+    ni, pt, tx = (_quarterly(facts, t) for t in (pb.NI_TAGS, PRETAX_TAGS, TAX_TAGS))
+    return ni, pt, tx, pb.op_income_rows(facts)[1]
+
+
+def _onetime_at(S, ttm_end, impact):
+    ni, pt, tx, opq = S
+    keys = [k for k in sorted(pt) if k <= ttm_end and k in opq and k in tx][-ONETIME_BASE_Q:]
+    win = keys[-4:]
+    if (len(keys) < ONETIME_MIN_Q or win[-1] != ttm_end or any(k not in ni for k in win)
+            or (date.fromisoformat(win[-1]) - date.fromisoformat(win[0])).days > 300):
+        return None
+    below = {k: pt[k]["val"] - opq[k]["val"] / (1 - pb.OP_TAX) for k in keys}
+    base = median(below.values())
+    excess = sum(below[k] - base for k in win)
+    pre, tax, n = (sum(s[k]["val"] for k in win) for s in (pt, tx, ni))
+    etrs = [tx[k]["val"] / pt[k]["val"] for k in keys if pt[k]["val"] > 0]
+    if len(etrs) < ONETIME_MIN_Q or pre <= 0 or n <= 0:
+        return None
+    etr_n = median(etrs)
+    clean = n + tax - excess - etr_n * (pre - excess)
+    ratio = n / clean if clean > 0 else None
+    if ratio is not None and abs(ratio - 1) <= impact:
+        return None
+    return {"ttm_end": ttm_end, "excess": excess, "base_q": base, "pretax": pre,
+            "etr": tax / pre, "etr_norm": etr_n, "ratio": ratio}
+
+
+def gaap_onetime(facts, ttm_end, impact=ONETIME_IMPACT):
+    """GAAP TTM 窗口（截至 ttm_end 的四季）里营业线以下 / 税项的一次性成分 -> dict 或 None。
+
+    为什么不靠 pe_band 的畸变守卫：它只看净利自身的形状，单季偏离同窗中位季 > 1.25 倍
+    才整窗剔。低于门槛的收益照样进窗口（AMZN Q3'25 $10.2B、Q1'26 $15.7B Anthropic
+    重估，† 停住的「末个有效点」本身仍含这两笔）；往下偏离的上限是 −100%（净利归零），
+    要转成实打实的亏损才够得着门槛（META Q3'25 OBBBA 一次性税费，净利 −86% 仍放行）。
+    改剔窗门槛会让 GAAP 列整年停在旧点，还会撞零售 Q4 的季节性——所以不剔，直接读造成
+    畸变的两个科目，还原成「营业外取常态、税率取常态」的口径：
+
+      营业外 = 税前利润 − 营业利润；常态 = 截至窗口末 12 季的中位（每季营业外、季度税率）
+      干净净利 = 净利 + 税 − 超常营业外 − 常态税率 × (税前 − 超常营业外)
+      ratio = 净利 ÷ 干净净利；GAAP PE × ratio = 干净口径 PE（clean ≤ 0 时 None）
+
+    常态只用截至该窗口末的季度，逐窗算不偷看未来，所以同一公式能拿来还原整段历史
+    （clean_band）。税后、线以下的项目（少数股东、权益法）原样保留。|ratio − 1| ≤ impact
+    返回 None；科目取不齐（金融股没有营业利润、外国发行人没有季度序列、窗口缺季）也返回
+    None——宁可不标也不瞎标。纯函数（facts = companyfacts 的 us-gaap 节）。
+    """
+    return _onetime_at(_onetime_series(facts), ttm_end, impact)
+
+
+def clean_band(series, ratios, key, x):
+    """还原口径的分位：历史每个交易日的 PE × 它所用窗口的 ratio，当前值 x 在其中的秩。纯函数。
+
+    只还原当前点、拿它去比没还原的历史是两种口径相比：GOOG/AMZN 近两年的 GAAP 历史本身
+    就被股权重估压低，还原后的当前值去比它会系统性偏高（GOOG P88/P100/P99，营业线才
+    P51/P73/P48）。所以历史逐窗用同一公式还原（_onetime_at 的常态只看窗口末之前，不偷看）。
+    取不到 ratio 的窗口（早年季度不足 8 季、还原后亏损）那几天不进分布。
+    series = compute_band(include_series=True) 的逐日记录（带 ttm_period）。"""
+    pts = [(s["date"], s[key] * ratios[s["ttm_period"]]) for s in series
+           if key in s and ratios.get(s.get("ttm_period"))]
+    out = {"days": len(pts)}
+    for n in (10, 5, 3):
+        start = pb.years_ago(n).isoformat()
+        sv = sorted(v for d, v in pts if d >= start)
+        ok = len(sv) >= MIN_DAYS
+        out[f"r{n}"] = pb.rank_of(sv, x) if ok else None
+        if n == 3:
+            out["p3"] = {q: pb.pctile(sv, q) for q in (10, 25, 50, 75, 90)} if ok else None
+    return out
+
+
+def onetime_reading(facts, g, b10, close, px_date, key="pe_trailing"):
+    """GAAP 读数 g -> 还原口径 dict（pe / asof / clean 分位）或 None。纯函数。
+
+    † 行（当前窗口被 pe_band 畸变守卫剔了）优先还原**最新那扇被剔的窗口**、用当前收盘：
+    显示的末个有效点是旧窗口 × 旧价格（AMZN 7/30），拿它还原会差出一个季度和两个月的
+    股价（AMZN 35.3x vs 最新窗口 33.9x、GOOG 33.6x vs 31.5x）。最新窗口还原不出偏离
+    （畸变在营业线以内，这里管不到）才退回旧点——旧点本身也可能含门槛下的一次性项。
+    b10 带 series 时附 clean（clean_band），否则只给还原后的 PE。"""
+    S = _onetime_series(facts)
+    tries = []
+    if not g["fresh"]:
+        newer = [w for w in b10.get("anom_windows", [])
+                 if w["period_end"] > (g["ttm_period"] or "")
+                 and w["known_from"] <= str(px_date) and w["ttm_eps"] > 0]
+        if newer:
+            w = max(newer, key=lambda w: w["period_end"])
+            tries.append((w["period_end"], close / w["ttm_eps"], str(px_date)))
+    tries.append((g["ttm_period"], g["pe"], g["date"]))
+    for end, pe, asof in tries:
+        ot = _onetime_at(S, end, ONETIME_IMPACT) if end else None
+        if ot:
+            break
+    else:
+        return None
+    ot = dict(ot, pe=pe * ot["ratio"] if ot["ratio"] else None, asof=asof)
+    if ot["pe"] and "series" in b10:
+        ends = {s.get("ttm_period") for s in b10["series"]} - {None}
+        ratios = {e: (r or {}).get("ratio") for e in ends for r in [_onetime_at(S, e, -1)]}
+        ot["clean"] = clean_band(b10["series"], ratios, key, ot["pe"])
+    return ot
+
+
+def onetime_note(ot, g):
+    """还原口径的脚注一句：一次性项明细 + 还原值 + 原值（表里这组显示的是还原口径）。"""
+    def bn(v, plus=False):
+        return f"{'−' if v < 0 else '+' if plus else ''}${abs(v) / 1e9:.1f}B"
+    parts = []
+    if abs(ot["excess"]) >= 0.03 * ot["pretax"]:
+        parts.append(f"营业外超常 {bn(ot['excess'], True)}（税前，常态每季 {bn(ot['base_q'])}）")
+    if abs(ot["etr"] - ot["etr_norm"]) >= 0.02:
+        parts.append(f"有效税率 {ot['etr']:.0%}（常态 {ot['etr_norm']:.0%}）")
+    adj = ("扣除后 TTM 亏损" if ot.get("pe") is None
+           else f"扣除后约 {ot['pe']:.1f}x（{ot.get('asof') or '—'} 收盘）")
+    raw = (f"{g['pe']:.1f}x" + ("" if g["fresh"] else f"†{g['date']}")
+           + " · " + "/".join(_pc(g.get(k)) for k in ("r10", "r5", "r3")))
+    return (f"TTM 窗口（至 {ot['ttm_end']}）疑含一次性项：{'；'.join(parts) or '营业外与税项合计'}"
+            f"——{adj}。表中 GAAP 这组是还原口径（历史逐窗同样扣除后重算分位）；原值 {raw}")
 
 
 def load_watchlist(path, tickers=None):
@@ -106,9 +245,10 @@ def summarize(b10, b5, last_px_date, key):
             "thin": b10["thin_coverage"], "r10": r10, "r5": r5, "r3": r3, "p3": p3}
 
 
-def band_reading(t, email, inputs, metric, key, last_px_date):
+def band_reading(t, email, inputs, metric, key, last_px_date, series=False):
     try:
-        b10 = pb.compute_band(t, email, 10, "trailing", metric=metric, inputs=inputs)
+        b10 = pb.compute_band(t, email, 10, "trailing", metric=metric, inputs=inputs,
+                              include_series=series)
     except RuntimeError as e:
         return {"err": str(e).splitlines()[0][:100]}, None
     try:
@@ -174,9 +314,16 @@ def collect(t, kind, email):
         return {"ticker": t, "skip": str(e).splitlines()[0][:100]}
     b10_eps = None
     for name, metric, key in METRICS:
-        row[name], b10 = band_reading(t, email, inputs, metric, key, row["px_date"])
+        # GAAP 带要逐日序列：一次性项还原口径的分位要逐窗还原整段历史（clean_band）
+        row[name], b10 = band_reading(t, email, inputs, metric, key, row["px_date"],
+                                      series=metric == "eps")
         if metric == "eps":
             b10_eps = b10
+            ot = None if "err" in row[name] else onetime_reading(
+                inputs["facts"], row[name], b10, row["close"], row["px_date"], key)
+            if ot:
+                row[name]["onetime"] = ot
+                row["notes"].append(onetime_note(ot, row[name]))
     row["yh"] = yahoo_info(t)
     try:
         cons, trend, _ = fetch_consensus(t)
@@ -209,10 +356,16 @@ def _pc(v):
 def _band_cells(m):
     if "err" in m:
         return ["n/a", "—", "—", "—", "—"]
-    pe = f"{m['pe']:.1f}x" + ("" if m["fresh"] else f"†{m['date'][5:]}")
-    p3 = m["p3"]
+    ot = m.get("onetime")
+    if ot:      # 还原口径：PE、三窗分位、近 3 年带全换成扣除一次性项后的同一口径（≈ 标记）
+        c = ot.get("clean") or {}
+        pe = "亏损⚠" if ot["pe"] is None else f"≈{ot['pe']:.1f}x⚠"
+        rs, p3 = [c.get(k) for k in ("r10", "r5", "r3")], c.get("p3")
+    else:
+        pe = f"{m['pe']:.1f}x" + ("" if m["fresh"] else f"†{m['date'][5:]}")
+        rs, p3 = [m["r10"], m["r5"], m["r3"]], m["p3"]
     b = "—" if not p3 else f"{p3[10]:.0f}/{p3[50]:.0f}/{p3[90]:.0f}"
-    return [pe, _pc(m["r10"]), _pc(m["r5"]), _pc(m["r3"]), b]
+    return [pe] + [_pc(v) for v in rs] + [b]
 
 
 def _fwd_cells(fw):
@@ -257,7 +410,8 @@ def render(rows, asof, intraday=False):
           "营业线 PE = P/NOPAT（市值 ÷ 营业利润×(1−21%)）；"
           "P10/50/90 = 近 3 年 10%/一半/90% 的交易日 PE 低于该值；"
           "† = 当前窗口被剔，显示末个有效点；本/下财年 PE = 收盘 ÷ yfinance 一致预期"
-          "（Yahoo forwardPE = 下财年列，不是 NTM）；⚠ = 本财年预期疑含一次性收益。"
+          "（Yahoo forwardPE = 下财年列，不是 NTM）；⚠ = 疑含一次性项（本财年预期 / "
+          "GAAP TTM 窗口的营业外与税项，见脚注的还原值）。"
           "口径细节见 valuation/pe_rank.py 文件头。", ""]
     if intraday:
         md += [f"**{INTRADAY_NOTE}**", ""]
@@ -305,6 +459,10 @@ def csv_rows(rows):
                   "fy2_pe_lo", "fy2_pe_hi"):
             rec[k] = fw.get(k)
         rec["fy1_suspect"] = bool(fw.get("fy1_suspect"))
+        ot = (r.get("gaap") or {}).get("onetime") or {}
+        rec["gaap_onetime"], rec["gaap_clean_pe"] = bool(ot), ot.get("pe")
+        for k in ("r10", "r5", "r3"):
+            rec[f"gaap_clean_{k}"] = (ot.get("clean") or {}).get(k)
         labels = r.get("fy_labels") or (None, None)
         rec["fy1_label"], rec["fy2_label"] = labels
         yh = r.get("yh") or {}

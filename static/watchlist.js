@@ -9,6 +9,22 @@ let data = null;
 const fmtPE = (v) => v == null ? "—" : v >= 1000 ? ">999x" : `${v.toFixed(1)}x`;
 const fmtNum = (v, d = 1) => v == null ? "—" : v >= 1000 ? ">999" : v.toFixed(d);
 const pctPct = (v) => `${v >= 0 ? "+" : ""}${Math.round(v * 100)}%`;
+const fmtB = (v, plus = false) => `${v < 0 ? "−" : plus ? "+" : ""}$${Math.abs(v / 1e9).toFixed(1)}B`;
+
+// 与 pe_rank.onetime_note 同口径：营业外超常 ≥ 税前 3%、税率偏离 ≥ 2 个点才列出
+function onetimeText(o, m) {
+  const parts = [];
+  if (Math.abs(o.excess) >= 0.03 * o.pretax)
+    parts.push(`营业外超常 ${fmtB(o.excess, true)}（税前，常态每季 ${fmtB(o.base_q)}）`);
+  if (Math.abs(o.etr - o.etr_norm) >= 0.02)
+    parts.push(`有效税率 ${Math.round(o.etr * 100)}%（常态 ${Math.round(o.etr_norm * 100)}%）`);
+  const adj = o.pe == null ? "扣除后 TTM 亏损" : `扣除后约 ${fmtPE(o.pe)}（${o.asof} 收盘）`;
+  const raw = [m.r10, m.r5, m.r3].map((v) => v == null ? "—" : `P${Math.round(v)}`).join("/");
+  return `TTM 窗口（至 ${o.ttm_end}）疑含一次性项：${parts.join("；") || "营业外与税项合计"}——`
+       + `${adj}。这组 PE / 分位 / 近 3 年带都是还原口径：历史每扇 TTM 窗口用同一公式`
+       + `扣除一次性项后重算，当前值与历史同口径比。原值 ${fmtPE(m.pe)}${m.fresh ? "" : `†${m.date}`}`
+       + `，原始分位 ${raw}`;
+}
 // 分位有天然中点（P50 = 自己历史的常态），两头才是信息 → 发散色阶：低 = 蓝、高 = 铜，
 // 中间退到底色。单色顺序色阶会把一头融进卡片底色、和「—」缺值格分不开（原先 AMZN P1）。
 // 不用红绿：那是好坏/状态的编码，会被读成买卖信号；不用橙：离 --warn 的 ⚠ 太近。
@@ -86,23 +102,33 @@ function bandCells(m) {
     return [el("td", { text: "n/a", cls: "na", title: m.err }),
             ...[0, 1, 2, 3].map(() => el("td", { text: "—", cls: "na" }))];
   }
-  const pe = el("td", { text: fmtPE(m.pe) });
-  if (!m.fresh) {
+  // 疑含一次性项：整组换成还原口径——当前值与历史逐窗用同一公式扣除一次性项后再排分位
+  // （pe_rank.clean_band）。斜纹 = 估算口径；原值在 PE 格 ⚠ 的悬停里
+  const ot = m.onetime;
+  const est = ot ? (ot.clean || {}) : null;
+  const pe = el("td", { text: ot ? (ot.pe == null ? "亏损" : `≈${fmtPE(ot.pe)}`) : fmtPE(m.pe) });
+  if (ot) pe.append(mark("⚠", onetimeText(ot, m)));
+  else if (!m.fresh) {
     pe.append(mark("†", `当前 TTM 窗口被剔（一次性畸变/亏损/近零），显示的是 ${m.date} 的末个有效点`));
   }
-  const why = m.thin ? `有效样本仅 ${m.days10} 天，不给分位` : "该窗口有效样本不足 250 天";
+  const why = ot ? "还原口径有效样本不足 250 天"
+    : m.thin ? `有效样本仅 ${m.days10} 天，不给分位` : "该窗口有效样本不足 250 天";
+  // 斜纹叠在 background-image 上，底色只能写 background-color（background 简写会把斜纹清掉）
   const pct = (v, n) => v == null
     ? el("td", { text: "—", cls: "na", title: why })
-    : el("td", { text: `P${Math.round(v)}`, cls: "pct",
-                 title: `近 ${n} 年里约 ${Math.round(v)}% 的有效交易日 PE 比现在低`,
-                 attrs: { style: `background:${shade(v)}` } });
-  const p3 = m.p3;
+    : el("td", { text: `P${Math.round(v)}`, cls: ot ? "pct est" : "pct",
+                 title: (ot ? "还原口径：" : "")
+                        + `近 ${n} 年里约 ${Math.round(v)}% 的有效交易日 PE 比现在低`,
+                 attrs: { style: `background-color:${shade(v)}` } });
+  const p3 = ot ? est.p3 : m.p3;
   const [lo, mid, hi] = p3 ? [p3["10"], p3["50"], p3["90"]].map(Math.round) : [];
   const band = el("td", p3
     ? { text: `${lo} / ${mid} / ${hi}`,
-        title: `近 3 年：10% 的交易日 PE 低于 ${lo}x，一半低于 ${mid}x，90% 低于 ${hi}x` }
+        title: `${ot ? "还原口径，" : ""}近 3 年：10% 的交易日 PE 低于 ${lo}x，`
+               + `一半低于 ${mid}x，90% 低于 ${hi}x` }
     : { text: "—", cls: "na" });
-  return [pe, pct(m.r10, 10), pct(m.r5, 5), pct(m.r3, 3), band];
+  const r = ot ? est : m;
+  return [pe, pct(r.r10, 10), pct(r.r5, 5), pct(r.r3, 3), band];
 }
 
 function fwdCells(fw, labels) {
@@ -130,17 +156,21 @@ function bodyRow(r) {
     attrs: { href: `/dashboard.html?ticker=${encodeURIComponent(r.ticker)}`,
              target: "_blank", rel: "noopener" } }, el("span", { text: "↗" })));
   const yh = r.yh || {};
-  const cells = [...bandCells(r.gaap), ...bandCells(r.op), ...fwdCells(r.fwd, r.fy_labels),
-                 el("td", { text: fmtNum(yh.tpe) }), el("td", { text: fmtNum(yh.peg, 2) })];
-  cells.forEach((c, i) => GSTART.has(i) && c.classList.add("gstart"));
-  return el("tr", {}, tk, el("td", { text: r.close == null ? "—" : r.close.toFixed(2) }), ...cells);
+  // 分组左边线按组画、不按列序号：一次性项那组会把三格合并成一格，序号就错位了
+  const groups = [bandCells(r.gaap), bandCells(r.op), fwdCells(r.fwd, r.fy_labels),
+                  [el("td", { text: fmtNum(yh.tpe) }), el("td", { text: fmtNum(yh.peg, 2) })]];
+  groups.forEach((g) => g[0].classList.add("gstart"));
+  return el("tr", {}, tk, el("td", { text: r.close == null ? "—" : r.close.toFixed(2) }),
+            ...groups.flat());
 }
 
 // 排序档位：有值(0) < 缺值(1)，同档再按数值——不能用 Infinity 当哨兵，
 // Infinity − Infinity = NaN 会让 sort 的比较结果不自洽
 function sortKey(r, path) {
   const [grp, k] = path.split(".");
-  const v = (r[grp] || {})[k];
+  // 疑含一次性项的 GAAP 分位按还原口径排（与表格显示的一致）
+  const ot = grp === "gaap" && (r.gaap || {}).onetime;
+  const v = ot ? (ot.clean || {})[k] : (r[grp] || {})[k];
   return v == null ? [1, 0] : [0, v];
 }
 const byKey = (path) => (a, b) => {
