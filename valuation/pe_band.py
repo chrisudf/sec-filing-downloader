@@ -1030,7 +1030,9 @@ def compute_band(ticker, email, years=5, basis="forward", include_series=False,
         # 要无滞后的 trailing 参照请用 trailing_nolag
         "other_basis_median": (pctile(other_pes, 50) if other_pes else None),
         "split_notes": split_notes, "dropped_fys": dropped,
-        "anom_windows": [{"period_end": p["period_end"], "quarter": p["anom_q"]}
+        # ttm_eps/known_from 给 pe_rank：† 行的当前窗口被剔了，还原一次性项要用它
+        "anom_windows": [{"period_end": p["period_end"], "quarter": p["anom_q"],
+                          "ttm_eps": p["ttm_eps"], "known_from": p["known_from"]}
                          for p in by_end if p.get("anomalous")],
         # 季节性豁免的窗口/财年单独留痕：被豁免 = 保留在分布里，读者要能核对
         # "为什么这票的 Q4 高峰没被当畸变剔掉"

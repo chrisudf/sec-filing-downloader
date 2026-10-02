@@ -4,7 +4,11 @@
 联网部分（load_inputs / fetch_consensus / yfinance info）不在这里测——它们都是
 既有模块的函数，本模块只负责拼装与口径。
 """
+import json
 from datetime import date, timedelta
+from pathlib import Path
+
+import pytest
 
 from valuation import pe_rank as pr
 
@@ -239,3 +243,163 @@ def test_write_atomic_leaves_no_tmp(tmp_path):
     pr.write_atomic(f, '{"a": 2}')
     assert f.read_text(encoding="utf-8") == '{"a": 2}'
     assert [p.name for p in tmp_path.iterdir()] == [f.name]
+
+
+# ---------------------------------------------------------------- gaap_onetime
+# 夹具：AMZN / META / HD 的真实 companyfacts，只留 gaap_onetime 用到的 5 个 tag、
+# 2022-06 起的 3 个月 / 12 个月期（2026-10-02 拉取）
+_FIX = Path(__file__).parent / "fixtures" / "onetime_companyfacts_min.json"
+
+
+def _cf(t):
+    return json.loads(_FIX.read_text(encoding="utf-8"))[t]
+
+
+def test_onetime_amzn_stale_point_still_has_anthropic_gains():
+    """† 停住的「末个有效点」（2025Q2–2026Q1 窗口）仍含 Q3'25 $10.2B、Q1'26 $15.7B
+    Anthropic 重估：各自低于 pe_band 1.25 倍剔窗门槛，畸变守卫放行。表上 28.1x，还原约 35x。"""
+    ot = pr.gaap_onetime(_cf("AMZN"), "2026-03-31")
+    assert ot["ratio"] == pytest.approx(1.256, abs=0.005)
+    assert ot["excess"] / 1e9 == pytest.approx(25.75, abs=0.05)
+    # 被剔的 2026Q2 窗口本身更离谱（$53.4B 那季），同一判据也认得出
+    assert pr.gaap_onetime(_cf("AMZN"), "2026-06-30")["ratio"] > 1.6
+
+
+def test_onetime_meta_tax_charge_pushes_pe_up():
+    """META Q3'25 OBBBA 一次性税费：净利 −86% 仍在剔窗门槛内（往下最多 −100%）。
+    方向与 AMZN 相反——GAAP PE 被抬高，还原后更便宜。"""
+    ot = pr.gaap_onetime(_cf("META"), "2026-06-30")
+    assert ot["ratio"] == pytest.approx(0.875, abs=0.005)
+    assert ot["etr"] == pytest.approx(0.222, abs=0.001)
+    assert ot["etr_norm"] == pytest.approx(0.117, abs=0.001)
+    g = dict(_row()["gaap"], pe=27.4, r10=43.1, r5=57.5, r3=43.6)
+    note = pr.onetime_note(dict(ot, pe=23.9, asof="2026-10-01"), g)
+    assert "有效税率 22%（常态 12%）" in note
+    assert "营业外超常" not in note                 # 营业外只差 0.8%，不列
+    assert "扣除后约 23.9x（2026-10-01 收盘）" in note
+    assert note.endswith("原值 27.4x · P43/P58/P44")   # 表里是还原口径，原值进脚注
+
+
+def test_onetime_clean_company_not_flagged():
+    f = _cf("HD")
+    end = max(pr._quarterly(f, pr.PRETAX_TAGS))
+    assert pr.gaap_onetime(f, end) is None
+    assert pr.gaap_onetime(f, end, impact=0)["ratio"] == pytest.approx(1, abs=0.01)
+
+
+def _syn(n=12, ni_over=None, drop=(), with_op=True):
+    """合成 companyfacts：每季营业利润 10、营业外 +1、税率 15%（$B）；
+    ni_over = {季序号: (税前, 税[, 营业利润])} 覆盖某季，drop = 去掉的季序号。"""
+    tags = {t: [] for t in ("NetIncomeLoss", "IncomeTaxExpenseBenefit", "OperatingIncomeLoss",
+                            pr.PRETAX_TAGS[0])}
+    end0 = date(2023, 3, 31)
+    for i in range(n):
+        if i in drop:
+            continue
+        e = end0 + timedelta(days=91 * i)
+        pre, tax, op = ((ni_over or {}).get(i, (11.0, 11.0 * 0.15)) + (10.0,))[:3]
+        for tag, v in (("NetIncomeLoss", pre - tax), ("IncomeTaxExpenseBenefit", tax),
+                       ("OperatingIncomeLoss", op), (pr.PRETAX_TAGS[0], pre)):
+            tags[tag].append({"start": (e - timedelta(days=90)).isoformat(), "end": e.isoformat(),
+                              "val": v * 1e9, "filed": (e + timedelta(days=30)).isoformat(),
+                              "form": "10-Q", "fp": "Q"})
+    if not with_op:
+        del tags["OperatingIncomeLoss"]
+    return {t: {"units": {"USD": rows}} for t, rows in tags.items()}, \
+        (end0 + timedelta(days=91 * (n - 1))).isoformat()
+
+
+def test_onetime_synthetic_guards():
+    f, end = _syn()
+    assert pr.gaap_onetime(f, end, impact=-1)["ratio"] == pytest.approx(1)   # -1 = 不过滤
+    # 末季营业外 +21（常态 +1）：超常 20，税率不变 -> ratio = 税前 64 ÷ 干净税前 44
+    f, end = _syn(ni_over={11: (31.0, 31.0 * 0.15)})
+    ot = pr.gaap_onetime(f, end)
+    assert ot["excess"] == pytest.approx(20e9) and ot["ratio"] == pytest.approx(64 / 44)
+    # 取不齐就不标：没有营业利润（金融股）、历史不足 8 季、窗口中间缺季
+    assert pr.gaap_onetime(_syn(with_op=False)[0], end) is None
+    assert pr.gaap_onetime(*_syn(n=7)) is None
+    assert pr.gaap_onetime(*_syn(ni_over={11: (31.0, 31.0 * 0.15)}, drop=(10,))) is None
+
+
+def test_onetime_clean_loss_has_no_pe():
+    """扣掉营业外收益后 TTM 转亏：ratio=None，仍要标（这正是最该提醒的情形）。"""
+    over = {i: (1.0, 0.15) for i in range(8)}            # 前 8 季：营业 10、营业外 −9
+    over.update({i: (-7.0, 0.0, 2.0) for i in (8, 9, 10)})  # 营业利润掉到 2，季季亏损
+    over[11] = (60.0, 9.0, 2.0)                          # 末季一笔 +67 的营业外收益
+    f, end = _syn(ni_over=over)
+    ot = pr.gaap_onetime(f, end)
+    assert ot["ratio"] is None
+    assert "扣除后 TTM 亏损" in pr.onetime_note(dict(ot, pe=None), _row()["gaap"])
+
+
+def test_onetime_marks_cells_and_csv():
+    """标了的行整组换成还原口径：≈PE、还原分位、还原近 3 年带；原值不进格子。"""
+    ot = {"ttm_end": "2026-03-31", "excess": 25.75e9, "base_q": 1.07e9, "pretax": 115.5e9,
+          "etr": 0.209, "etr_norm": 0.188, "ratio": 1.256, "pe": 35.3,
+          "clean": {"days": 1570, "r10": 2.4, "r5": 5.1, "r3": None,
+                    "p3": None}}
+    g = dict(_row()["gaap"], fresh=False, date="2026-07-30", onetime=ot)
+    assert pr._band_cells(g) == ["≈35.3x⚠", "P2", "P5", "—", "—"]
+    assert pr._band_cells(dict(g, onetime=dict(ot, pe=None, clean=None)))[0] == "亏损⚠"
+    rec = pr.csv_rows([_row(gaap=g), _row()])
+    assert rec[0]["gaap_onetime"] and rec[0]["gaap_clean_pe"] == 35.3
+    assert rec[0]["gaap_clean_r5"] == 5.1 and rec[0]["gaap_r5"] == 2.0      # 原值仍留在 csv
+    assert not rec[1]["gaap_onetime"] and rec[1]["gaap_clean_pe"] is None
+
+
+def test_onetime_reading_dagger_row_uses_latest_window():
+    """† 行：显示的是 7/30 旧点（截至 2026Q1、旧价格），还原要用最新那扇被剔的窗口 ×
+    当前收盘——AMZN 35.3x（旧点还原）vs 33.8x（最新窗口还原）。"""
+    f = _cf("AMZN")
+    g = {"fresh": False, "ttm_period": "2026-03-31", "pe": 28.13, "date": "2026-07-30"}
+    b10 = {"anom_windows": [{"period_end": "2026-06-30", "quarter": "2026-06-30",
+                             "ttm_eps": 12.454, "known_from": "2026-07-31"}]}
+    ot = pr.onetime_reading(f, g, b10, 248.23, date(2026, 10, 1))
+    assert ot["ttm_end"] == "2026-06-30" and ot["asof"] == "2026-10-01"
+    assert ot["pe"] == pytest.approx(248.23 / 12.454 * 1.694, abs=0.05)
+    # 最新窗口还没公告（可知日在价格日之后）-> 退回旧点、旧价格
+    ot = pr.onetime_reading(f, g, b10, 235.5, date(2026, 7, 30))
+    assert ot["ttm_end"] == "2026-03-31" and ot["asof"] == "2026-07-30"
+    assert ot["pe"] == pytest.approx(28.13 * 1.256, abs=0.05)
+    # 新鲜行直接用显示的点
+    fresh = dict(g, fresh=True, ttm_period="2026-06-30", pe=19.93, date="2026-10-01")
+    assert pr.onetime_reading(f, fresh, {}, 248.23, date(2026, 10, 1))["ttm_end"] == "2026-06-30"
+
+
+def test_onetime_reading_falls_back_when_latest_window_clean():
+    """最新被剔窗口还原不出偏离（畸变在营业线以内）-> 退回旧点，旧点本身仍可能含一次性项。"""
+    f, _ = _syn(ni_over={7: (31.0, 31.0 * 0.15)})       # q7 的一次性：q7~q10 四扇窗含它
+    ends = sorted(pr._quarterly(f, pr.PRETAX_TAGS))
+    g = {"fresh": False, "ttm_period": ends[10], "pe": 20.0, "date": ends[10]}
+    b10 = {"anom_windows": [{"period_end": ends[11], "quarter": ends[11],
+                             "ttm_eps": 5.0, "known_from": ends[11]}]}
+    ot = pr.onetime_reading(f, g, b10, 100.0, date.fromisoformat(ends[11]) + timedelta(days=60))
+    assert ot["ttm_end"] == ends[10] and ot["pe"] == pytest.approx(20.0 * 64 / 44)
+
+
+def test_clean_band_ranks_against_restored_history():
+    """历史逐窗乘各自的 ratio 后再排：只还原当前点、去比没还原的历史是两种口径相比
+    （GOOG 那样会从 P47 假性跳到 P88+）。ratio 缺 / None 的窗口那几天不进分布。"""
+    days = [(TODAY - timedelta(days=i)) for i in range(400, 0, -1)]
+    series = [{"date": d.isoformat(), KEY: 20.0 + (i % 10), "ttm_period": "A" if i < 200 else "B"}
+              for i, d in enumerate(days)]
+    raw = pr.clean_band(series, {"A": 1.0, "B": 1.0}, KEY, 25.0)
+    # B 窗口含一次性收益（PE 被压低）：还原 ×1.5 后同样的当前值 25x 落到更低的分位
+    fixed = pr.clean_band(series, {"A": 1.0, "B": 1.5}, KEY, 25.0)
+    assert fixed["r3"] < raw["r3"] and fixed["days"] == raw["days"] == 400
+    assert fixed["p3"][50] > raw["p3"][50]
+    gone = pr.clean_band(series, {"A": 1.0, "B": None}, KEY, 25.0)     # 还原后亏损的窗口
+    assert gone["days"] == 200 and gone["r3"] is None                  # < MIN_DAYS 不给分位
+
+
+def test_onetime_reading_attaches_clean_band():
+    """b10 带 series 时，还原口径的分位一并算好（逐窗 ratio 走 _onetime_at，不偷看未来）。"""
+    f, end = _syn(ni_over={11: (31.0, 31.0 * 0.15)})
+    ends = sorted(pr._quarterly(f, pr.PRETAX_TAGS))
+    series = [{"date": (TODAY - timedelta(days=300 - i)).isoformat(), KEY: 20.0,
+               "ttm_period": ends[11] if i >= 150 else ends[10]} for i in range(300)]
+    g = {"fresh": True, "ttm_period": end, "pe": 20.0, "date": TODAY.isoformat()}
+    ot = pr.onetime_reading(f, g, {"series": series}, 100.0, TODAY)
+    assert ot["pe"] == pytest.approx(20.0 * 64 / 44)
+    assert ot["clean"]["days"] == 300 and ot["clean"]["r3"] is not None
