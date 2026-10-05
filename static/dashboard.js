@@ -16,6 +16,14 @@ if (qs.get("ticker")) $("ticker").value = qs.get("ticker").toUpperCase();
 if (qs.get("compare")) $("compare").value = qs.get("compare").toUpperCase();
 if (qs.get("freq") === "annual") setFreq("annual");
 if (["3", "5", "10"].includes(qs.get("years"))) $("years").value = qs.get("years");
+// 首页「内部人交易」按钮带 #insider：首次加载完直接滚到那张卡（只滚一次，换票不再跳）
+let scrollToInsider = location.hash === "#insider";
+const keepHash = () => location.hash === "#insider" ? "#insider" : "";
+// 吸顶工具栏随窗口宽度折成 1-3 行（64-190px），按实际高度留边，不写死
+function scrollToCard(id) {
+  const bar = document.querySelector(".topbar").offsetHeight;
+  window.scrollTo({ top: $(id).getBoundingClientRect().top + window.scrollY - bar - 12 });
+}
 
 function setFreq(v) {
   state.freq = v;
@@ -1147,7 +1155,7 @@ async function load() {
     state.data = d;
     state.cmp = null;  // 先按单票渲染，对比票回来后再叠线（不阻塞主图）
     history.replaceState(null, "",
-      `?ticker=${d.ticker}&freq=${freq}&years=${years}`);
+      `?ticker=${d.ticker}&freq=${freq}&years=${years}${keepHash()}`);
     document.title = `${d.ticker} 财务图表 · EDGAR 财报下载器`;
     // 公司名来自 EDGAR 第三方数据，必须走 textContent 而不是 innerHTML
     const co = $("coname");
@@ -1186,7 +1194,13 @@ async function load() {
     sel.onchange = () => renderWaterfall(d, +sel.value);
     renderWaterfall(d, d.periods.length - 1);
     // 卡片刚显示时容器才有宽度，让 ECharts 重算一次
-    requestAnimationFrame(() => Object.values(state.charts).forEach(c => c.resize()));
+    requestAnimationFrame(() => {
+      Object.values(state.charts).forEach(c => c.resize());
+      if (scrollToInsider) {
+        scrollToInsider = false;
+        scrollToCard("insCard");
+      }
+    });
     // 营业利润推导期（发行人未申报 OperatingIncomeLoss）要说出来，不能冒充申报值
     const opDerived = (d.income.op_income_derived || []).some(Boolean)
       ? " · 营业利润为推导值（营收−成本−研发−销管）" : "";
@@ -1199,7 +1213,7 @@ async function load() {
       if (cmpD) {
         state.cmp = { ticker: cmpD.ticker, data: cmpD };
         history.replaceState(null, "",
-          `?ticker=${d.ticker}&freq=${freq}&years=${years}&compare=${cmpD.ticker}`);
+          `?ticker=${d.ticker}&freq=${freq}&years=${years}&compare=${cmpD.ticker}${keepHash()}`);
         renderIncome(d, labels);
         const align = alignCompare(d.periods, cmpD.periods,
           cmpD.income.margins.net, d.freq === "annual" ? 183 : 45);
