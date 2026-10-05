@@ -1074,6 +1074,12 @@ function renderInsiderFilters(d) {
     b.type = "button";
     b.dataset.f = f.key;
     b.className = state.insOn.has(f.key) ? "on" : "";
+    if (!n) b.classList.add("zero");
+    // 公开市场买入是这张卡最有信息量的信号：有就高亮，哪怕当前没选中它
+    if (f.key === "buy" && n) {
+      b.classList.add("hot");
+      b.title = `近 ${d.years} 年有 ${n} 笔公开市场买入`;
+    }
     if (f.title) b.title = f.title;
     if (f.mark) {
       const m = document.createElement("span");

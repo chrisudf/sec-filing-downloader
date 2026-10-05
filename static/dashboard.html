@@ -140,6 +140,13 @@
   .chips button:hover { border-color: var(--accent); }
   .chips button.on { background: var(--accent-dim); border-color: var(--accent); color: var(--text); }
   .chips button .n { color: var(--muted); margin-left: 4px; font-variant-numeric: tabular-nums; }
+  .chips button.zero .n { opacity: .55; }
+  /* 有公开市场买入时「买入」按钮高亮（与图上 ▲ 同色），选没选中都一眼看得到 */
+  .chips button.hot { border-color: var(--s3); color: var(--text); font-weight: 700;
+                      background: rgba(25, 158, 112, .16);
+                      box-shadow: 0 0 0 1px rgba(25, 158, 112, .45), 0 0 10px rgba(25, 158, 112, .35); }
+  .chips button.hot.on { background: rgba(25, 158, 112, .32); }
+  .chips button.hot .n { color: #4fe0a8; font-weight: 700; opacity: 1; }
   @media (max-width: 640px) {
     .chart { height: 320px; }
     .chart.tall { height: 460px; }
