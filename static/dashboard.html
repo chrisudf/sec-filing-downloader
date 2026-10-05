@@ -122,14 +122,24 @@
   details.fold summary { color: var(--muted); font-size: 13px; cursor: pointer;
                          padding: 6px 4px; }
   #insTable { overflow-x: auto; }
+  /* 窄屏时让表格变宽、在卡片内横向滚动，而不是把这两列挤成一字一行 */
+  #insTable td.role { min-width: 110px; }
+  #insTable td.note { min-width: 200px; max-width: 320px; color: var(--muted); font-size: 12px; }
   table.conc td.num { font-variant-numeric: tabular-nums; text-align: right; white-space: nowrap; }
   table.conc th.num { text-align: right; }
   table.conc td.nowrap, #insTable .tag, #insTable th, #insTable td:last-child { white-space: nowrap; }
   table.conc a { color: var(--accent); text-decoration: none; }
   .ins-bar { display: flex; align-items: center; justify-content: space-between;
              gap: 12px; flex-wrap: wrap; margin-top: 4px; }
-  .ins-bar label { color: var(--muted); font-size: 12px; cursor: pointer; }
   .ins-warn { color: #e0a63f; font-size: 12px; }
+  /* 明细表筛选：可多选的胶囊按钮（区别于单选的 .seg） */
+  .chips { display: flex; gap: 6px; flex-wrap: wrap; margin: 10px 0 2px; }
+  .chips button { background: var(--card2); border: 1px solid var(--border);
+                  border-radius: 999px; color: var(--muted); font-size: 12px;
+                  padding: 5px 12px; cursor: pointer; white-space: nowrap; }
+  .chips button:hover { border-color: var(--accent); }
+  .chips button.on { background: var(--accent-dim); border-color: var(--accent); color: var(--text); }
+  .chips button .n { color: var(--muted); margin-left: 4px; font-variant-numeric: tabular-nums; }
   @media (max-width: 640px) {
     .chart { height: 320px; }
     .chart.tall { height: 460px; }
@@ -200,8 +210,8 @@
       <div class="chart" id="cInsider"><div class="empty">内部人数据加载中…</div></div>
       <div class="ins-bar">
         <span class="ins-warn" id="insWarn"></span>
-        <label><input type="checkbox" id="insAll"> 显示全部（含扣税 / 行权 / 授予 / 赠与 / 员工购股）</label>
       </div>
+      <div class="chips" id="insFilters" title="筛选下表（可多选）"></div>
       <div id="insTable"></div>
     </div>
     <div class="chart-card">

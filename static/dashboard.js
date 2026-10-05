@@ -920,6 +920,17 @@ const INS_KIND = {
   other:     { label: "其他", color: C.muted },
 };
 const INS_MARKED = ["buy", "private", "sell", "sell_plan"];
+// 明细表的筛选按钮（可多选）。私募/认购只在这只票真有时才出现；「其他」收扣税等
+// 不画点的类别。默认只看买入——卖出（尤其计划卖出）笔数多，会把买入淹掉
+const INS_FILTERS = [
+  { key: "buy", label: "买入", mark: "▲", kinds: ["buy"] },
+  { key: "private", label: "私募/认购", mark: "◇", kinds: ["private"], onlyIfAny: true },
+  { key: "sell", label: "自主卖出", mark: "▼", kinds: ["sell"] },
+  { key: "sell_plan", label: "计划卖出", mark: "▽", kinds: ["sell_plan"] },
+  { key: "other", label: "其他", kinds: ["espp", "tax", "exercise", "grant", "gift", "other"],
+    title: "扣税 / 行权 / 授予 / 赠与 / 员工购股计划" },
+];
+state.insOn = new Set(["buy", "private"]);  // 换票、切 1/2 年都保留用户的选择
 const INS_TABLE_MAX = 300;
 
 // 内部人交易金额跨度大（几千到几亿），不能用 fmtUSD 的 M 起步
@@ -938,6 +949,7 @@ function insEmpty(msg) {
   $("insTiles").style.display = "none";
   $("insTiles").textContent = "";
   $("insWarn").textContent = "";
+  $("insFilters").textContent = "";
   $("insTable").textContent = "";
   $("cInsider").innerHTML = '<div class="empty"></div>';
   $("cInsider").firstChild.textContent = msg;
@@ -997,6 +1009,7 @@ function renderInsider(d) {
   tiles.style.display = "grid";
   $("insWarn").textContent = d.warning ? "⚠ " + d.warning : "";
   renderInsiderChart(d);
+  renderInsiderFilters(d);
   renderInsiderTable(d);
 }
 
@@ -1051,16 +1064,45 @@ function renderInsiderChart(d) {
   mount("cInsider", opt);
 }
 
+function renderInsiderFilters(d) {
+  const box = $("insFilters");
+  box.textContent = "";
+  for (const f of INS_FILTERS) {
+    const n = d.rows.filter(r => f.kinds.includes(r.kind)).length;
+    if (f.onlyIfAny && !n) continue;
+    const b = document.createElement("button");
+    b.type = "button";
+    b.dataset.f = f.key;
+    b.className = state.insOn.has(f.key) ? "on" : "";
+    if (f.title) b.title = f.title;
+    if (f.mark) {
+      const m = document.createElement("span");
+      m.textContent = f.mark + " ";
+      m.style.color = INS_KIND[f.kinds[0]].color;
+      b.appendChild(m);
+    }
+    b.appendChild(document.createTextNode(f.label));
+    const c = document.createElement("span");
+    c.className = "n";
+    c.textContent = n;
+    b.appendChild(c);
+    box.appendChild(b);
+  }
+}
+
 function renderInsiderTable(d) {
   const el = $("insTable");
   el.textContent = "";
-  const all = $("insAll").checked;
-  const rows = d.rows.filter(r => all || INS_MARKED.includes(r.kind));
+  // 只认当前真显示出来的按钮：私募按钮不在时，它残留的选中状态不算数
+  const shown = INS_FILTERS.filter(f => !f.onlyIfAny || d.rows.some(r => f.kinds.includes(r.kind)));
+  const on = shown.filter(f => state.insOn.has(f.key));
+  const kinds = new Set(on.flatMap(f => f.kinds));
+  const rows = d.rows.filter(r => kinds.has(r.kind));
   if (!rows.length) {
     const p = document.createElement("div");
     p.className = "conc-empty";
-    p.textContent = all ? `近 ${d.years} 年没有 Form 4 交易`
-      : `近 ${d.years} 年没有公开市场买卖或私募认购（勾「显示全部」看授予/行权等）`;
+    p.textContent = !on.length ? "点上面的按钮选要看的类型（可多选）"
+      : `近 ${d.years} 年没有${on.map(f => f.label).join("、")}——点上面的按钮看其他类型`;
     el.appendChild(p);
     return;
   }
@@ -1086,7 +1128,7 @@ function renderInsiderTable(d) {
     cell(r.date, "nowrap");
     cell(r.filed, "nowrap");
     cell(r.owner);
-    cell(r.role);
+    cell(r.role, "role");
     const k = INS_KIND[r.kind] || INS_KIND.other;
     const tag = document.createElement("span");
     tag.className = "tag";
@@ -1097,11 +1139,17 @@ function renderInsiderTable(d) {
     cell(r.price ? (+r.price).toFixed(2) : "—", "num");
     cell(fmtMoney(r.value), "num");
     cell(fmtShares(r.after), "num");
+    // 持有方式常是一整句英文（"The Reporting Person is a beneficiary and trustee of…"），
+    // 截断显示、悬停看全文，别把整行撑成十行高
+    const NATURE_MAX = 48;
+    const nat = r.nature && r.nature.length > NATURE_MAX
+      ? r.nature.slice(0, NATURE_MAX).trimEnd() + "…" : r.nature;
     const notes = [];
-    if (r.indirect) notes.push(r.nature ? `间接: ${r.nature}` : "间接持有");
+    if (r.indirect) notes.push(nat ? `间接: ${nat}` : "间接持有");
     if (r.form === "4/A") notes.push("修正申报");
     if (r.late_days > 0) notes.push(`迟报 ${r.late_days} 个工作日`);
-    cell(notes.join(" · "));
+    const noteTd = cell(notes.join(" · "), "note");
+    if (nat !== r.nature) noteTd.title = r.nature;
     const a = document.createElement("a");
     a.href = r.url;
     a.target = "_blank";
@@ -1118,7 +1166,14 @@ function renderInsiderTable(d) {
   }
 }
 
-$("insAll").addEventListener("change", () => { if (state.insData) renderInsiderTable(state.insData); });
+$("insFilters").addEventListener("click", (e) => {
+  const b = e.target.closest("button");
+  if (!b || !state.insData) return;
+  const k = b.dataset.f;
+  if (state.insOn.has(k)) state.insOn.delete(k); else state.insOn.add(k);
+  b.classList.toggle("on", state.insOn.has(k));
+  renderInsiderTable(state.insData);
+});
 $("insYears").addEventListener("click", (e) => {
   const y = e.target.dataset && e.target.dataset.y;
   if (!y || +y === state.insYears) return;
