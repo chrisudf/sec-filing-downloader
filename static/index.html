@@ -177,6 +177,8 @@
     </div>
     <a id="dashLink" class="dash-btn" target="_blank" rel="noopener"
        style="display:none">📈 打开财务图表面板（损益 · 分部营收 · 现金流 · 债务）↗</a>
+    <a id="insLink" class="dash-btn" target="_blank" rel="noopener"
+       style="display:none">🕵️ 内部人交易（Form 4 买卖点 · 自主卖出 vs 10b5-1 计划卖出）↗</a>
   </div>
 
   <label class="section">下载类型（可多选）</label>
@@ -312,6 +314,9 @@ async function lookup() {
     $("coLatest").textContent = parts.length ? parts.join("； ") : "未找到";
     $("dashLink").href = `/dashboard.html?ticker=${encodeURIComponent(info.ticker)}`;
     $("dashLink").style.display = "block";
+    // 同一页面的内部人交易卡片；#insider 让 dashboard 加载后直接滚过去
+    $("insLink").href = `/dashboard.html?ticker=${encodeURIComponent(info.ticker)}#insider`;
+    $("insLink").style.display = "block";
     $("companyInfo").style.display = "block";
   } catch (e) {
     showCompanyError("查询失败：" + e.message);
@@ -322,6 +327,7 @@ function showCompanyError(msg) {
   $("coName").textContent = msg;
   $("coLatest").textContent = "—";
   $("dashLink").style.display = "none";
+  $("insLink").style.display = "none";
   $("companyInfo").style.display = "block";
 }
 

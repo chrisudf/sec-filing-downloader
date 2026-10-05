@@ -82,11 +82,13 @@ from . import valuation_service  # noqa: E402 —— 需在静态挂载前注册
 from . import financials_service  # noqa: E402
 from . import segments_service  # noqa: E402
 from . import pe_rank_service  # noqa: E402
+from . import insider_service  # noqa: E402
 
 app.include_router(valuation_service.router)
 app.include_router(financials_service.router)
 app.include_router(segments_service.router)
 app.include_router(pe_rank_service.router)
+app.include_router(insider_service.router)
 
 STATIC_DIR = Path(__file__).resolve().parent.parent / "static"
 app.mount("/", StaticFiles(directory=str(STATIC_DIR), html=True), name="static")

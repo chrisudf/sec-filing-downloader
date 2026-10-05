@@ -6,7 +6,7 @@ const C = { s1: css("--s1"), s2: css("--s2"), s3: css("--s3"), s4: css("--s4"),
             card2: css("--card2") };
 
 const state = { freq: "quarterly", data: null, charts: {}, seq: 0, segSeq: 0,
-                segMode: "abs", segData: null };
+                segMode: "abs", segData: null, insSeq: 0, insData: null, insYears: 1 };
 const esc = (s) => String(s).replace(/[&<>"']/g,
   (c) => ({ "&": "&amp;", "<": "&lt;", ">": "&gt;", '"': "&quot;", "'": "&#39;" }[c]));
 
@@ -16,6 +16,14 @@ if (qs.get("ticker")) $("ticker").value = qs.get("ticker").toUpperCase();
 if (qs.get("compare")) $("compare").value = qs.get("compare").toUpperCase();
 if (qs.get("freq") === "annual") setFreq("annual");
 if (["3", "5", "10"].includes(qs.get("years"))) $("years").value = qs.get("years");
+// 首页「内部人交易」按钮带 #insider：首次加载完直接滚到那张卡（只滚一次，换票不再跳）
+let scrollToInsider = location.hash === "#insider";
+const keepHash = () => location.hash === "#insider" ? "#insider" : "";
+// 吸顶工具栏随窗口宽度折成 1-3 行（64-190px），按实际高度留边，不写死
+function scrollToCard(id) {
+  const bar = document.querySelector(".topbar").offsetHeight;
+  window.scrollTo({ top: $(id).getBoundingClientRect().top + window.scrollY - bar - 12 });
+}
 
 function setFreq(v) {
   state.freq = v;
@@ -897,6 +905,289 @@ function renderCashflow(d, labels) {
   mount("cCashflow", opt);
 }
 
+// ---- 图 5：内部人交易（SEC Form 4）----
+// 图上只画四类；其余（扣税/行权/授予/赠与/员工购股/其他）只进表格
+const INS_KIND = {
+  buy:       { label: "公开市场买入", color: C.s3, symbol: "triangle", rotate: 0, hollow: false },
+  private:   { label: "私募/认购", color: C.s7, symbol: "diamond", rotate: 0, hollow: true },
+  sell:      { label: "自主卖出", color: C.s8, symbol: "triangle", rotate: 180, hollow: false },
+  sell_plan: { label: "10b5-1 计划卖出", color: C.muted, symbol: "triangle", rotate: 180, hollow: true },
+  espp:      { label: "员工购股计划", color: C.muted },
+  tax:       { label: "扣税", color: C.muted },
+  exercise:  { label: "行权/转换", color: C.muted },
+  grant:     { label: "授予", color: C.muted },
+  gift:      { label: "赠与", color: C.muted },
+  other:     { label: "其他", color: C.muted },
+};
+const INS_MARKED = ["buy", "private", "sell", "sell_plan"];
+// 明细表的筛选按钮（可多选）。私募/认购只在这只票真有时才出现；「其他」收扣税等
+// 不画点的类别。默认只看买入——卖出（尤其计划卖出）笔数多，会把买入淹掉
+const INS_FILTERS = [
+  { key: "buy", label: "买入", mark: "▲", kinds: ["buy"] },
+  { key: "private", label: "私募/认购", mark: "◇", kinds: ["private"], onlyIfAny: true },
+  { key: "sell", label: "自主卖出", mark: "▼", kinds: ["sell"] },
+  { key: "sell_plan", label: "计划卖出", mark: "▽", kinds: ["sell_plan"] },
+  { key: "other", label: "其他", kinds: ["espp", "tax", "exercise", "grant", "gift", "other"],
+    title: "扣税 / 行权 / 授予 / 赠与 / 员工购股计划" },
+];
+state.insOn = new Set(["buy"]);  // 默认只看公开市场买入；换票、切 1/2 年都保留用户的选择
+const INS_TABLE_MAX = 300;
+
+// 内部人交易金额跨度大（几千到几亿），不能用 fmtUSD 的 M 起步
+function fmtMoney(v) {
+  if (v == null) return "—";
+  const a = Math.abs(v);
+  if (a >= 1e9) return "$" + (v / 1e9).toFixed(2) + "B";
+  if (a >= 1e6) return "$" + (v / 1e6).toFixed(1) + "M";
+  if (a >= 1e3) return "$" + (v / 1e3).toFixed(0) + "K";
+  return "$" + v.toFixed(0);
+}
+const fmtShares = (v) => v == null ? "—" : Math.round(v).toLocaleString("en-US");
+
+function insEmpty(msg) {
+  if (state.charts.cInsider) { state.charts.cInsider.dispose(); delete state.charts.cInsider; }
+  $("insTiles").style.display = "none";
+  $("insTiles").textContent = "";
+  $("insWarn").textContent = "";
+  $("insFilters").textContent = "";
+  $("insTable").textContent = "";
+  $("cInsider").innerHTML = '<div class="empty"></div>';
+  $("cInsider").firstChild.textContent = msg;
+}
+
+async function loadInsider(ticker) {
+  // 独立序号：主请求或分部卡片的新一轮不该作废仍然有效的内部人响应
+  const seq = ++state.insSeq;
+  state.insData = null;
+  insEmpty("内部人数据加载中…（首次要逐份下载 Form 4，约 10-60 秒）");
+  try {
+    const res = await fetch(`/api/insider/${encodeURIComponent(ticker)}?years=${state.insYears}`);
+    if (seq !== state.insSeq) return;
+    if (!res.ok) {
+      const body = await res.json().catch(() => ({}));
+      throw new Error(body.detail || `请求失败（HTTP ${res.status}）`);
+    }
+    const d = await res.json();
+    if (seq !== state.insSeq) return;
+    state.insData = d;
+    renderInsider(d);
+  } catch (e) {
+    // 瞬态失败不能说成「没有内部人交易」——那是错误的否定信号
+    if (seq === state.insSeq) insEmpty("内部人数据加载失败：" + e.message);
+  }
+}
+
+function insTile(k, v, n) {
+  const t = document.createElement("div");
+  t.className = "tile";
+  for (const [cls, text] of [["k", k], ["v", v], ["n", n]]) {
+    if (text == null) continue;
+    const el = document.createElement("div");
+    el.className = cls;
+    el.textContent = text;   // 申报人姓名来自 EDGAR 第三方数据，只走 textContent
+    t.appendChild(el);
+  }
+  return t;
+}
+
+function renderInsider(d) {
+  const s = d.summary;
+  const tiles = $("insTiles");
+  tiles.textContent = "";
+  const b = s.buy;
+  tiles.appendChild(insTile("公开市场买入", b.n ? fmtMoney(b.value) : "无",
+    b.n ? `${b.people} 人 ${b.n} 笔${b.cluster ? " · 30 天内多人买入" : ""}` : `近 ${d.years} 年`));
+  if (b.last) tiles.appendChild(insTile("最近一次买入", b.last.date,
+    `${b.last.owner}（${b.last.role}）${fmtMoney(b.last.value)}`));
+  if (s.private.n) tiles.appendChild(insTile("私募/认购", fmtMoney(s.private.value),
+    `${s.private.people} 人 ${s.private.n} 笔`));
+  tiles.appendChild(insTile("自主卖出", s.sell.n ? fmtMoney(s.sell.value) : "无",
+    s.sell.n ? `${s.sell.people} 人 ${s.sell.n} 笔` : null));
+  tiles.appendChild(insTile("10b5-1 计划卖出", s.sell_plan.n ? fmtMoney(s.sell_plan.value) : "无",
+    s.sell_plan.n ? `${s.sell_plan.people} 人 ${s.sell_plan.n} 笔` : null));
+  tiles.appendChild(insTile("其他（不画点）", `${s.other_n} 笔`, "扣税/行权/授予/赠与/员工购股"));
+  tiles.style.display = "grid";
+  $("insWarn").textContent = d.warning ? "⚠ " + d.warning : "";
+  renderInsiderChart(d);
+  renderInsiderFilters(d);
+  renderInsiderTable(d);
+}
+
+function renderInsiderChart(d) {
+  if (!d.prices.length) {
+    if (state.charts.cInsider) { state.charts.cInsider.dispose(); delete state.charts.cInsider; }
+    $("cInsider").innerHTML = '<div class="empty">取不到股价，买卖点无法画出（明细见下表）</div>';
+    return;
+  }
+  if (!state.charts.cInsider) $("cInsider").textContent = "";
+  const maxV = Math.max(1, ...d.markers.map(m => m.value));
+  // 面积 ∝ 金额：直径按开方缩放，最小的点也要点得中
+  const size = (v) => 7 + 21 * Math.sqrt(Math.max(v, 0) / maxV);
+  const opt = baseOpt();
+  opt.tooltip = Object.assign({}, opt.tooltip, { trigger: "item", axisPointer: undefined });
+  opt.tooltip.formatter = (p) => {
+    if (p.seriesType === "line") return `<b>${esc(p.value[0])}</b><br>收盘 ${(+p.value[1]).toFixed(2)}`;
+    const m = p.data.m;
+    let html = `<b>${esc(m.date)}</b> · ${esc(INS_KIND[m.kind].label)} ${fmtMoney(m.value)}`
+      + `<br><span style="color:${C.muted}">当日收盘 ${(+m.y).toFixed(2)}</span>`;
+    for (const i of m.rows.slice(0, 8)) {
+      const r = d.rows[i];
+      html += `<br>${esc(r.owner)}（${esc(r.role)}）${fmtShares(r.shares)} 股`
+        + (r.price ? ` @ ${(+r.price).toFixed(2)}` : "") + ` ≈ ${fmtMoney(r.value)}`
+        + (r.indirect && r.nature ? ` <span style="color:${C.muted}">间接: ${esc(r.nature)}</span>` : "");
+    }
+    if (m.rows.length > 8) html += `<br><span style="color:${C.muted}">…另 ${m.rows.length - 8} 笔见下表</span>`;
+    return html;
+  };
+  opt.xAxis = { type: "time", axisLine: { lineStyle: { color: C.border } },
+                axisLabel: { color: C.muted, fontSize: 11 }, splitLine: { show: false } };
+  opt.yAxis = { type: "value", scale: true,
+                splitLine: { lineStyle: { color: C.border, opacity: .6 } },
+                axisLabel: { color: C.muted, fontSize: 11 } };
+  // 窄屏上图例折成两行，不多留底边会压住横轴的月份
+  opt.grid = { left: 56, right: 20, top: 24,
+               bottom: $("cInsider").clientWidth < 520 ? 80 : 56 };
+  opt.series = [{ name: "收盘价", type: "line", data: d.prices, showSymbol: false,
+                  lineStyle: { width: 1.5, color: C.s1 }, itemStyle: { color: C.s1 } }];
+  for (const kind of INS_MARKED) {
+    const k = INS_KIND[kind];
+    const pts = d.markers.filter(m => m.kind === kind);
+    if (!pts.length) continue;
+    opt.series.push({
+      name: k.label, type: "scatter", symbol: k.symbol, symbolRotate: k.rotate,
+      data: pts.map(m => ({ value: [m.date, m.y], m, symbolSize: size(m.value) })),
+      itemStyle: k.hollow ? { color: "transparent", borderColor: k.color, borderWidth: 1.5 }
+                          : { color: k.color, opacity: .9 },
+      z: 3,
+    });
+  }
+  mount("cInsider", opt);
+}
+
+function renderInsiderFilters(d) {
+  const box = $("insFilters");
+  box.textContent = "";
+  for (const f of INS_FILTERS) {
+    const n = d.rows.filter(r => f.kinds.includes(r.kind)).length;
+    if (f.onlyIfAny && !n) continue;
+    const b = document.createElement("button");
+    b.type = "button";
+    b.dataset.f = f.key;
+    b.className = state.insOn.has(f.key) ? "on" : "";
+    if (!n) b.classList.add("zero");
+    // 公开市场买入是这张卡最有信息量的信号：有就高亮，哪怕当前没选中它
+    if (f.key === "buy" && n) {
+      b.classList.add("hot");
+      b.title = `近 ${d.years} 年有 ${n} 笔公开市场买入`;
+    }
+    if (f.title) b.title = f.title;
+    if (f.mark) {
+      const m = document.createElement("span");
+      m.textContent = f.mark + " ";
+      m.style.color = INS_KIND[f.kinds[0]].color;
+      b.appendChild(m);
+    }
+    b.appendChild(document.createTextNode(f.label));
+    const c = document.createElement("span");
+    c.className = "n";
+    c.textContent = n;
+    b.appendChild(c);
+    box.appendChild(b);
+  }
+}
+
+function renderInsiderTable(d) {
+  const el = $("insTable");
+  el.textContent = "";
+  // 只认当前真显示出来的按钮：私募按钮不在时，它残留的选中状态不算数
+  const shown = INS_FILTERS.filter(f => !f.onlyIfAny || d.rows.some(r => f.kinds.includes(r.kind)));
+  const on = shown.filter(f => state.insOn.has(f.key));
+  const kinds = new Set(on.flatMap(f => f.kinds));
+  const rows = d.rows.filter(r => kinds.has(r.kind));
+  if (!rows.length) {
+    const p = document.createElement("div");
+    p.className = "conc-empty";
+    p.textContent = !on.length ? "点上面的按钮选要看的类型（可多选）"
+      : `近 ${d.years} 年没有${on.map(f => f.label).join("、")}——点上面的按钮看其他类型`;
+    el.appendChild(p);
+    return;
+  }
+  const t = document.createElement("table");
+  t.className = "conc";
+  const head = t.createTHead().insertRow();
+  for (const [h, num] of [["交易日"], ["申报日"], ["申报人"], ["身份"], ["类型"],
+                          ["股数", 1], ["价格", 1], ["金额", 1], ["交易后持有", 1], ["说明"], [""]]) {
+    const th = document.createElement("th");
+    th.textContent = h;
+    if (num) th.className = "num";
+    head.appendChild(th);
+  }
+  const body = t.createTBody();
+  for (const r of rows.slice(0, INS_TABLE_MAX)) {
+    const tr = body.insertRow();
+    const cell = (text, cls) => {
+      const td = tr.insertCell();
+      td.textContent = text;
+      if (cls) td.className = cls;
+      return td;
+    };
+    cell(r.date, "nowrap");
+    cell(r.filed, "nowrap");
+    cell(r.owner);
+    cell(r.role, "role");
+    const k = INS_KIND[r.kind] || INS_KIND.other;
+    const tag = document.createElement("span");
+    tag.className = "tag";
+    tag.style.color = k.color;
+    tag.textContent = r.kind === "other" ? `其他（${r.code}）` : k.label;
+    tr.insertCell().appendChild(tag);
+    cell(fmtShares(r.shares), "num");
+    cell(r.price ? (+r.price).toFixed(2) : "—", "num");
+    cell(fmtMoney(r.value), "num");
+    cell(fmtShares(r.after), "num");
+    // 持有方式常是一整句英文（"The Reporting Person is a beneficiary and trustee of…"），
+    // 截断显示、悬停看全文，别把整行撑成十行高
+    const NATURE_MAX = 48;
+    const nat = r.nature && r.nature.length > NATURE_MAX
+      ? r.nature.slice(0, NATURE_MAX).trimEnd() + "…" : r.nature;
+    const notes = [];
+    if (r.indirect) notes.push(nat ? `间接: ${nat}` : "间接持有");
+    if (r.form === "4/A") notes.push("修正申报");
+    if (r.late_days > 0) notes.push(`迟报 ${r.late_days} 个工作日`);
+    const noteTd = cell(notes.join(" · "), "note");
+    if (nat !== r.nature) noteTd.title = r.nature;
+    const a = document.createElement("a");
+    a.href = r.url;
+    a.target = "_blank";
+    a.rel = "noopener";
+    a.textContent = "原文";
+    tr.insertCell().appendChild(a);
+  }
+  el.appendChild(t);
+  if (rows.length > INS_TABLE_MAX) {
+    const p = document.createElement("div");
+    p.className = "conc-empty";
+    p.textContent = `共 ${rows.length} 条，只显示最近 ${INS_TABLE_MAX} 条（复制 CSV 拿全部）`;
+    el.appendChild(p);
+  }
+}
+
+$("insFilters").addEventListener("click", (e) => {
+  const b = e.target.closest("button");
+  if (!b || !state.insData) return;
+  const k = b.dataset.f;
+  if (state.insOn.has(k)) state.insOn.delete(k); else state.insOn.add(k);
+  b.classList.toggle("on", state.insOn.has(k));
+  renderInsiderTable(state.insData);
+});
+$("insYears").addEventListener("click", (e) => {
+  const y = e.target.dataset && e.target.dataset.y;
+  if (!y || +y === state.insYears) return;
+  state.insYears = +y;
+  for (const btn of $("insYears").children) btn.classList.toggle("on", btn.dataset.y === y);
+  if (state.data) loadInsider(state.data.ticker);
+});
+
 // ---- 加载与渲染 ----
 async function load() {
   const ticker = $("ticker").value.trim().toUpperCase();
@@ -925,7 +1216,7 @@ async function load() {
     state.data = d;
     state.cmp = null;  // 先按单票渲染，对比票回来后再叠线（不阻塞主图）
     history.replaceState(null, "",
-      `?ticker=${d.ticker}&freq=${freq}&years=${years}`);
+      `?ticker=${d.ticker}&freq=${freq}&years=${years}${keepHash()}`);
     document.title = `${d.ticker} 财务图表 · EDGAR 财报下载器`;
     // 公司名来自 EDGAR 第三方数据，必须走 textContent 而不是 innerHTML
     const co = $("coname");
@@ -955,6 +1246,7 @@ async function load() {
       if (state.charts[id]) state.charts[id].group = "sync";
     echarts.connect("sync");
     loadSegments(d.ticker, freq, years);  // 独立异步，不阻塞主图状态
+    loadInsider(d.ticker);                // 同上；不随季度/年度与年数切换
     // 瀑布图期数下拉：默认最新一期
     const sel = $("wfPeriod");
     sel.innerHTML = "";
@@ -963,7 +1255,13 @@ async function load() {
     sel.onchange = () => renderWaterfall(d, +sel.value);
     renderWaterfall(d, d.periods.length - 1);
     // 卡片刚显示时容器才有宽度，让 ECharts 重算一次
-    requestAnimationFrame(() => Object.values(state.charts).forEach(c => c.resize()));
+    requestAnimationFrame(() => {
+      Object.values(state.charts).forEach(c => c.resize());
+      if (scrollToInsider) {
+        scrollToInsider = false;
+        scrollToCard("insCard");
+      }
+    });
     // 营业利润推导期（发行人未申报 OperatingIncomeLoss）要说出来，不能冒充申报值
     const opDerived = (d.income.op_income_derived || []).some(Boolean)
       ? " · 营业利润为推导值（营收−成本−研发−销管）" : "";
@@ -976,7 +1274,7 @@ async function load() {
       if (cmpD) {
         state.cmp = { ticker: cmpD.ticker, data: cmpD };
         history.replaceState(null, "",
-          `?ticker=${d.ticker}&freq=${freq}&years=${years}&compare=${cmpD.ticker}`);
+          `?ticker=${d.ticker}&freq=${freq}&years=${years}&compare=${cmpD.ticker}${keepHash()}`);
         renderIncome(d, labels);
         const align = alignCompare(d.periods, cmpD.periods,
           cmpD.income.margins.net, d.freq === "annual" ? 183 : 45);
@@ -1020,12 +1318,24 @@ function csvConc() {
     L.push([r.party, r.type, r.benchmark, r.pct, r.pct_lo, r.aggregate, r.end]);
   return L;
 }
+function csvInsider() {
+  const d = state.insData;
+  if (!d) return null;
+  const L = [["交易日", "申报日", "申报人", "身份", "类型", "交易代码", "股数", "价格",
+              "金额", "交易后持有", "间接持有", "修正申报", "迟报工作日", "原文"]];
+  for (const r of d.rows)
+    L.push([r.date, r.filed, r.owner, r.role, (INS_KIND[r.kind] || INS_KIND.other).label,
+            r.code, r.shares, r.price, r.value, r.after, r.indirect ? (r.nature || "是") : "",
+            r.form === "4/A" ? "是" : "", r.late_days || "", r.url]);
+  return L;
+}
 document.addEventListener("click", async (e) => {
   const kind = e.target.dataset && e.target.dataset.csv;
   if (!kind) return;
   const d = state.data;
   const table = kind === "income" ? (d && csvIncome(d))
-    : kind === "cashflow" ? (d && csvCashflow(d)) : csvConc();
+    : kind === "cashflow" ? (d && csvCashflow(d))
+    : kind === "insider" ? csvInsider() : csvConc();
   if (!table) return;
   // RFC4180：含逗号/引号/换行的字段包引号并把引号加倍
   const cell = (v) => {
