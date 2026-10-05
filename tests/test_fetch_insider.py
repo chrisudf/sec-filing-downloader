@@ -311,6 +311,10 @@ def test_build_uses_disk_cache_and_skips_old_and_non_form4(fast):
                          transport=_transport(subs, docs, calls))
     assert [r["kind"] for r in d["rows"]] == ["sell", "buy"]
     assert d["missing"] == 0 and len(calls) == 3        # submissions + 2 份 XML
+    # primaryDocument 是 "xslF345X06/b.xml"（XSL 渲染出的 HTML）；原始 XML 在申报根目录
+    assert [c for c in calls if c.endswith(".xml")] == [
+        "/Archives/edgar/data/1818874/0001262/b.xml",
+        "/Archives/edgar/data/1818874/0001261/a.xml"]
     calls.clear()
     fi.build_insider("SOFI", "x@y.z", SOFI, 1, today=date(2026, 10, 5),
                      transport=_transport(subs, {}, calls))

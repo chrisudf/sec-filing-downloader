@@ -335,6 +335,9 @@ def _parse_cached(client: httpx.Client, cik: int, row: dict) -> dict | None:
             return json.loads(path.read_text(encoding="utf-8"))
         except (OSError, json.JSONDecodeError):
             pass
+    # 故意去掉目录: submissions 的 primaryDocument 是 "xslF345X06/xxx.xml", 那是 SEC
+    # 用 XSL 渲染出来的 HTML 页面 (text/html, XML 解析直接报错); 原始 XML 在申报
+    # 根目录同名文件 (text/xml)。2026-10-06 对 SOFI 0001613438-26-000016 实测两边
     doc = row["doc"].rsplit("/", 1)[-1]
     if not doc.lower().endswith(".xml"):
         return None

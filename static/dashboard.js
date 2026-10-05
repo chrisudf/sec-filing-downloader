@@ -930,7 +930,7 @@ const INS_FILTERS = [
   { key: "other", label: "其他", kinds: ["espp", "tax", "exercise", "grant", "gift", "other"],
     title: "扣税 / 行权 / 授予 / 赠与 / 员工购股计划" },
 ];
-state.insOn = new Set(["buy", "private"]);  // 换票、切 1/2 年都保留用户的选择
+state.insOn = new Set(["buy"]);  // 默认只看公开市场买入；换票、切 1/2 年都保留用户的选择
 const INS_TABLE_MAX = 300;
 
 // 内部人交易金额跨度大（几千到几亿），不能用 fmtUSD 的 M 起步

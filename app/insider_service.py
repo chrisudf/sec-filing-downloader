@@ -30,6 +30,9 @@ from valuation.fetch_insider import InsiderError, build_insider  # noqa: E402
 router = APIRouter()
 
 INS_TTL = 3600
+# 股价只用来定位买卖点; Yahoo 卡住时降级成不画点, 不能让整个接口跟着挂住。
+# 线程没法取消, 超时后它在后台自己结束 (同 valuation_service 取价的做法)
+PRICE_TIMEOUT = 30
 CACHE_MAX = 64
 YEARS_MAX = 2
 CLUSTER_DAYS = 30
@@ -101,7 +104,7 @@ def _prices(ticker: str, since: str) -> list[list]:
     """日收盘 [[date, close], ...]; 取不到返回 [] (卡片照出, 只是不画点)。"""
     import yfinance as yf
     start = (date.fromisoformat(since) - timedelta(days=7)).isoformat()
-    hist = yf.Ticker(ticker).history(start=start, auto_adjust=False)
+    hist = yf.Ticker(ticker).history(start=start, auto_adjust=False, timeout=15)
     if hist.empty:
         return []
     close = hist["Close"].dropna()
@@ -118,7 +121,7 @@ async def _load(ticker: str, years: int, email: str) -> dict:
         info = await edgar.company_info(ticker, email)
         since = (date.today() - timedelta(days=365 * years)).isoformat()
         ins_task = asyncio.to_thread(build_insider, ticker, email, info["cik"], years)
-        px_task = asyncio.to_thread(_prices, ticker, since)
+        px_task = asyncio.wait_for(asyncio.to_thread(_prices, ticker, since), PRICE_TIMEOUT)
         ins, px = await asyncio.gather(ins_task, px_task, return_exceptions=True)
         if isinstance(ins, InsiderError):
             raise edgar.EdgarError(502 if ins.transient else 404, str(ins))

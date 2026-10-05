@@ -116,6 +116,22 @@ def test_price_failure_degrades_not_fails(api):
     assert "取不到股价" in d["warning"]
 
 
+def test_stalled_price_source_degrades_instead_of_hanging(api, monkeypatch):
+    # Copilot 评审: Yahoo 卡住时接口不能跟着挂住, 要走"不画点"的降级
+    import time
+    monkeypatch.setattr(svc, "PRICE_TIMEOUT", 0.1)
+    monkeypatch.setattr(svc, "_prices", lambda t, s: time.sleep(1) or [["2026-06-16", 1.0]])
+    async def timed():
+        # 在事件循环里计时: asyncio.run 退出时会等那个睡着的线程, 服务端的循环不会
+        t0 = time.monotonic()
+        d = await svc.insider("SOFI", years=1)
+        return d, time.monotonic() - t0
+    d, elapsed = asyncio.run(timed())
+    assert elapsed < 0.9
+    assert d["markers"] == [] and len(d["rows"]) == 1
+    assert "取不到股价" in d["warning"]
+
+
 def test_missing_filings_are_reported(api):
     api["ins"]["missing"] = 3
     d = asyncio.run(svc.insider("SOFI", years=1))
