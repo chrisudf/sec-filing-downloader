@@ -74,7 +74,9 @@
   .status.ok { color: var(--ok); }
   .coname { color: var(--muted); font-size: 13px; }
   .coname b { color: var(--text); }
-  .grid { display: grid; grid-template-columns: 1fr; gap: 16px; margin-top: 18px; }
+  /* minmax(0, 1fr) 而不是 1fr：1fr 的下限是内容宽度，内部人明细表（~900px）会把
+     整列撑破手机屏幕；宽表改在 #insTable / #concTable 里自己横向滚动 */
+  .grid { display: grid; grid-template-columns: minmax(0, 1fr); gap: 16px; margin-top: 18px; }
   .chart-card {
     background: var(--card);
     border: 1px solid var(--border);
@@ -119,6 +121,15 @@
   details.fold { margin: 6px 0 14px; }
   details.fold summary { color: var(--muted); font-size: 13px; cursor: pointer;
                          padding: 6px 4px; }
+  #insTable { overflow-x: auto; }
+  table.conc td.num { font-variant-numeric: tabular-nums; text-align: right; white-space: nowrap; }
+  table.conc th.num { text-align: right; }
+  table.conc td.nowrap, #insTable .tag, #insTable th, #insTable td:last-child { white-space: nowrap; }
+  table.conc a { color: var(--accent); text-decoration: none; }
+  .ins-bar { display: flex; align-items: center; justify-content: space-between;
+             gap: 12px; flex-wrap: wrap; margin-top: 4px; }
+  .ins-bar label { color: var(--muted); font-size: 12px; cursor: pointer; }
+  .ins-warn { color: #e0a63f; font-size: 12px; }
   @media (max-width: 640px) {
     .chart { height: 320px; }
     .chart.tall { height: 460px; }
@@ -156,7 +167,7 @@
   <div id="welcome">
     <div class="big">📊</div>
     输入股票代码加载财务图表<br>
-    损益摘要与利润率 · 利润瀑布 · 现金与债务 · 现金流与资本开支<br>
+    损益摘要与利润率 · 利润瀑布 · 现金与债务 · 现金流与资本开支 · 内部人交易<br>
     数据来自 SEC EDGAR XBRL，季度现金流由累计数差分还原
   </div>
   <div class="grid" id="charts" style="display:none">
@@ -173,6 +184,25 @@
         <div><h2>每股与股本</h2><div class="sub">上：稀释 EPS；下：加权稀释股本——回购缩股/增发稀释的节奏直读。股本线的财年 Q4 为均值口径、无法由年度倒推，留空断线。两栏共用同一时间轴</div></div>
       </div>
       <div class="chart" id="cEps"></div>
+    </div>
+    <div class="chart-card" id="insCard">
+      <div class="chart-head">
+        <div><h2>内部人交易</h2><div class="sub">SEC Form 4（高管 / 董事 / 10% 股东）。点画在交易日收盘价上：<span style="color:var(--s3)">▲ 公开市场买入</span> · <span style="color:var(--s7)">◇ 私募/认购</span> · <span style="color:var(--s8)">▼ 自主卖出</span> · ▽ 10b5-1 计划卖出，点越大金额越大（hover 看明细）。扣税、行权、授予、赠与、员工购股计划只在表里。watchlist 邮件只推 ≥$2.5 万的公开市场买入，这里全部列出。首次加载要逐份下载申报（约 10-60 秒）</div></div>
+        <div style="display:flex;gap:8px;flex-wrap:wrap">
+          <div class="seg" id="insYears">
+            <button data-y="1" class="on">1 年</button>
+            <button data-y="2">2 年</button>
+          </div>
+          <button class="mini" data-csv="insider">复制 CSV</button>
+        </div>
+      </div>
+      <div class="tiles" id="insTiles" style="display:none"></div>
+      <div class="chart" id="cInsider"><div class="empty">内部人数据加载中…</div></div>
+      <div class="ins-bar">
+        <span class="ins-warn" id="insWarn"></span>
+        <label><input type="checkbox" id="insAll"> 显示全部（含扣税 / 行权 / 授予 / 赠与 / 员工购股）</label>
+      </div>
+      <div id="insTable"></div>
     </div>
     <div class="chart-card">
       <div class="chart-head">
