@@ -1,0 +1,17 @@
+.git
+.venv
+.claude
+.pytest_cache
+**/__pycache__
+*.pyc
+.sec_email
+.env
+jobs/
+reports/
+prev_configs/
+vintages/
+ref_snapshots/
+downloads/
+docs/
+tests/vint-*
+*.zip

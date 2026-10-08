@@ -12,3 +12,4 @@ prev_configs/
 vintages/
 ref_snapshots/
 ref_table_overrides.json
+.env

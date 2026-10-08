@@ -37,7 +37,9 @@ QUARTER_FORMS = ("10-Q", "6-K")   # 季报（6-K 为中概股等外国发行人�
 ANNUAL_FORMS = ("10-K", "20-F")   # 年报（20-F 为外国发行人）
 
 REQUEST_GAP = 0.12   # SEC 限速 10 req/s，留出余量
-MAX_FILES = 60       # 单次打包上限，防止误选超大范围
+# 单次打包上限，防止误选超大范围。zip 在内存里打，大公司一份 10-K 十几 MB——
+# 1GB 的 droplet 上 60 份能把机器吃光，线上用 SEC_MAX_FILES 压小
+MAX_FILES = int(os.environ.get("SEC_MAX_FILES", "60"))
 TICKER_TTL = 24 * 3600
 
 _ticker_cache: dict = {"map": None, "ts": 0.0}

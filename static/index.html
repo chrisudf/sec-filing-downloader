@@ -214,11 +214,13 @@
   <button class="download" id="btn">下载 SEC 文件</button>
   <div class="status" id="status"></div>
 
+  <div id="valSection">
   <label class="section">估值报告（AI 定假设 · 引擎算数字）</label>
   <button class="download val" id="valBtn">📊 生成三情景估值报告 (Excel)</button>
   <div class="status" id="valStatus"></div>
   <div class="hint">bear/base/bull 三情景：PE 法 + 十年 DCF + SOTP + 反向 DCF。AI 只负责定假设并注明财报出处，
     所有数字由确定性引擎计算并经公式复算验证。全程约 2-4 分钟，产出 zip（财报原件 + Excel 报告 + 假设留档）。</div>
+  </div>
 
   <div class="foot">
     数据来自 <a href="https://www.sec.gov/cgi-bin/browse-edgar" target="_blank">SEC EDGAR</a>，
@@ -229,6 +231,12 @@
 <script>
 const $ = (id) => document.getElementById(id);
 const state = { company: null };
+
+// 线上部署关掉估值时（SEC_DISABLE_VALUATION）整段隐藏，不留一个点了必报错的按钮；
+// 接口取不到时保持可见——本机老行为不变
+fetch("/api/features").then(r => r.ok ? r.json() : null).then(f => {
+  if (f && f.valuation === false) $("valSection").hidden = true;
+}).catch(() => {});
 
 // ---- 初始化下拉框 ----
 const NOW = new Date();
