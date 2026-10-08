@@ -282,7 +282,48 @@ powershell -ExecutionPolicy Bypass -File scripts\pe_rank_weekly.ps1 -Unregister 
 - SEC 要求所有自动化请求的 **User-Agent 包含真实联系方式**——通过环境变量 `SEC_EMAIL` 或项目根目录
   `.sec_email` 文件配置（服务端统一使用，页面无需填写），不配置会返回明确报错，乱填可能被 SEC 403
 - 限速 **10 请求/秒**，本项目单线程顺序下载并留 0.12s 间隔，请勿改成高并发
-- 单次打包上限 60 个文件，防止误选超大范围拖垮下载
+- 单次打包上限 60 个文件（环境变量 `SEC_MAX_FILES` 可改），防止误选超大范围拖垮下载
+
+## 🌐 部署到 droplet
+
+线上只跑财务图表 / Watchlist PE / 内部人交易 / 下载，估值报告关掉——判断层调的是本机已登录的
+`claude -p`，droplet 上没有。挂在 ibkr-portfolio 那套 Caddy 后面（同一个 docker 网络 + 同一个
+basic auth），一台 1 vCPU / 1GB 的机器。
+
+```bash
+git clone https://github.com/chrisudf/sec-filing-downloader /opt/sec-filing-downloader
+cd /opt/sec-filing-downloader/deploy
+echo 'SEC_EMAIL=you@example.com' > .env
+docker compose up -d --build
+```
+
+Caddyfile 加一个站点块（`reverse_proxy sec-downloader:8756`，basic_auth 照抄 nomad403.cc 那块），
+`docker compose exec caddy caddy reload --config /etc/caddy/Caddyfile`。
+
+线上和本机的差别都在 `deploy/docker-compose.yml` 的环境变量里：
+
+| 变量 | 线上 | 为什么 |
+|---|---|---|
+| `SEC_DISABLE_VALUATION=1` | 不注册 `/api/valuation*`，首页按 `GET /api/features` 隐藏入口 | 没有 claude CLI |
+| `SEC_MAX_FILES=10` | 下载上限 60 → 10 | zip 在内存里打 |
+| `TZ=Australia/Brisbane` | pe_rank 文件名日期 | 与本机一致 |
+
+几个坑：
+
+- **内存**：网页进程峰值约 170MB（yfinance/pandas + 大公司 companyfacts），「刷新」PE 表会再起一个
+  约 170MB 的子进程。容器限 512MB，超了只杀它自己，不让内核去挑别的服务
+- **compose 项目名与服务名**：ibkr 那边的 compose 目录也叫 `deploy/`、服务也叫 `app`。不改的话
+  `up` 会把对方容器当孤儿，同一网络上两个 `app` 别名会让 Caddy 在两个容器间轮询
+- **watchlist.toml 挂目录不挂文件**：`git pull` 换掉文件 inode 后，单文件 bind mount 会一直读旧版本
+- **改 Caddyfile 别用 `sed -i`**：它也是单文件挂载，`sed -i` 换 inode，容器里看不到改动
+
+每周定时搬到 droplet 的 crontab（**这台机器时钟是布里斯班不是 UTC**）：
+
+```
+0 10 * * 6 cd /opt/sec-filing-downloader/deploy && docker compose exec -T sec-downloader python valuation/pe_rank.py >> /root/logs/sec-pe-rank.log 2>&1
+```
+
+更新：`git pull && docker compose up -d --build`。
 
 ## 📄 License
 

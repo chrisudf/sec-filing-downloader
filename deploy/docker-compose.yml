@@ -1,0 +1,40 @@
+# droplet 部署：挂到 ibkr-portfolio 那套 Caddy 后面（同一个 docker 网络，Caddy 按服务名反代）。
+# 用法与坑见 README「部署到 droplet」。
+#
+# 两处必须和 ibkr-portfolio 区分开，否则会互相踩：
+#   - name: 那边的 compose 目录也叫 deploy/，默认项目名同为 "deploy"，
+#     up 会把对方的容器当成本项目的孤儿
+#   - 服务名不能叫 app：同一网络上两个 "app" 别名，Caddy 的 reverse_proxy app:8000
+#     会在两个容器之间轮询
+name: sec-downloader
+
+services:
+  sec-downloader:
+    build: ..
+    restart: unless-stopped
+    env_file:
+      - .env                       # SEC_EMAIL=...（gitignore，不进镜像）
+    environment:
+      SEC_DISABLE_VALUATION: "1"   # 估值判断层要本机 claude CLI，线上跑不了
+      SEC_MAX_FILES: "10"          # zip 在内存里打，1GB 机器扛不住 60 份
+      TZ: Australia/Brisbane       # pe_rank 文件名日期与本机一致
+    volumes:
+      - jobs:/app/jobs             # insider / segments 磁盘缓存
+      - reports:/app/reports       # pe_rank 结果（watchlist 页读最近一份）
+      # 挂目录不挂文件：git pull 换掉 watchlist.toml 的 inode 后，单文件挂载会一直读旧的
+      - ${WATCHLIST_DIR:-/opt/watchlist-scanner}:/watchlist-scanner:ro
+    expose:
+      - "8756"
+    # 超了只杀这个容器，不让内核 OOM 去挑 IBKR 面板
+    mem_limit: 512m
+    networks:
+      - proxy
+
+volumes:
+  jobs:
+  reports:
+
+networks:
+  proxy:
+    external: true
+    name: ${PROXY_NETWORK:-deploy_web}

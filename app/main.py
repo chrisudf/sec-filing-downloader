@@ -1,6 +1,7 @@
 """FastAPI 入口：两个 API + 静态前端。"""
 from __future__ import annotations
 
+import os
 from datetime import date
 from pathlib import Path
 
@@ -78,13 +79,25 @@ async def download(req: DownloadRequest) -> Response:
     )
 
 
-from . import valuation_service  # noqa: E402 —— 需在静态挂载前注册路由
-from . import financials_service  # noqa: E402
+# 线上（droplet）没有本机 claude CLI 的登录态，估值判断层跑不起来：
+# SEC_DISABLE_VALUATION=1 时不注册估值路由，首页据 /api/features 隐藏入口
+VALUATION_ENABLED = os.environ.get("SEC_DISABLE_VALUATION", "").strip().lower() not in (
+    "1", "true", "yes")
+
+
+@app.get("/api/features")
+async def features():
+    return {"valuation": VALUATION_ENABLED, "max_files": edgar.MAX_FILES}
+
+
+from . import financials_service  # noqa: E402 —— 需在静态挂载前注册路由
 from . import segments_service  # noqa: E402
 from . import pe_rank_service  # noqa: E402
 from . import insider_service  # noqa: E402
 
-app.include_router(valuation_service.router)
+if VALUATION_ENABLED:
+    from . import valuation_service  # noqa: E402
+    app.include_router(valuation_service.router)
 app.include_router(financials_service.router)
 app.include_router(segments_service.router)
 app.include_router(pe_rank_service.router)
