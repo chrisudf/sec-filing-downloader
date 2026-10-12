@@ -569,3 +569,38 @@ def test_revision_mark_and_one_time_flag_independent():
     back = json.loads(json.dumps(pr.payload([r], [], "2026-10-12", "t", False, "w"),
                                  allow_nan=False))
     assert back["rows"][0]["rev"]["down30"] == 12 and back["rows"][0]["fwd"]["fy2_down"] is True
+
+
+def _run_main(monkeypatch, tmp_path, *argv):
+    """main() 走真实写文件路径，只把联网的 collect 换成 ETF 跳过行。"""
+    monkeypatch.setattr(pr, "collect", lambda t, kind, email: {
+        "ticker": t, "kind": kind, "skip": pr.ETF_SKIP})
+    monkeypatch.setattr(pr, "contact_email", lambda: "test@example.com")
+    monkeypatch.setattr(pr, "us_market_open", lambda: False)
+    monkeypatch.setattr("sys.argv", ["pe_rank.py", "--out-dir", str(tmp_path), *argv])
+    pr.main()
+
+
+def test_out_stem_manual_suffix():
+    assert pr.out_stem("2026-10-12", manual=False) == "pe_rank_2026-10-12"
+    assert pr.out_stem("2026-10-12", manual=True) == "pe_rank_2026-10-12-manual"
+
+
+def test_tickers_run_does_not_clobber_full_table(monkeypatch, tmp_path):
+    # 2026-10-12 之前：--tickers 写同名 pe_rank_YYYY-MM-DD.*，盖掉当天整表，网页随之只剩那几只
+    from app import pe_rank_service as ps
+    wl = tmp_path / "watchlist.toml"
+    wl.write_text('[tickers]\nQQQ = { kind = "etf" }\nGLD = { kind = "etf" }\n', encoding="utf-8")
+    out = tmp_path / "out"
+    _run_main(monkeypatch, out, "--watchlist", str(wl))
+    full = ps.latest_file(out)
+    assert full is not None and not full.stem.endswith("-manual")
+    full_text = full.read_text(encoding="utf-8")
+
+    _run_main(monkeypatch, out, "--watchlist", str(wl), "--tickers", "QQQ")
+    manual = sorted(p.name for p in out.glob("pe_rank_*-manual.*"))
+    assert [n.rsplit(".", 1)[1] for n in manual] == ["csv", "json", "md"]
+    assert ps.latest_file(out) == full                      # 网页仍读整表
+    assert full.read_text(encoding="utf-8") == full_text    # 整表没被覆盖
+    assert '"GLD"' in full_text
+    assert '"GLD"' not in (out / manual[1]).read_text(encoding="utf-8")

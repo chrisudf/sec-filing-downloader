@@ -225,7 +225,7 @@ EPS 用 yfinance 免费一致预期（0y/+1y 财年口径 + 90 天修正轨迹�
 ```bash
 # watchlist 批量：当前 PE 在近 10/5/3 年的分位 + 本/下财年 PE，一票一行
 python valuation/pe_rank.py                    # 票单 = ../watchlist-scanner/watchlist.toml
-python valuation/pe_rank.py --tickers MSFT,NVDA
+python valuation/pe_rank.py --tickers MSFT,NVDA   # 部分表写 *-manual.*，网页不读、不盖当天整表
 ```
 
 `pe_rank.py` 把 pe_band（trailing 口径，GAAP 与营业线两组）和 yfinance 一致预期拼成一张表，
