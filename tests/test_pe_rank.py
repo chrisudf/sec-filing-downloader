@@ -160,6 +160,9 @@ def test_csv_rows_flatten_all_kinds():
     assert list(recs[0]) == list(recs[1])       # 同一组列，DictWriter 不会缺列
     assert recs[0]["gaap_3y_p50"] == 51 and recs[1]["skip"] == "index"
     assert recs[0]["fy2_label"] == "FY2028(至2028-01)"
+    # PEG 已删（LESSONS.md 2026-10-12）：Yahoo 组只留 tPE 做对账
+    assert pr.HEADER[-1] == "Yahoo tPE" and "PEG" not in pr.HEADER
+    assert recs[0]["yahoo_tpe"] == 28.47 and "yahoo_peg" not in recs[0]
 
 
 def test_load_watchlist(tmp_path):
@@ -403,3 +406,166 @@ def test_onetime_reading_attaches_clean_band():
     ot = pr.onetime_reading(f, g, {"series": series}, 100.0, TODAY)
     assert ot["pe"] == pytest.approx(20.0 * 64 / 44)
     assert ot["clean"]["days"] == 300 and ot["clean"]["r3"] is not None
+
+
+# ---------------------------------------------------------------- 下财年修正 / ↓
+# 表格形状照 2026-10-12 yfinance 实测：列名 upLast7days 小写 d、downLast7Days 大写 D
+
+def _rev_df(up30, down30):
+    import pandas as pd
+    return pd.DataFrame({"upLast7days": [0, up30], "upLast30days": [0, up30],
+                         "downLast30days": [0, down30], "downLast7Days": [0, down30],
+                         "currency": ["USD", "USD"]}, index=pd.Index(["0y", "+1y"], name="period"))
+
+
+def _trend_df(cur, ago30):
+    import pandas as pd
+    return pd.DataFrame({"current": [1.0, cur], "7daysAgo": [1.0, cur], "30daysAgo": [1.0, ago30],
+                         "60daysAgo": [1.0, ago30], "90daysAgo": [1.0, ago30],
+                         "currency": ["USD", "USD"]}, index=pd.Index(["0y", "+1y"], name="period"))
+
+
+class _FakeTicker:
+    def __init__(self, rev, trend):
+        self.eps_revisions, self.eps_trend = rev, trend
+
+
+def _rev(up30, down30, cur, ago30):
+    return pr.parse_revisions(_rev_df(up30, down30), _trend_df(cur, ago30))
+
+
+def test_revisions_parse_and_cell():
+    # TSLA 2026-10-12 实测：↑1/↓4，一致预期 2.15858 -> 2.18245
+    rv = pr.fetch_revisions("TSLA", _FakeTicker(_rev_df(1, 4), _trend_df(2.18245, 2.15858)))
+    assert rv == {"up30": 1, "down30": 4, "eps": 2.18245, "eps_30d": 2.15858}
+    assert pr.revision_cell(rv) == "↑1/↓4 · +1.1%"
+    # 下修用真正的减号（与 onetime_note 的 −$1.0B 一致）
+    assert pr.revision_cell(_rev(2, 15, 3.94, 4.00)) == "↑2/↓15 · −1.5%"
+    # 亏损 / 穿零报绝对值：百分比方向会反（RKLB −0.089→−0.066 是减亏）
+    assert pr.revision_cell(_rev(2, 6, -0.06557, -0.08929)) == "↑2/↓6 · −0.09→−0.07"
+    assert pr.revision_cell(_rev(3, 0, 0.16, -0.05)) == "↑3/↓0 · −0.05→0.16"
+    # 只缺一致预期：照给家数
+    rv = pr.parse_revisions(_rev_df(3, 1), None)
+    assert rv["eps"] is None and pr.revision_cell(rv) == "↑3/↓1"
+
+
+def test_consensus_and_revisions_share_one_ticker(monkeypatch):
+    """一致预期和修正读同一个 Ticker 实例：yfinance 的 earningsTrend 按实例缓存，各建各的
+    就是每只票多一次 Yahoo 请求（PR #39 review）。新建 Ticker 直接炸，证明两边都没另起实例。"""
+    import pandas as pd
+    import yfinance as yf
+    from valuation import ref_table
+
+    def no_new_ticker(*a, **k):
+        raise AssertionError("不该再建 yf.Ticker")
+    monkeypatch.setattr(yf, "Ticker", no_new_ticker)
+    tk = _FakeTicker(_rev_df(2, 15), _trend_df(3.94, 4.00))
+    tk.earnings_estimate = pd.DataFrame(
+        {"avg": [3.5, 3.94], "low": [3.2, 3.5], "high": [3.8, 4.4], "numberOfAnalysts": [20, 18]},
+        index=["0y", "+1y"])
+    tk.fast_info = {"lastPrice": 100.0}
+    cons, trend, px = ref_table.fetch_consensus("X", tk)
+    assert cons["fy2"]["avg"] == 3.94 and trend["+1y"]["30daysAgo"] == 4.00 and px == 100.0
+    assert pr.revisions("X", tk) == {"up30": 2, "down30": 15, "eps": 3.94, "eps_30d": 4.00}
+
+
+def test_revisions_empty_etf_and_failure_show_dash():
+    import pandas as pd
+    empty = pd.DataFrame()
+    # 空表（ETF/指数，或个股取数失败被 yfinance 吞掉）= 取不到，不是「没有修正」
+    with pytest.raises(pr.EmptyRevisions):
+        pr.fetch_revisions("QQQ", _FakeTicker(empty, empty))
+    # 有表但下财年家数是 NaN：同样当取不到
+    nan = float("nan")
+    with pytest.raises(pr.EmptyRevisions):
+        pr.fetch_revisions("X", _FakeTicker(_rev_df(nan, nan), _trend_df(1.0, 1.0)))
+    rv = pr.revisions("QQQ", _FakeTicker(empty, empty))
+    assert rv == {"err": "Yahoo 返回空表（无覆盖或取数失败）"}
+
+    def boom(t, tk):
+        raise ConnectionError("HTTP 429\nToo Many Requests")
+    assert pr.revisions("NVDA", fetch=boom) == {"err": "ConnectionError: HTTP 429"}
+    # 取不到：格子「—」、进脚注、不打标记；一致预期也没取到（fwd={}）照样不抛
+    r = _row(fwd={})
+    pr.apply_revisions(r, {"err": "Yahoo 返回空表（无覆盖或取数失败）"})
+    assert r["notes"] == ["下财年修正取不到：Yahoo 返回空表（无覆盖或取数失败）"]
+    assert not r["fwd"].get("fy2_down")
+    # ETF 不联网直接跳过（collect 在取任何数之前就返回），不进表格
+    etf = pr.collect("QQQ", "index", "x@example.com")
+    assert etf["skip"] == pr.ETF_SKIP and "rev" not in etf
+    # 旧结果 / 取不到的行：这一列「—」，表格列数不乱
+    text, _ = pr.render([_row(), r, etf], "2026-10-12")
+    table = [ln for ln in text.splitlines() if ln.startswith("| ")]
+    assert len(table) == 1 + 2 and all(ln.count("|") == len(pr.HEADER) + 1 for ln in table)
+    i = pr.HEADER.index("下财年修正(30天)")
+    assert [ln.split(" | ")[i] for ln in table[1:]] == ["—", "—"]
+    rec = pr.csv_rows([r, etf])
+    assert list(rec[0]) == list(rec[1]) and rec[0]["fy2_rev_up30"] is None
+
+
+def test_revision_mark_triggers_on_fy2_cell():
+    rv = _rev(2, 15, 3.94, 4.00)
+    assert pr.revised_down(rv)
+    r = _row()
+    pr.apply_revisions(r, rv)
+    assert r["fwd"]["fy2_down"] is True
+    assert r["notes"] == [pr.revision_note(rv)]
+    assert "分母在被下修，下财年 PE 偏低、便宜得不实" in r["notes"][0]
+    assert "↑2/↓15 · −1.5%" in r["notes"][0]
+    cells = pr._fwd_cells(r["fwd"])
+    assert cells[1] == "14.4x↓" and "↓" not in cells[0] + cells[2]
+    text, notes = pr.render([r], "2026-10-12")
+    row = next(ln for ln in text.splitlines() if ln.startswith("| NVDA"))
+    assert "14.4x↓" in row and "↑2/↓15 · −1.5%" in row
+    assert any("NVDA: 下财年 30 天" in n for n in notes)
+    rec = pr.csv_rows([r])[0]
+    assert rec["fy2_down"] is True and rec["fy2_rev_down30"] == 15
+    # 门槛边界：恰好 REV_MIN_DOWN 家、0 家上调、一致预期微降 -> 标
+    assert pr.revised_down(_rev(0, pr.REV_MIN_DOWN, 3.999, 4.00))
+    # 门槛看下调家数、不看净数（README 写明）：↑4/↓5 净下调只有 1 家，也标
+    assert pr.revised_down(_rev(4, 5, 3.99, 4.00))
+
+
+def test_revision_counts_vs_magnitude_disagree_no_mark():
+    cases = [
+        _rev(1, 4, 2.18245, 2.15858),      # TSLA 实测：家数朝下（且不够 5 家），一致预期 +1.1%
+        _rev(2, 6, -0.06557, -0.08929),    # RKLB 实测：净下调 6 家，但亏损在收窄（减亏）
+        _rev(0, 8, 4.02, 4.00),            # 家数一边倒向下，一致预期反而上调
+        _rev(6, 6, 3.90, 4.00),            # 幅度朝下，但不是净下调
+        _rev(0, pr.REV_MIN_DOWN - 1, 3.90, 4.00),   # 幅度朝下，但下调家数不到门槛
+        _rev(1, 9, 4.00, 4.00),            # 一致预期没动：变动 = 0 不算 < 0
+        pr.parse_revisions(_rev_df(1, 9), None),    # 缺一致预期：只有家数不标
+    ]
+    for rv in cases:
+        assert not pr.revised_down(rv), rv
+        r = _row()
+        pr.apply_revisions(r, rv)
+        assert not r["fwd"].get("fy2_down") and r["notes"] == []
+        assert "↓" not in pr._fwd_cells(r["fwd"])[1]
+    # 下财年亏损（PE 为空）：家数和幅度都朝下也不标——没有「便宜」可言
+    rv = _rev(1, 7, -0.30, -0.20)
+    assert pr.revised_down(rv)
+    r = _row(fwd=pr.forward(70.0, {"fy2": {"avg": -0.3, "low": -0.6, "high": 0.1, "n": 9}}))
+    pr.apply_revisions(r, rv)
+    assert not r["fwd"].get("fy2_down") and pr._fwd_cells(r["fwd"])[1] == "—"
+
+
+def test_revision_mark_and_one_time_flag_independent():
+    """⚠ 标本财年格（一次性收益进了本财年预期）、↓ 标下财年格（分母在被下修）：同一行可同时出现，
+    各自一条脚注，互不覆盖。"""
+    r = _row()
+    r["fwd"] = dict(r["fwd"], fy1_pe=19.4, fy1_suspect={"j0": 0.48, "j1": 0.05})
+    r["notes"].append(pr.one_time_note(r["fwd"]["fy1_suspect"]))
+    pr.apply_revisions(r, _rev(3, 12, 15.20, 15.68))
+    cells = pr._fwd_cells(r["fwd"])
+    assert cells[0] == "19.4x⚠" and cells[1] == "14.4x↓"
+    assert len(r["notes"]) == 2
+    assert "一次性" in r["notes"][0] and "分母在被下修" in r["notes"][1]
+    rec = pr.csv_rows([r])[0]
+    assert rec["fy1_suspect"] is True and rec["fy2_down"] is True
+    text, _ = pr.render([r], "2026-10-12")
+    assert "19.4x⚠ | 14.4x↓" in text
+    # 网页 JSON 带上原始读数（前端按同口径格式化）
+    back = json.loads(json.dumps(pr.payload([r], [], "2026-10-12", "t", False, "w"),
+                                 allow_nan=False))
+    assert back["rows"][0]["rev"]["down30"] == 12 and back["rows"][0]["fwd"]["fy2_down"] is True

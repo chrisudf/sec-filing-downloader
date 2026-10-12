@@ -523,6 +523,16 @@ IBM 估值（base $194 vs 现价 $231）复盘时查出三处**数据层**缺口
       重估收益，还原 PE 偏高（AMZN 主业约 31x vs 表上 33.8x）。数据在估值引擎的 SOTP 那边
 - [ ] pe_band 的 `ANOM_K` 往下实际不可触发（K ≥ 1 时只有转亏才触发）：engine 的 `pe_band_check`
       仍用含一次性项的带——评估要不要让带子本身也接 `clean_band` 的逐窗还原
+- [x] 「下财年修正(30天)」列 + 「下财年 PE」格的 ↓（2026-10-12）：Yahoo eps_revisions +1y 的
+      30 天上调/下调家数 · eps_trend 一致预期 30 天变动；↓ 要家数（下调 ≥5 且多于上调）和幅度
+      （一致预期下降）同向——10/11 实跑 TSLA ↑1/↓4 却 +1.1%、RKLB ↑2/↓6 却在减亏。只展示不打分；
+      快照只在 watchlist-scanner 存一份（PR #24），这里不另存
+- [ ] ↓ 的阈值（5 家）是拍的：等 watchlist-scanner 的 `data/eps_revisions.csv` 攒够约 120 个交易日、
+      那边回测出结论（scanner todo.md #10）后回来校准，或者证明没用就撤掉
+- [x] 删 Yahoo PEG 列，只留 tPE 做对账（2026-10-12，见 LESSONS.md）：`trailingPegRatio` = PE ÷ 分析师
+      5 年增速预期，分母是最不靠谱的那个预期（NVDA 0.48 隐含 5 年每年约 60%），分子是含一次性项的
+      GAAP PE（GOOG 17.5 → PEG 1.20 跟着偏低），没有可对账的对象。估值 Excel 里的「PEG（合理）」
+      分母是自家情景增速，另一回事，没动
 
 ## 🧮 XBRL 股数量纲错（MCD，2026-09-29，见 LESSONS.md）
 
