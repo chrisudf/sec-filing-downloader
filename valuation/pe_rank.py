@@ -28,6 +28,14 @@ json 供网页 /watchlist.html 读（app/pe_rank_service.py），原子写入。
     GAAP PE 偏离超过 ONETIME_IMPACT（gaap_onetime / onetime_reading）。这时 GAAP 那组
     整组换成还原口径（≈ 标记、网页上分位格加斜纹）：当前值和历史逐窗用同一公式扣除
     一次性项后再算分位（clean_band），原值进脚注 / 悬停。
+  下财年修正(30天) —— yfinance eps_revisions 的 +1y 行：近 30 天上调 / 下调下财年 EPS
+    预期的分析师家数，加 eps_trend 的一致预期较 30 天前（两头为正报百分比；亏损或穿零报
+    绝对值 a→b——−1.00→−0.50 是减亏，算百分比却是 −50%）。只做展示，未经回测、不进打分；
+    快照只在 watchlist-scanner 存一份（data/eps_revisions.csv），这里不另存。
+  ↓ —— 标在「下财年 PE」格上：家数和幅度同时朝下（30 天下调 ≥ REV_MIN_DOWN 家且多于上调，
+    且一致预期较 30 天前下降）= 分母在被下修，下财年 PE 偏低、便宜得不实。只看家数会误标：
+    2026-10-11 实跑 TSLA ↑1/↓4 但一致预期 +1.1%，RKLB ↑2/↓6 但亏损在收窄。下财年 PE 为空
+    （亏损）不标——没有「便宜」可言。与 ⚠（本财年预期的一次性判据）是两个独立标记。
   分位与前瞻 PE 回答的是两个问题（历史位置 vs 预期兑现后的倍数），要一起读。
 """
 import argparse
@@ -64,6 +72,12 @@ TAX_TAGS = ["IncomeTaxExpenseBenefit"]
 ONETIME_BASE_Q = 12   # 常态 = 截至窗口末 12 季的中位：窗口 4 季全畸变也拖不动
 ONETIME_MIN_Q = 8
 ONETIME_IMPACT = 0.10
+# 下财年修正 ↓：30 天下调家数下限（还须多于上调，且一致预期较 30 天前下降——家数与幅度
+# 两个都要，见文件头的 TSLA/RKLB）。拍的数、未经回测，只决定标不标，不进任何打分
+REV_MIN_DOWN = 5
+# (我们的键, Yahoo 列名小写)：upLast7days 小写 d、downLast7Days 大写 D，Yahoo 不统一
+REV_FIELDS = (("up30", "uplast30days"), ("down30", "downlast30days"))
+TREND_FIELDS = (("eps", "current"), ("eps_30d", "30daysago"))
 
 
 def us_market_open(now=None):
@@ -84,6 +98,119 @@ def one_time_flag(trend):
 def one_time_note(flag):
     return (f"本财年一致预期 90 天内 {flag['j0']:+.0%}、下财年仅 {flag['j1']:+.0%}——"
             "疑似一次性收益进了预期，本财年 PE 偏低不可信，看下财年")
+
+
+# ---- 下财年分析师修正（逻辑照 watchlist-scanner revisions.py，不跨仓库 import）----
+
+class EmptyRevisions(Exception):
+    """个股拿到空表：ETF/指数没有 earningsTrend 模块，Yahoo 404 后 yfinance 吞掉异常、
+    返回空表——个股遇到多半是取数失败被吞了，不能当成「没有修正」。"""
+
+
+def _num(v):
+    """表格单元 -> float；NaN / None / 非数字 -> None。"""
+    if isinstance(v, bool):
+        return None
+    try:
+        f = float(v)
+    except (TypeError, ValueError):
+        return None
+    return f if math.isfinite(f) else None
+
+
+def _period_row(df, period, fields):
+    """DataFrame（index = period）的一行 -> {我们的键: 值}，列名按小写比对；没有这行 -> {}。"""
+    if df is None or getattr(df, "empty", True) or period not in df.index:
+        return {}
+    cols = {str(c).lower(): c for c in df.columns}
+    row = df.loc[period]
+    return {k: _num(row[cols[src]]) if src in cols else None for k, src in fields}
+
+
+def parse_revisions(rev_df, trend_df):
+    """eps_revisions / eps_trend 两张表 -> 下财年（+1y）{up30, down30, eps, eps_30d}。纯函数。
+    缺上调 / 下调家数 -> None（调用方当取不到）；只缺一致预期时照给家数，变动留空。"""
+    rev = _period_row(rev_df, "+1y", REV_FIELDS)
+    if rev.get("up30") is None or rev.get("down30") is None:
+        return None
+    out = {k: int(round(v)) for k, v in rev.items()}
+    out.update(dict.fromkeys(k for k, _ in TREND_FIELDS))
+    out.update(_period_row(trend_df, "+1y", TREND_FIELDS))
+    return out
+
+
+def fetch_revisions(t, ticker_factory=None):
+    """联网：两张表来自同一次 earningsTrend 请求（同一 Ticker 对象共用缓存）。
+    取不到抛异常，空表也算（EmptyRevisions）。"""
+    if ticker_factory is None:
+        import yfinance as yf
+        ticker_factory = yf.Ticker
+    tk = ticker_factory(t)
+    rev = parse_revisions(tk.eps_revisions, tk.eps_trend)
+    if rev is None:
+        raise EmptyRevisions("Yahoo 返回空表（无覆盖或取数失败）")
+    return rev
+
+
+def revisions(t, fetch=fetch_revisions):
+    """一只票的下财年修正 -> dict，取不到 -> {"err": 原因}。不抛：这一列缺了只显示「—」，
+    不拖垮整张表。"""
+    try:
+        return fetch(t)
+    except Exception as e:  # noqa: BLE001
+        msg = str(e).splitlines()[0][:80] if str(e) else ""
+        if isinstance(e, EmptyRevisions):
+            return {"err": msg}
+        return {"err": f"{type(e).__name__}: {msg}" if msg else type(e).__name__}
+
+
+def revised_down(rev):
+    """家数和幅度同时朝下 -> True。纯函数。
+
+    幅度看一致预期 EPS 较 30 天前的方向（current < 30daysAgo）：两头为正时等价于百分比 < 0；
+    亏损股 −0.09→−0.07 是减亏（current 更大），不会被当成下修。"""
+    if not rev or "err" in rev:
+        return False
+    cur, ago = rev.get("eps"), rev.get("eps_30d")
+    if cur is None or ago is None:
+        return False
+    return rev["down30"] >= REV_MIN_DOWN and rev["down30"] > rev["up30"] and cur < ago
+
+
+def consensus_change(rev):
+    """一致预期较 30 天前：两头为正 -> 百分比，否则（亏损 / 穿零）-> 绝对值 a→b。纯函数。"""
+    cur, ago = rev.get("eps"), rev.get("eps_30d")
+    if cur is None or ago is None:
+        return None
+    s = f"{(cur / ago - 1) * 100:+.1f}%" if cur > 0 and ago > 0 else f"{ago:.2f}→{cur:.2f}"
+    return s.replace("-", "−")
+
+
+def revision_cell(rev):
+    """「下财年修正(30天)」格：↑2/↓15 · −1.5%。ETF / 无覆盖 / 取数失败 / 旧结果没有这项 -> —。"""
+    if not rev or "err" in rev:
+        return "—"
+    s = f"↑{rev['up30']}/↓{rev['down30']}"
+    chg = consensus_change(rev)
+    return f"{s} · {chg}" if chg else s
+
+
+def revision_note(rev):
+    return (f"下财年 30 天 {revision_cell(rev)}——分母在被下修，下财年 PE 偏低、便宜得不实"
+            f"（家数与幅度同向才标：下调 ≥{REV_MIN_DOWN} 家且多于上调、一致预期较 30 天前下降；"
+            "未经回测，只做提示）")
+
+
+def apply_revisions(row, rev):
+    """修正读数挂到行上（不联网）：取不到进脚注；家数和幅度同时朝下、且下财年 PE 有值
+    -> fwd.fy2_down（「下财年 PE」格的 ↓）+ 脚注。与 fwd.fy1_suspect（⚠）各管各的格子。"""
+    row["rev"] = rev
+    fw = row.setdefault("fwd", {})
+    if "err" in rev:
+        row["notes"].append(f"下财年修正取不到：{rev['err']}")
+    elif revised_down(rev) and fw.get("fy2_pe") is not None:
+        fw["fy2_down"] = True
+        row["notes"].append(revision_note(rev))
 
 
 def _quarterly(facts, tags):
@@ -335,6 +462,7 @@ def collect(t, kind, email):
     except (SystemExit, Exception) as e:   # fetch_consensus 取不到时 raise SystemExit
         row["fwd"] = {}
         row["notes"].append(f"一致预期取不到：{str(e).splitlines()[0][:80]}")
+    apply_revisions(row, revisions(t))
     # 财年标签：Yahoo 的 lastFiscalYearEnd 覆盖所有票（XBRL 带缺席的 TSM/RKLB 也有）
     lfy = row["yh"].get("last_fy_end")
     src = {"fiscal_years": [{"fy_end": lfy}]} if lfy else (b10_eps or {})
@@ -379,12 +507,14 @@ def _fwd_cells(fw):
     else:
         rng = f"{_f(lo)}–{_f(hi)}"
     fy1 = _f(fw.get("fy1_pe"), suffix="x") + ("⚠" if fw.get("fy1_suspect") else "")
-    return [fy1, _f(fw.get("fy2_pe"), suffix="x"), rng]
+    fy2 = _f(fw.get("fy2_pe"), suffix="x") + ("↓" if fw.get("fy2_down") else "")
+    return [fy1, fy2, rng]
 
 
 HEADER = ["票", "收盘", "TTM PE", "10y", "5y", "3y", "3y P10/50/90",
           "营业线 PE", "10y", "5y", "3y", "3y P10/50/90",
-          "本财年 PE", "下财年 PE", "下财年区间", "下财年", "Yahoo tPE", "PEG"]
+          "本财年 PE", "下财年 PE", "下财年区间", "下财年修正(30天)", "下财年",
+          "Yahoo tPE", "PEG"]
 
 
 INTRADAY_NOTE = "⚠ 运行时美股在盘中：「收盘」列是盘中价，分位与前瞻 PE 随之浮动"
@@ -411,7 +541,10 @@ def render(rows, asof, intraday=False):
           "P10/50/90 = 近 3 年 10%/一半/90% 的交易日 PE 低于该值；"
           "† = 当前窗口被剔，显示末个有效点；本/下财年 PE = 收盘 ÷ yfinance 一致预期"
           "（Yahoo forwardPE = 下财年列，不是 NTM）；⚠ = 疑含一次性项（本财年预期 / "
-          "GAAP TTM 窗口的营业外与税项，见脚注的还原值）。"
+          "GAAP TTM 窗口的营业外与税项，见脚注的还原值）；"
+          "下财年修正 = 近 30 天上调/下调下财年 EPS 预期的分析师家数 · 一致预期较 30 天前"
+          "（亏损股报绝对值），只做展示、未经回测；"
+          f"↓ = 分母在被下修（下调 ≥{REV_MIN_DOWN} 家且多于上调、一致预期下降，两个都要）。"
           "口径细节见 valuation/pe_rank.py 文件头。", ""]
     if intraday:
         md += [f"**{INTRADAY_NOTE}**", ""]
@@ -424,7 +557,7 @@ def render(rows, asof, intraday=False):
         yh = r.get("yh", {})
         md.append("| " + " | ".join(
             [t, f"{r['close']:.2f}"] + _band_cells(r["gaap"]) + _band_cells(r["op"])
-            + _fwd_cells(r.get("fwd")) + [r["fy_labels"][1],
+            + _fwd_cells(r.get("fwd")) + [revision_cell(r.get("rev")), r["fy_labels"][1],
                                           _f(yh.get("tpe")), _f(yh.get("peg"), 2)]) + " |")
         for lbl, m in (("TTM", r["gaap"]), ("营业线", r["op"])):
             if "err" in m:
@@ -459,7 +592,11 @@ def csv_rows(rows):
                   "fy2_pe_lo", "fy2_pe_hi"):
             rec[k] = fw.get(k)
         rec["fy1_suspect"] = bool(fw.get("fy1_suspect"))
-        ot = (r.get("gaap") or {}).get("onetime") or {}
+        rv = r.get("rev") or {}
+        for k in ("up30", "down30", "eps", "eps_30d"):
+            rec[f"fy2_rev_{k}"] = rv.get(k)
+        rec["fy2_down"] = bool(fw.get("fy2_down"))
+        ot =(r.get("gaap") or {}).get("onetime") or {}
         rec["gaap_onetime"], rec["gaap_clean_pe"] = bool(ot), ot.get("pe")
         for k in ("r10", "r5", "r3"):
             rec[f"gaap_clean_{k}"] = (ot.get("clean") or {}).get(k)

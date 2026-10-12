@@ -233,6 +233,9 @@ python valuation/pe_rank.py --tickers MSFT,NVDA
 刚转盈的票只出前瞻列。`†` = 当前 TTM 窗口被畸变守卫剔除（AMZN/GOOG 2026Q2 私募重估型），
 此时看营业线那组；`⚠` 标在「本财年 PE」格 = 本财年一致预期疑含一次性收益。注意 Yahoo 的
 forwardPE 是**下财年**预期，不是 NTM。美股盘中跑会拿到盘中价，报告头与网页都会标出。
+「下财年修正(30天)」= Yahoo eps_revisions 近 30 天上调/下调家数 · 一致预期较 30 天前（亏损股报
+绝对值）；`↓` 标在「下财年 PE」格 = 净下调 ≥5 家**且**一致预期确实下降（分母在被下修，PE 便宜得不实）。
+只做展示、未经回测；快照只在 watchlist-scanner 存（`data/eps_revisions.csv`）。
 
 **网页**：首页右上角「📋 Watchlist PE」→ `/watchlist.html`，读最近一份 json；「刷新」在后台
 重跑（约 5 分钟，逐票进度），可按分位/下财年 PE 排序，点票名开财务图表。

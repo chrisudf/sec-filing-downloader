@@ -11,6 +11,19 @@ const fmtNum = (v, d = 1) => v == null ? "—" : v >= 1000 ? ">999" : v.toFixed(
 const pctPct = (v) => `${v >= 0 ? "+" : ""}${Math.round(v * 100)}%`;
 const fmtB = (v, plus = false) => `${v < 0 ? "−" : plus ? "+" : ""}$${Math.abs(v / 1e9).toFixed(1)}B`;
 
+// 与 pe_rank.revision_cell 同口径：↑上调/↓下调家数 · 一致预期较 30 天前
+// （两头为正报百分比，亏损 / 穿零报绝对值 a→b）；取不到 / 旧结果没有这项 -> —
+function revText(rv) {
+  if (!rv || rv.err) return "—";
+  const s = `↑${rv.up30}/↓${rv.down30}`;
+  const cur = rv.eps, ago = rv.eps_30d;
+  if (cur == null || ago == null) return s;
+  const chg = cur > 0 && ago > 0
+    ? `${cur >= ago ? "+" : ""}${((cur / ago - 1) * 100).toFixed(1)}%`
+    : `${ago.toFixed(2)}→${cur.toFixed(2)}`;
+  return `${s} · ${chg.replace(/-/g, "−")}`;
+}
+
 // 与 pe_rank.onetime_note 同口径：营业外超常 ≥ 税前 3%、税率偏离 ≥ 2 个点才列出
 function onetimeText(o, m) {
   const parts = [];
@@ -71,7 +84,7 @@ const GROUPS = [
   ["营业利润 · P/NOPAT", 5, "P/NOPAT（price-to-NOPAT）：市值 ÷ 税后营业利润（营业利润 × (1−21%)）。"
     + "营业线以下的一次性项目（投资重估、利息）影响不到它。绝对值不能和 GAAP P/E 直接比，"
     + "看它在自己历史里的分位"],
-  ["前瞻 · 一致预期", 4, "收盘 ÷ yfinance 分析师一致预期 EPS（通常是调整后口径，与 GAAP 不同）"],
+  ["前瞻 · 一致预期", 5, "收盘 ÷ yfinance 分析师一致预期 EPS（通常是调整后口径，与 GAAP 不同）"],
   ["Yahoo", 2, "Yahoo 自己的 trailingPE 与 PEG，供交叉核对"],
 ];
 const winTitle = (n) => `当前 PE 在近 ${n} 年有效交易日里的分位。P7 = 约 7% 的日子 PE 比现在低`;
@@ -83,8 +96,10 @@ const SUBS = [...BAND_SUBS, ...BAND_SUBS,
               ["本财年", "收盘 ÷ 本财年一致预期 EPS"],
               ["下财年", "收盘 ÷ 下财年一致预期 EPS——Yahoo 的 forwardPE 就是这个，不是未来 12 个月"],
               ["下财年区间", "收盘 ÷ 最高预期 … 收盘 ÷ 最低预期"],
+              ["下财年修正 30天", "近 30 天上调 / 下调下财年 EPS 预期的分析师家数 · 一致预期较 30 天前"
+                + "（亏损股报绝对值）。只做展示，未经回测"],
               ["下财年止"], ["tPE"], ["PEG"]];
-const GSTART = new Set([0, 5, 10, 14]);     // 每组第一列画左边线
+const GSTART = new Set([0, 5, 10, 15]);     // 每组第一列画左边线
 
 function head() {
   const r1 = el("tr", {}, el("th", { text: "票", cls: "tk", attrs: { rowspan: 2 } }),
@@ -131,7 +146,7 @@ function bandCells(m) {
   return [pe, pct(r.r10, 10), pct(r.r5, 5), pct(r.r3, 3), band];
 }
 
-function fwdCells(fw, labels) {
+function fwdCells(fw, labels, rv) {
   fw = fw || {};
   const eps = (k) => fw[`${k}_eps`] != null
     ? `${fw[`${k}_n`]} 位分析师，一致预期 EPS ${fw[`${k}_eps`].toFixed(2)}` : null;
@@ -145,9 +160,17 @@ function fwdCells(fw, labels) {
   if (fw.fy2_pe_lo !== undefined) {
     rng = `${fmtNum(fw.fy2_pe_lo)}–${fw.fy2_low_nonpos ? "含亏损" : fmtNum(fw.fy2_pe_hi)}`;
   }
-  return [fy1, el("td", { text: fmtPE(fw.fy2_pe), title: eps("fy2") }),
+  const fy2 = el("td", { text: fmtPE(fw.fy2_pe), title: eps("fy2") });
+  if (fw.fy2_down) {
+    fy2.append(mark("↓", `下财年 30 天 ${revText(rv)}——分母在被下修，下财年 PE 偏低、便宜得不实`
+                          + "（家数与幅度同时朝下才标，阈值见脚注；未经回测）"));
+  }
+  const rev = el("td", rv && !rv.err
+    ? { text: revText(rv), title: "近 30 天上调 / 下调下财年 EPS 预期的分析师家数 · 一致预期较 30 天前" }
+    : { text: "—", cls: "na", title: (rv && rv.err) || "ETF / 无覆盖 / 旧结果没有这一项" });
+  return [fy1, fy2,
           el("td", { text: rng, title: "收盘 ÷ 最高预期 … 收盘 ÷ 最低预期" }),
-          el("td", { text: (labels && labels[1]) || "—" })];
+          rev, el("td", { text: (labels && labels[1]) || "—" })];
 }
 
 function bodyRow(r) {
@@ -157,7 +180,7 @@ function bodyRow(r) {
              target: "_blank", rel: "noopener" } }, el("span", { text: "↗" })));
   const yh = r.yh || {};
   // 分组左边线按组画、不按列序号：一次性项那组会把三格合并成一格，序号就错位了
-  const groups = [bandCells(r.gaap), bandCells(r.op), fwdCells(r.fwd, r.fy_labels),
+  const groups = [bandCells(r.gaap), bandCells(r.op), fwdCells(r.fwd, r.fy_labels, r.rev),
                   [el("td", { text: fmtNum(yh.tpe) }), el("td", { text: fmtNum(yh.peg, 2) })]];
   groups.forEach((g) => g[0].classList.add("gstart"));
   return el("tr", {}, tk, el("td", { text: r.close == null ? "—" : r.close.toFixed(2) }),
