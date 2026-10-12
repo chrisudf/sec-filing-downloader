@@ -52,10 +52,14 @@ def _p(pcts, q):
     return pcts.get(q) if q in pcts else pcts.get(str(q))
 
 
-def fetch_consensus(ticker):
-    """yfinance 一致预期：0y/+1y 财年 EPS（avg/low/high/#分析师）+ 修正轨迹 + 现价。"""
+def fetch_consensus(ticker, tk=None):
+    """yfinance 一致预期：0y/+1y 财年 EPS（avg/low/high/#分析师）+ 修正轨迹 + 现价。
+
+    tk = 调用方已有的 yf.Ticker：earningsTrend 按实例缓存，同一只票还要读 eps_revisions
+    的（pe_rank）传同一个实例进来，省一次 Yahoo 请求。"""
     import yfinance as yf
-    tk = yf.Ticker(ticker)
+    if tk is None:
+        tk = yf.Ticker(ticker)
     ee = tk.earnings_estimate
     if ee is None or ee.empty or "0y" not in ee.index:
         raise SystemExit(f"{ticker} 取不到 yfinance 一致预期（earnings_estimate 为空）")

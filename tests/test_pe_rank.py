@@ -436,7 +436,7 @@ def _rev(up30, down30, cur, ago30):
 
 def test_revisions_parse_and_cell():
     # TSLA 2026-10-12 实测：↑1/↓4，一致预期 2.15858 -> 2.18245
-    rv = pr.fetch_revisions("TSLA", lambda t: _FakeTicker(_rev_df(1, 4), _trend_df(2.18245, 2.15858)))
+    rv = pr.fetch_revisions("TSLA", _FakeTicker(_rev_df(1, 4), _trend_df(2.18245, 2.15858)))
     assert rv == {"up30": 1, "down30": 4, "eps": 2.18245, "eps_30d": 2.15858}
     assert pr.revision_cell(rv) == "↑1/↓4 · +1.1%"
     # 下修用真正的减号（与 onetime_note 的 −$1.0B 一致）
@@ -449,22 +449,42 @@ def test_revisions_parse_and_cell():
     assert rv["eps"] is None and pr.revision_cell(rv) == "↑3/↓1"
 
 
+def test_consensus_and_revisions_share_one_ticker(monkeypatch):
+    """一致预期和修正读同一个 Ticker 实例：yfinance 的 earningsTrend 按实例缓存，各建各的
+    就是每只票多一次 Yahoo 请求（PR #39 review）。新建 Ticker 直接炸，证明两边都没另起实例。"""
+    import pandas as pd
+    import yfinance as yf
+    from valuation import ref_table
+
+    def no_new_ticker(*a, **k):
+        raise AssertionError("不该再建 yf.Ticker")
+    monkeypatch.setattr(yf, "Ticker", no_new_ticker)
+    tk = _FakeTicker(_rev_df(2, 15), _trend_df(3.94, 4.00))
+    tk.earnings_estimate = pd.DataFrame(
+        {"avg": [3.5, 3.94], "low": [3.2, 3.5], "high": [3.8, 4.4], "numberOfAnalysts": [20, 18]},
+        index=["0y", "+1y"])
+    tk.fast_info = {"lastPrice": 100.0}
+    cons, trend, px = ref_table.fetch_consensus("X", tk)
+    assert cons["fy2"]["avg"] == 3.94 and trend["+1y"]["30daysAgo"] == 4.00 and px == 100.0
+    assert pr.revisions("X", tk) == {"up30": 2, "down30": 15, "eps": 3.94, "eps_30d": 4.00}
+
+
 def test_revisions_empty_etf_and_failure_show_dash():
     import pandas as pd
     empty = pd.DataFrame()
     # 空表（ETF/指数，或个股取数失败被 yfinance 吞掉）= 取不到，不是「没有修正」
     with pytest.raises(pr.EmptyRevisions):
-        pr.fetch_revisions("QQQ", lambda t: _FakeTicker(empty, empty))
+        pr.fetch_revisions("QQQ", _FakeTicker(empty, empty))
     # 有表但下财年家数是 NaN：同样当取不到
     nan = float("nan")
     with pytest.raises(pr.EmptyRevisions):
-        pr.fetch_revisions("X", lambda t: _FakeTicker(_rev_df(nan, nan), _trend_df(1.0, 1.0)))
-    rv = pr.revisions("QQQ", lambda t: pr.fetch_revisions(t, lambda _: _FakeTicker(empty, empty)))
+        pr.fetch_revisions("X", _FakeTicker(_rev_df(nan, nan), _trend_df(1.0, 1.0)))
+    rv = pr.revisions("QQQ", _FakeTicker(empty, empty))
     assert rv == {"err": "Yahoo 返回空表（无覆盖或取数失败）"}
 
-    def boom(t):
+    def boom(t, tk):
         raise ConnectionError("HTTP 429\nToo Many Requests")
-    assert pr.revisions("NVDA", boom) == {"err": "ConnectionError: HTTP 429"}
+    assert pr.revisions("NVDA", fetch=boom) == {"err": "ConnectionError: HTTP 429"}
     # 取不到：格子「—」、进脚注、不打标记；一致预期也没取到（fwd={}）照样不抛
     r = _row(fwd={})
     pr.apply_revisions(r, {"err": "Yahoo 返回空表（无覆盖或取数失败）"})
@@ -502,6 +522,8 @@ def test_revision_mark_triggers_on_fy2_cell():
     assert rec["fy2_down"] is True and rec["fy2_rev_down30"] == 15
     # 门槛边界：恰好 REV_MIN_DOWN 家、0 家上调、一致预期微降 -> 标
     assert pr.revised_down(_rev(0, pr.REV_MIN_DOWN, 3.999, 4.00))
+    # 门槛看下调家数、不看净数（README 写明）：↑4/↓5 净下调只有 1 家，也标
+    assert pr.revised_down(_rev(4, 5, 3.99, 4.00))
 
 
 def test_revision_counts_vs_magnitude_disagree_no_mark():

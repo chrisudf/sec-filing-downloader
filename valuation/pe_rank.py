@@ -139,24 +139,24 @@ def parse_revisions(rev_df, trend_df):
     return out
 
 
-def fetch_revisions(t, ticker_factory=None):
-    """联网：两张表来自同一次 earningsTrend 请求（同一 Ticker 对象共用缓存）。
+def fetch_revisions(t, tk=None):
+    """联网：两张表来自 earningsTrend 模块，yfinance 按 Ticker 实例缓存。tk = collect 里与
+    fetch_consensus 共用的实例：一致预期已经把这个模块拉下来了，这里不再发请求。
     取不到抛异常，空表也算（EmptyRevisions）。"""
-    if ticker_factory is None:
+    if tk is None:
         import yfinance as yf
-        ticker_factory = yf.Ticker
-    tk = ticker_factory(t)
+        tk = yf.Ticker(t)
     rev = parse_revisions(tk.eps_revisions, tk.eps_trend)
     if rev is None:
         raise EmptyRevisions("Yahoo 返回空表（无覆盖或取数失败）")
     return rev
 
 
-def revisions(t, fetch=fetch_revisions):
+def revisions(t, tk=None, fetch=fetch_revisions):
     """一只票的下财年修正 -> dict，取不到 -> {"err": 原因}。不抛：这一列缺了只显示「—」，
     不拖垮整张表。"""
     try:
-        return fetch(t)
+        return fetch(t, tk)
     except Exception as e:  # noqa: BLE001
         msg = str(e).splitlines()[0][:80] if str(e) else ""
         if isinstance(e, EmptyRevisions):
@@ -453,8 +453,11 @@ def collect(t, kind, email):
                 row[name]["onetime"] = ot
                 row["notes"].append(onetime_note(ot, row[name]))
     row["yh"] = yahoo_info(t)
+    import yfinance as yf
+    # 一致预期与下财年修正共用一个实例：earningsTrend 按实例缓存，一只票只请求一次
+    tk = yf.Ticker(t)
     try:
-        cons, trend, _ = fetch_consensus(t)
+        cons, trend, _ = fetch_consensus(t, tk)
         row["fwd"] = forward(row["close"], cons)
         flag = one_time_flag(trend)
         if flag:
@@ -463,7 +466,7 @@ def collect(t, kind, email):
     except (SystemExit, Exception) as e:   # fetch_consensus 取不到时 raise SystemExit
         row["fwd"] = {}
         row["notes"].append(f"一致预期取不到：{str(e).splitlines()[0][:80]}")
-    apply_revisions(row, revisions(t))
+    apply_revisions(row, revisions(t, tk))
     # 财年标签：Yahoo 的 lastFiscalYearEnd 覆盖所有票（XBRL 带缺席的 TSM/RKLB 也有）
     lfy = row["yh"].get("last_fy_end")
     src = {"fiscal_years": [{"fy_end": lfy}]} if lfy else (b10_eps or {})
