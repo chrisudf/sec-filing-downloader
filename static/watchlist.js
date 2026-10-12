@@ -85,7 +85,7 @@ const GROUPS = [
     + "营业线以下的一次性项目（投资重估、利息）影响不到它。绝对值不能和 GAAP P/E 直接比，"
     + "看它在自己历史里的分位"],
   ["前瞻 · 一致预期", 5, "收盘 ÷ yfinance 分析师一致预期 EPS（通常是调整后口径，与 GAAP 不同）"],
-  ["Yahoo", 2, "Yahoo 自己的 trailingPE 与 PEG，供交叉核对"],
+  ["Yahoo", 1, "Yahoo 自己的 trailingPE（GAAP TTM，一次性项全在里面），供和左边 TTM 原值对账"],
 ];
 const winTitle = (n) => `当前 PE 在近 ${n} 年有效交易日里的分位。P7 = 约 7% 的日子 PE 比现在低`;
 const P3_TITLE = "近 3 年的 PE 分布：10% 的交易日低于第一个数，一半低于中间数（中位数），"
@@ -98,7 +98,9 @@ const SUBS = [...BAND_SUBS, ...BAND_SUBS,
               ["下财年区间", "收盘 ÷ 最高预期 … 收盘 ÷ 最低预期"],
               ["下财年修正 30天", "近 30 天上调 / 下调下财年 EPS 预期的分析师家数 · 一致预期较 30 天前"
                 + "（亏损股报绝对值）。只做展示，未经回测"],
-              ["下财年止"], ["tPE"], ["PEG"]];
+              ["下财年止"],
+              ["tPE", "Yahoo 的 trailingPE = 现价 ÷ Yahoo 的 GAAP TTM EPS。和左边 TTM 原值（悬停 ⚠ 可见）"
+                + "差很多，说明 TTM 里有一次性项，比如 GOOG 17.5 含 2026 上半年的持股重估收益"]];
 const GSTART = new Set([0, 5, 10, 15]);     // 每组第一列画左边线
 
 function head() {
@@ -181,7 +183,7 @@ function bodyRow(r) {
   const yh = r.yh || {};
   // 分组左边线按组画、不按列序号：一次性项那组会把三格合并成一格，序号就错位了
   const groups = [bandCells(r.gaap), bandCells(r.op), fwdCells(r.fwd, r.fy_labels, r.rev),
-                  [el("td", { text: fmtNum(yh.tpe) }), el("td", { text: fmtNum(yh.peg, 2) })]];
+                  [el("td", { text: fmtNum(yh.tpe) })]];
   groups.forEach((g) => g[0].classList.add("gstart"));
   return el("tr", {}, tk, el("td", { text: r.close == null ? "—" : r.close.toFixed(2) }),
             ...groups.flat());

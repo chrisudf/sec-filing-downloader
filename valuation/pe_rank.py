@@ -413,7 +413,8 @@ def yahoo_info(t):
     except Exception:
         return {}
     fye = i.get("lastFiscalYearEnd")
-    return {"tpe": i.get("trailingPE"), "peg": i.get("trailingPegRatio"),
+    # tPE 只做对账（Yahoo 的 GAAP TTM，一次性项全在里面）。PEG 已删，见 LESSONS.md 2026-10-12
+    return {"tpe": i.get("trailingPE"),
             "last_fy_end": date.fromtimestamp(fye).isoformat() if fye else None}
 
 
@@ -514,7 +515,7 @@ def _fwd_cells(fw):
 HEADER = ["票", "收盘", "TTM PE", "10y", "5y", "3y", "3y P10/50/90",
           "营业线 PE", "10y", "5y", "3y", "3y P10/50/90",
           "本财年 PE", "下财年 PE", "下财年区间", "下财年修正(30天)", "下财年",
-          "Yahoo tPE", "PEG"]
+          "Yahoo tPE"]
 
 
 INTRADAY_NOTE = "⚠ 运行时美股在盘中：「收盘」列是盘中价，分位与前瞻 PE 随之浮动"
@@ -544,7 +545,8 @@ def render(rows, asof, intraday=False):
           "GAAP TTM 窗口的营业外与税项，见脚注的还原值）；"
           "下财年修正 = 近 30 天上调/下调下财年 EPS 预期的分析师家数 · 一致预期较 30 天前"
           "（亏损股报绝对值），只做展示、未经回测；"
-          f"↓ = 分母在被下修（下调 ≥{REV_MIN_DOWN} 家且多于上调、一致预期下降，两个都要）。"
+          f"↓ = 分母在被下修（下调 ≥{REV_MIN_DOWN} 家且多于上调、一致预期下降，两个都要）；"
+          "Yahoo tPE = Yahoo 的 GAAP TTM PE，只做对账（和 TTM 原值差很多 = 有一次性项）。"
           "口径细节见 valuation/pe_rank.py 文件头。", ""]
     if intraday:
         md += [f"**{INTRADAY_NOTE}**", ""]
@@ -558,7 +560,7 @@ def render(rows, asof, intraday=False):
         md.append("| " + " | ".join(
             [t, f"{r['close']:.2f}"] + _band_cells(r["gaap"]) + _band_cells(r["op"])
             + _fwd_cells(r.get("fwd")) + [revision_cell(r.get("rev")), r["fy_labels"][1],
-                                          _f(yh.get("tpe")), _f(yh.get("peg"), 2)]) + " |")
+                                          _f(yh.get("tpe"))]) + " |")
         for lbl, m in (("TTM", r["gaap"]), ("营业线", r["op"])):
             if "err" in m:
                 notes.append(f"{t} {lbl}: {m['err']}")
@@ -596,14 +598,14 @@ def csv_rows(rows):
         for k in ("up30", "down30", "eps", "eps_30d"):
             rec[f"fy2_rev_{k}"] = rv.get(k)
         rec["fy2_down"] = bool(fw.get("fy2_down"))
-        ot =(r.get("gaap") or {}).get("onetime") or {}
+        ot = (r.get("gaap") or {}).get("onetime") or {}
         rec["gaap_onetime"], rec["gaap_clean_pe"] = bool(ot), ot.get("pe")
         for k in ("r10", "r5", "r3"):
             rec[f"gaap_clean_{k}"] = (ot.get("clean") or {}).get(k)
         labels = r.get("fy_labels") or (None, None)
         rec["fy1_label"], rec["fy2_label"] = labels
         yh = r.get("yh") or {}
-        rec["yahoo_tpe"], rec["yahoo_peg"] = yh.get("tpe"), yh.get("peg")
+        rec["yahoo_tpe"] = yh.get("tpe")
         out.append(rec)
     return out
 

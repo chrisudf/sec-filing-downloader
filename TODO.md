@@ -529,6 +529,10 @@ IBM 估值（base $194 vs 现价 $231）复盘时查出三处**数据层**缺口
       快照只在 watchlist-scanner 存一份（PR #24），这里不另存
 - [ ] ↓ 的阈值（5 家）是拍的：等 watchlist-scanner 的 `data/eps_revisions.csv` 攒够约 120 个交易日、
       那边回测出结论（scanner todo.md #10）后回来校准，或者证明没用就撤掉
+- [x] 删 Yahoo PEG 列，只留 tPE 做对账（2026-10-12，见 LESSONS.md）：`trailingPegRatio` = PE ÷ 分析师
+      5 年增速预期，分母是最不靠谱的那个预期（NVDA 0.48 隐含 5 年每年约 60%），分子是含一次性项的
+      GAAP PE（GOOG 17.5 → PEG 1.20 跟着偏低），没有可对账的对象。估值 Excel 里的「PEG（合理）」
+      分母是自家情景增速，另一回事，没动
 
 ## 🧮 XBRL 股数量纲错（MCD，2026-09-29，见 LESSONS.md）
 

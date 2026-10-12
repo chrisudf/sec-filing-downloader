@@ -160,6 +160,9 @@ def test_csv_rows_flatten_all_kinds():
     assert list(recs[0]) == list(recs[1])       # 同一组列，DictWriter 不会缺列
     assert recs[0]["gaap_3y_p50"] == 51 and recs[1]["skip"] == "index"
     assert recs[0]["fy2_label"] == "FY2028(至2028-01)"
+    # PEG 已删（LESSONS.md 2026-10-12）：Yahoo 组只留 tPE 做对账
+    assert pr.HEADER[-1] == "Yahoo tPE" and "PEG" not in pr.HEADER
+    assert recs[0]["yahoo_tpe"] == 28.47 and "yahoo_peg" not in recs[0]
 
 
 def test_load_watchlist(tmp_path):
