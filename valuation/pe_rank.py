@@ -6,7 +6,8 @@
 
 票单默认读同级目录 ../watchlist-scanner/watchlist.toml；kind=etf/index 跳过（SEC 无 EPS）。
 结果写 reports/pe_rank/pe_rank_YYYY-MM-DD.{md,csv,json}（reports/ 已 gitignore），同时打印到终端；
-json 供网页 /watchlist.html 读（app/pe_rank_service.py），原子写入。
+json 供网页 /watchlist.html 读（app/pe_rank_service.py），原子写入。--tickers 的部分表写
+pe_rank_YYYY-MM-DD-manual.*，网页不读，也不会覆盖当天的整表。
 节奏：分母一季度才跳一次，每周跑一次 + 财报季补跑就够，天天跑没有信息量。
 美股盘中跑的话 yfinance 末根是未收盘 K 线，「收盘」其实是盘中价——报告头会标出来。
 
@@ -636,6 +637,13 @@ def payload(rows, notes, asof, generated_at, intraday, watchlist):
                       "skipped": skipped_line(rows)})
 
 
+def out_stem(asof, manual):
+    """结果文件名（不含扩展名）。--tickers 的部分表加 -manual 后缀：网页只认
+    pe_rank_YYYY-MM-DD.json（app/pe_rank_service.RESULT），不加的话部分表会
+    覆盖当天整表、或成为「最近一份」把网页换成那几只票。纯函数。"""
+    return f"pe_rank_{asof}" + ("-manual" if manual else "")
+
+
 def write_atomic(path, text):
     """先写临时文件再 os.replace：网页刷新和定时任务可能撞车，读者不能读到半截文件。"""
     tmp = path.with_name(f".{path.name}.tmp")
@@ -666,17 +674,19 @@ def main():
     text, notes = render(rows, asof, intraday)
     out = Path(a.out_dir)
     out.mkdir(parents=True, exist_ok=True)
-    (out / f"pe_rank_{asof}.md").write_text(text, encoding="utf-8")
+    stem = out_stem(asof, manual=bool(a.tickers))
+    (out / f"{stem}.md").write_text(text, encoding="utf-8")
     recs = csv_rows(rows)
-    with open(out / f"pe_rank_{asof}.csv", "w", newline="", encoding="utf-8-sig") as fh:
+    with open(out / f"{stem}.csv", "w", newline="", encoding="utf-8-sig") as fh:
         w = csv.DictWriter(fh, fieldnames=list(recs[0]))
         w.writeheader()
         w.writerows(recs)
     gen = datetime.now().astimezone().isoformat(timespec="seconds")
-    write_atomic(out / f"pe_rank_{asof}.json", json.dumps(
+    write_atomic(out / f"{stem}.json", json.dumps(
         payload(rows, notes, asof, gen, intraday, a.watchlist), ensure_ascii=False))
     print(text)
-    print(f"已写出 {out / f'pe_rank_{asof}'}.md / .csv / .json", file=sys.stderr)
+    print(f"已写出 {out / stem}.md / .csv / .json"
+          + ("（--tickers 部分表，网页不读）" if a.tickers else ""), file=sys.stderr)
 
 
 if __name__ == "__main__":
