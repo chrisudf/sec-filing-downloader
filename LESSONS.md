@@ -1178,3 +1178,40 @@ SEC XBRL 季度数（营业利润 = 申报值，营业外 = 税前利润 − 营
   写的是「供交叉核对」，但它没有可核对的对象。
 - **外部的「PE」先问分子分母的口径。** Yahoo trailingPE = GAAP TTM，持股重估、出售收益全在里面。
   它和自家清洗过的数差几十个百分点时，先找一次性项，不要先怀疑数据源。
+
+---
+
+## 2026-10-19 · 增发 patch：pytest 1028 条全绿，财务图表页一行 JS 都没跑
+
+### 现象
+
+「最近定价增发 + ATM」一行的 patch（基座 a98398c，#35）打到 main（e76c940）上，三处文本冲突解完，
+pytest 1028 passed。打开 `dashboard.html?ticker=RKLB`：代码框是空的，一个请求都没发，图表、内部人
+卡片、增发行全空。控制台：`Uncaught SyntaxError: Identifier 'fmtShares' has already been declared`。
+
+### 机制
+
+patch 在 `dashboard.js` 顶层加了 `function fmtShares(n)`（万股/亿股，空值返回 null）；#36 的内部人
+卡片早就有 `const fmtShares = (v) => …`（千分位整数，空值返回「—」）。同一作用域里 `function` 和
+`const` 同名是解析期错误：整份脚本在执行前就被拒，**坏的不只是增发那一行，是整页**。两个函数口径
+不同，不能合并成一个。
+
+### 为什么没早发现
+
+- patch 作者在 a98398c 上验证：那时还没有内部人卡片，没有重名，页面实测正常。
+- `git apply --3way` 只对文本冲突报警。两个 `fmtShares` 相隔约 380 行，各自落在没冲突的区域，
+  git 看不出这是语义冲突。
+- pytest 全是 Python，`static/*.js` 不在任何测试的覆盖面里。「全绿」对前端没有任何信息量。
+
+### 改了什么
+
+- patch 的两个格式化函数改名 `fmtSharesCn` / `fmtUsdCn`（顺带避开和全局 `fmtUSD` 只差大小写）。
+- 新增 `tests/test_static_js.py`：`static/*.js` 逐个跑 `node --check`，没有 node 时跳过。
+  变异检查（临时副本）：把重名放回去、或留一行冲突标记，测试都会挂；对照组通过。
+
+### 可复用的规则
+
+- **合并前端改动后，「pytest 全绿」只说明 Python 没坏。** 前端至少要过一次语法检查，再在浏览器里
+  打开一次页面、看一眼控制台。
+- **基座落后的 patch，文本冲突解完还要查语义冲突**：顶层同名函数、重复的元素 id、同一个 state 字段。
+  `dashboard.js` 是多张卡片共用一个顶层作用域，新卡片的辅助函数要起不会撞名的名字。

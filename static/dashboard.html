@@ -74,6 +74,14 @@
   .status.ok { color: var(--ok); }
   .coname { color: var(--muted); font-size: 13px; }
   .coname b { color: var(--text); }
+  .offer-line { color: var(--muted); font-size: 13px; line-height: 1.7; padding: 0 4px; }
+  .offer-line b { color: var(--text); font-variant-numeric: tabular-nums; }
+  .offer-line a { color: inherit; }
+  .offer-sales { display: grid; gap: 1px; margin-top: 6px; font-size: 12.5px; }
+  .offer-sales .muted { color: var(--muted); font-size: 12px; }
+  .offer-sales .win { font-variant-numeric: tabular-nums; color: var(--text); }
+  .offer-line .tag { display: inline-block; background: var(--card2); border: 1px solid var(--border);
+                     border-radius: 6px; padding: 0 7px; font-size: 12px; margin-left: 6px; }
   /* minmax(0, 1fr) 而不是 1fr：1fr 的下限是内容宽度，内部人明细表（~900px）会把
      整列撑破手机屏幕；宽表改在 #insTable / #concTable 里自己横向滚动 */
   .grid { display: grid; grid-template-columns: minmax(0, 1fr); gap: 16px; margin-top: 18px; }
@@ -188,6 +196,7 @@
     数据来自 SEC EDGAR XBRL，季度现金流由累计数差分还原
   </div>
   <div class="grid" id="charts" style="display:none">
+    <div class="offer-line" id="offerLine" style="display:none"></div>
     <div class="chart-card">
       <div class="chart-head">
         <div><h2>损益摘要</h2><div class="sub">上：金额；下：利润率——红虚线=剔除一次性/投资项的净利率（按当期有效税率税后化）；毛利率以总营收为分母（含会员费类非商品收入）。两栏共用同一时间轴。点任一期的柱可直接驱动下方利润瀑布</div></div>
