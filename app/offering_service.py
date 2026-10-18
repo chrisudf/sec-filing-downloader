@@ -14,11 +14,14 @@ ATM 按市价陆续卖出，申报日收盘只是参考价（yfinance 一次取�
 而那份是续展，最近实际成交是 2026Q2 均价 $135.62。单线程顺序请求、每份间隔 REQUEST_GAP（README 的 SEC 合规约定）；
 逐份解析结果按 accession 落盘（jobs/offering_cache/），同一份申报只下载一次。
 
-为什么只做一行、不画成关键价位：2026-10-17 的 offering-price-study（R1000
-2010-2026，1,166 笔定价增发）预注册检验显示，增发价既不是顶部信号（增发后
-60 日 CAR 比匹配对照 +2.1%），也不是持续的压力/支撑位（挡回率只比随机价位
-高 1.1pp，门槛 8pp）；唯一可见的效应是发行后约 5 个交易日收盘扎堆在发行价
-（承销商托底，T+1 为相邻档 1.6 倍）。所以这里只给事实和托底期提示。
+为什么只做一行、不画成关键价位：2026-10-19 的全样本事件研究（2015–2025 美股包销/定向
+增发 4,058 笔，对照同一只股票「次日涨跌幅相近」的随机日）显示，发行价既不是压力位也不是
+支撑位；承销商稳定期也不托底——前 30 个交易日收盘跌破发行价的比例反而高 5.8pp
+[+4.0, +7.5]（市值 >$10B 的 148 笔 +3.5pp 不显著，同样看不到托底）。稳定的只有增发后
+整体跑输：120 日超额差 −8.7pp [−11.7, −5.5]，250 日 −16.7pp。ATM 不在样本内。
+10-17 那版（R1000，1,166 笔）说的「前 5 个交易日收盘扎堆在发行价」10-19 没有按同一指标
+复核，但「托底」这层解读站不住。所以标签按距今交易日分三档：≤ STABILIZE_DAYS 提示不托底，
+≤ DRIFT_DAYS 提示仍在跑输窗口，之后只说不是压力/支撑位。
 """
 from __future__ import annotations
 
@@ -48,7 +51,8 @@ LOOKBACK_YEARS = 3
 MAX_SCAN = 40          # 单次最多读多少份封面（冷启动约 MAX_SCAN×0.3 秒）
 NOTE_HEAVY = 150       # 424B2/424B3 超过这个数 = 票据/存单定价补充发行人，跳过这两类
 COVER_BYTES = 100_000  # 封面标记都在原始 HTML 前 ~70KB（研究实测）
-STABILIZE_DAYS = 5     # 托底效应可见的交易日数
+STABILIZE_DAYS = 30    # 承销商稳定期（约 30 天超额配售）：窗口内提示「发行价不托底」
+DRIFT_DAYS = 120       # 增发后跑输最稳的窗口：窗口内提示「120 日平均跑输」
 PRICE_TIMEOUT = 30     # yfinance 自身无超时，卡住会占死请求
 REPORT_BYTES = 8_000_000   # 10-Q/10-K 附注在文档后半，需整份读（上限防超大申报）
 PERIODIC_FORMS = ("10-Q", "10-K")
@@ -62,7 +66,7 @@ WHO_LABEL = {"primary": "一级发行", "secondary": "老股东减持", "mixed":
 
 
 def _weekdays_between(start: date, end: date) -> int:
-    """start 之后到 end（含）之间的工作日数，不扣节假日——托底期提示够用。"""
+    """start 之后到 end（含）之间的工作日数，不扣节假日（会多算 1–2 天）——分档提示够用。"""
     n, d = 0, start
     while d < end:
         d += timedelta(days=1)
@@ -164,6 +168,7 @@ def _shape(row: dict, cik: int, c: dict, today: date) -> dict:
         "concurrent_buyback": bool(c.get("concurrent_buyback")),
         "trading_days_since": days,
         "stabilizing": days <= STABILIZE_DAYS,
+        "drift_window": days <= DRIFT_DAYS,
         "url": edgar.INDEX_HTML_URL.format(cik=cik, acc=acc.replace("-", ""), acc_dashed=acc),
     }
 

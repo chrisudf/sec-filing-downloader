@@ -5,7 +5,7 @@
 """
 import asyncio
 import html
-from datetime import date
+from datetime import date, timedelta
 from pathlib import Path
 
 import httpx
@@ -131,7 +131,26 @@ def test_disk_cache_avoids_refetch():
 def test_stabilizing_window():
     handler, _ = make_handler(BASE_ROWS[1:])
     o = run(handler, today=date(2026, 8, 14))["offering"]
-    assert o["trading_days_since"] == 4 and o["stabilizing"] is True
+    assert o["trading_days_since"] == 4 and o["stabilizing"] is True and o["drift_window"] is True
+
+
+def _add_weekdays(d, n):
+    while n:
+        d += timedelta(days=1)
+        if d.weekday() < 5:
+            n -= 1
+    return d
+
+
+@pytest.mark.parametrize("days, stabilizing, drift", [
+    (30, True, True), (31, False, True), (120, False, True), (121, False, False)])
+def test_tag_window_boundaries(days, stabilizing, drift):
+    # 前端按这两个开关分三档文案：≤30 个交易日提示不托底、≤120 提示跑输窗口、之后只说
+    # 不是压力/支撑位。阈值来自 10-19 全样本研究的 30 日稳定期与 120 日跑输窗口
+    r = row("0000000000-26-000003", "424B5", "2026-08-12", "final.htm")
+    c = {"price": 95.0, "who": "primary", "pricing_date": "2026-08-10"}
+    o = svc._shape(r, CIK, c, _add_weekdays(date(2026, 8, 10), days))
+    assert (o["trading_days_since"], o["stabilizing"], o["drift_window"]) == (days, stabilizing, drift)
 
 
 def test_note_heavy_forms_skipped_with_warning():

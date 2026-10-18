@@ -710,8 +710,8 @@ async function loadSegments(ticker, freq, years) {
 }
 
 // ---- 顶部一行：最近一次定价增发（424B 封面） ----
-// 只展示事实与托底期提示：回测显示增发价不构成压力/支撑位，仅发行后约 5 个
-// 交易日收盘扎堆在发行价（见 app/offering_service.py 文档）。EDGAR 数据一律走 textContent。
+// 只展示事实，不把发行价画成关键价位：10-19 全样本回测显示它既不是压力位也不托底，
+// 稳定的只有增发后整体跑输（分档与数字见 app/offering_service.py 文档）。EDGAR 数据一律走 textContent。
 async function loadOffering(ticker) {
   const seq = ++state.offSeq;
   const box = $("offerLine");
@@ -870,9 +870,16 @@ function renderOffering(d) {
     a.target = "_blank";
     a.rel = "noopener";
     if (atm) addAtm(" · 之后又开过 ");
-    add(o.stabilizing
-      ? `托底期：发行后第 ${o.trading_days_since} 个交易日，收盘常扎堆在发行价`
-      : "发行价不构成压力/支撑位（回测仅头 5 个交易日有托底）", "span", "tag");
+    // 三档：≤30 个交易日（承销商稳定期）提示不托底；≤120 提示仍在跑输窗口；之后只说不是压力/支撑位
+    const tag = add(o.stabilizing
+      ? `发行后第 ${o.trading_days_since} 个交易日：发行价不托底（前 30 日跌破反而多约 6pp），120 日平均跑输约 9pp`
+      : o.drift_window
+        ? `发行价不是压力/支撑位；增发后 120 日平均跑输约 9pp（现为第 ${o.trading_days_since} 个交易日）`
+        : "发行价不是压力/支撑位（2015–25 全样本 4,058 笔）", "span", "tag");
+    tag.title = "2015–2025 美股包销/定向增发 4,058 笔，对照同一只股票次日涨跌幅相近的随机日：\n" +
+      "· 前 30 个交易日收盘跌破发行价 77.6% vs 71.8%（+5.8pp，95% CI +4.0~+7.5）\n" +
+      "· 120 日超额收益差 −8.7pp（95% CI −11.7~−5.5），250 日 −16.7pp\n" +
+      "交易日按工作日计、不扣节假日；ATM 不在样本内";
   }
   if (d.warning) add("　⚠ " + d.warning);
   addSalesList();
