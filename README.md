@@ -74,7 +74,10 @@ sec-filing-downloader/
 │   ├── main.py                # FastAPI 入口：/api/company、/api/download、静态托管
 │   ├── edgar.py               # SEC EDGAR 客户端：查询、过滤、下载、重命名、打包
 │   ├── valuation_service.py   # 估值任务管道：/api/valuation 提交/轮询/下载
-│   └── pe_rank_service.py     # Watchlist PE：/api/pe_rank 读最近一份 + 后台刷新
+│   ├── pe_rank_service.py     # Watchlist PE：/api/pe_rank 读最近一份 + 后台刷新
+│   ├── offering_service.py    # 最近定价增发 + ATM：/api/offering/{ticker}，财务图表页顶部一行
+│   ├── offering_cover.py      # 424B 招股书封面解析（发行价/定价日/前收盘/一二级；ATM 额度/续展/修订）
+│   └── atm_sales.py           # 10-Q/10-K 附注 ATM 实际成交（股数/均价，尽力而为）
 ├── static/
 │   ├── index.html             # 深色主题单页前端（原生 JS，无构建步骤）
 │   └── watchlist.html/.js     # Watchlist PE 分位页（入口在首页右上角）

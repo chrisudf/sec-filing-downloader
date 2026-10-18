@@ -6,7 +6,8 @@ const C = { s1: css("--s1"), s2: css("--s2"), s3: css("--s3"), s4: css("--s4"),
             card2: css("--card2") };
 
 const state = { freq: "quarterly", data: null, charts: {}, seq: 0, segSeq: 0,
-                segMode: "abs", segData: null, insSeq: 0, insData: null, insYears: 1 };
+                segMode: "abs", segData: null, insSeq: 0, insData: null, insYears: 1,
+                offSeq: 0 };
 const esc = (s) => String(s).replace(/[&<>"']/g,
   (c) => ({ "&": "&amp;", "<": "&lt;", ">": "&gt;", '"': "&quot;", "'": "&#39;" }[c]));
 
@@ -708,6 +709,176 @@ async function loadSegments(ticker, freq, years) {
   }
 }
 
+// ---- 顶部一行：最近一次定价增发（424B 封面） ----
+// 只展示事实与托底期提示：回测显示增发价不构成压力/支撑位，仅发行后约 5 个
+// 交易日收盘扎堆在发行价（见 app/offering_service.py 文档）。EDGAR 数据一律走 textContent。
+async function loadOffering(ticker) {
+  const seq = ++state.offSeq;
+  const box = $("offerLine");
+  box.style.display = "none";
+  box.textContent = "";
+  try {
+    const res = await fetch(`/api/offering/${encodeURIComponent(ticker)}`);
+    if (seq !== state.offSeq) return;
+    if (!res.ok) {
+      const body = await res.json().catch(() => ({}));
+      throw new Error(body.detail || `请求失败（HTTP ${res.status}）`);
+    }
+    const d = await res.json();
+    if (seq !== state.offSeq) return;
+    renderOffering(d);
+  } catch (e) {
+    if (seq !== state.offSeq) return;
+    box.textContent = "定价增发信息加载失败：" + e.message;
+    box.style.display = "";
+  }
+}
+
+// 增发行用万/亿单位；与内部人卡片的 fmtShares（千分位整数）、全局 fmtUSD（M/B）口径不同
+function fmtSharesCn(n) {
+  if (!n) return null;
+  return n >= 1e8 ? `${(n / 1e8).toFixed(2)} 亿股` : `${Math.round(n / 1e4).toLocaleString()} 万股`;
+}
+
+function fmtUsdCn(v) {
+  return v >= 1e8 ? `$${(v / 1e8).toFixed(2).replace(/\.?0+$/, "")} 亿` : `$${Math.round(v / 1e4).toLocaleString()} 万`;
+}
+
+// ATM 额度：只数新开的（修订、续展都不算一次），悬停列出全部。
+// 申报日收盘只是参考价——ATM 按市价陆续卖出，成交价看定期报告（atm_sales）
+function atmSummary(list) {
+  const fresh = list.filter(a => !a.amendment && !a.rollover);
+  if (!fresh.length) return null;
+  const size = (a) => a.usd ? `上限 ${fmtUsdCn(a.usd)}` : a.shares ? `上限 ${fmtSharesCn(a.shares)}` : "额度未注明";
+  const ref = (a) => a.close == null ? "" : a.close_src === "封面"
+    ? `，封面前收盘 ${a.close_date.slice(5)} $${Number(a.close).toFixed(2)}`
+    : `，申报日收盘 $${Number(a.close).toFixed(2)}（参考）`;
+  const sold = {};
+  for (const a of list) if (a.prior_date && a.prior_sold_usd) sold[a.prior_date] = a.prior_sold_usd;
+  const line = (a) => a.amendment ? "修订既有额度"
+    : a.rollover ? `旧额度续展（${size(a)}）${ref(a)}`
+    : `${size(a)}${sold[a.date] ? `，后实卖 ${fmtUsdCn(sold[a.date])}` : ""}${ref(a)}`;
+  const nRoll = list.filter(a => a.rollover).length;
+  const last = fresh[0];
+  return {
+    text: `${fresh.length} 次 ATM 额度${nRoll ? `（另 ${nRoll} 次旧额度续展）` : ""}，最近新额度 ${last.date} ${size(last)}`,
+    title: list.map(a => `${a.date}  ${line(a)}`).join("\n"),
+    url: last.url,
+  };
+}
+
+// ATM 实际成交（定期报告附注 + 之后的 8-K 完成公告），服务端已按卖出窗口时间排好
+function saleWhat(e) {
+  return e.kind === "collar"
+    ? `领口远期 ${fmtSharesCn(e.shares)}，价格区间 $${e.avg_price.toFixed(2)}${e.avg_high ? "–" + e.avg_high.toFixed(2) : ""}（交割时定）`
+    : `卖出 ${fmtSharesCn(e.shares)}，均价 $${e.avg_price.toFixed(2)}`;
+}
+
+function saleWindow(e) {
+  if (!e.window_start) return e.window_end ? `截至 ${e.window_end}` : "期间不详";
+  const end = e.window_end || "";
+  return `${e.window_start} → ${end.slice(0, 4) === e.window_start.slice(0, 4) ? end.slice(5) : end}`;
+}
+
+function saleProgram(e) {
+  if (!e.program_date) return "";
+  const amt = e.program_usd ? fmtUsdCn(e.program_usd) : "";
+  return e.program_rollover ? `续展余额 ${amt}` : `${e.program_date.slice(0, 7)} 协议 ${amt}`;
+}
+
+function renderOffering(d) {
+  const box = $("offerLine");
+  box.textContent = "";
+  const add = (text, tag = "span", cls = "") => {
+    const n = document.createElement(tag);
+    n.textContent = text;
+    if (cls) n.className = cls;
+    box.appendChild(n);
+    return n;
+  };
+  const o = d.offering;
+  const atm = atmSummary(d.atm_programs || []);
+  const link = (text, href) => {
+    const a = add(text, "a");
+    a.href = href;
+    a.target = "_blank";
+    a.rel = "noopener";
+  };
+  const sales = d.atm_sales && d.atm_sales.entries.length ? d.atm_sales.entries : [];
+  const addAtm = (prefix) => {
+    const n = add(prefix + atm.text + " · ");
+    n.title = atm.title;
+    link("最近一份", atm.url);
+    const lastSale = [...sales].reverse().find(e => e.kind !== "collar");
+    if (lastSale) {
+      add(" · 最近一笔实际成交：");
+      add(`${saleWindow(lastSale)} ${saleWhat(lastSale)}`, "b");
+    } else if (d.atm_sales && d.atm_sales.report) {
+      add(" · 实际成交见 ");
+      link(`${d.atm_sales.report.form}（${d.atm_sales.report.report_date}）`, d.atm_sales.report.url);
+    }
+  };
+  // 按时间列出每一笔：卖出窗口 · 所属协议 · 股数与均价 · 来源
+  const addSalesList = () => {
+    if (!sales.length) return;
+    const box2 = document.createElement("div");
+    box2.className = "offer-sales";
+    const head = document.createElement("div");
+    head.className = "muted";
+    head.textContent = "ATM 实际成交（按时间；均价 = 毛收入 ÷ 股数）";
+    box2.appendChild(head);
+    for (const e of sales) {
+      const row = document.createElement("div");
+      const t = document.createElement("span");
+      t.className = "win";
+      t.textContent = saleWindow(e);
+      row.appendChild(t);
+      const prog = saleProgram(e);
+      row.appendChild(document.createTextNode(prog ? ` · ${prog} · ` : " · "));
+      const w = document.createElement("b");
+      w.textContent = saleWhat(e);
+      row.appendChild(w);
+      row.appendChild(document.createTextNode(" · "));
+      const a = document.createElement("a");
+      a.href = e.source_url;
+      a.target = "_blank";
+      a.rel = "noopener";
+      a.textContent = `${e.source_form} ${e.source_date}`;
+      row.appendChild(a);
+      box2.appendChild(row);
+    }
+    box.appendChild(box2);
+  };
+  if (!o && atm) {
+    add(`近 ${d.lookback_years} 年没有定价增发；开过 `);
+    addAtm("");
+    add("ATM 按市价陆续卖出：申报日价格不是成交价，以定期报告为准", "span", "tag");
+  } else if (!o) {
+    add(`近 ${d.lookback_years} 年没有定价增发，也没有开 ATM（发债、员工计划不计）`);
+  } else {
+    const price = Number(o.price).toLocaleString("en-US", { minimumFractionDigits: 2, maximumFractionDigits: 4 });
+    add("最近定价增发 ");
+    add(`${o.date} · $${price}`, "b");
+    const parts = [o.date_kind === "定价日" ? null : `（${o.date_kind}）`, o.who_label, fmtSharesCn(o.shares)];
+    if (o.discount_pct != null)
+      parts.push(`较前收 ${o.discount_pct > 0 ? "+" : "−"}${Math.abs(o.discount_pct).toFixed(1)}%`);
+    if (o.block) parts.push("大宗（承销商买入价）");
+    if (o.concurrent_buyback) parts.push("含公司同步回购");
+    add(" · " + parts.filter(Boolean).join(" · ") + " · ");
+    const a = add(o.form, "a");
+    a.href = o.url;
+    a.target = "_blank";
+    a.rel = "noopener";
+    if (atm) addAtm(" · 之后又开过 ");
+    add(o.stabilizing
+      ? `托底期：发行后第 ${o.trading_days_since} 个交易日，收盘常扎堆在发行价`
+      : "发行价不构成压力/支撑位（回测仅头 5 个交易日有托底）", "span", "tag");
+  }
+  if (d.warning) add("　⚠ " + d.warning);
+  addSalesList();
+  box.style.display = "";
+}
+
 // ---- 图 2c：客户与供应商集中度 ----
 function concReset(msg) {
   if (state.charts.cConcTrend) { state.charts.cConcTrend.dispose(); delete state.charts.cConcTrend; }
@@ -1247,6 +1418,7 @@ async function load() {
     echarts.connect("sync");
     loadSegments(d.ticker, freq, years);  // 独立异步，不阻塞主图状态
     loadInsider(d.ticker);                // 同上；不随季度/年度与年数切换
+    loadOffering(d.ticker);               // 同上：一行增发信息，失败只影响这一行
     // 瀑布图期数下拉：默认最新一期
     const sel = $("wfPeriod");
     sel.innerHTML = "";
