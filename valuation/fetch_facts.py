@@ -105,6 +105,15 @@ SPEC = {
     "finance_lease_principal": _item(
         ["FinanceLeasePrincipalPayments",
          "RepaymentsOfLongTermCapitalLeaseObligations"], y=True),
+    # 融资租赁负债（时点）：只给图表端分辨「本金没单独标」和「根本没有融资租赁」。
+    # 2026-10-23 实测 46 只：AAPL/MCD/T/DLR/AVGO 资产负债表上有这项负债，本金偿付
+    # 却没单独打标签——缺标签不等于没有，不能当 0 扣。总额排第一：同一份申报里
+    # 先列的标签胜出，只标流动/非流动两半的发行人拿到的是其中一半（量级仍对）
+    "finance_lease_liability": _item(
+        ["FinanceLeaseLiability", "FinanceLeaseLiabilityNoncurrent",
+         "FinanceLeaseLiabilityCurrent", "CapitalLeaseObligations",
+         "CapitalLeaseObligationsNoncurrent", "CapitalLeaseObligationsCurrent"],
+        i=True),
     # 股东回报与股权激励（图表端；现金流量表科目，10-Q 为累计口径）
     "buyback": _item(["PaymentsForRepurchaseOfCommonStock"], y=True),
     # PaymentsOfOrdinaryDividends 走 fill（只补缺不覆盖）：PFE **只**用这个标签，

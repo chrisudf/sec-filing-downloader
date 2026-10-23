@@ -135,6 +135,24 @@ function ttmOneoff(d) {
   return { pre, ni: niv - idx.reduce((s, i) => s + oneoffAfterTax(d, i), 0) };
 }
 
+// FCF 扣融资租赁本金：服务端只在近四季都单独标了才给 ok，其余状态说清楚为什么
+// 没扣（「没标」≠「没有」，不能当 0 扣）。措辞不写「公司口径」：META 自己这么算，
+// MSFT 不扣——它讲的「含融资租赁的资本开支」加的是新增租赁资产，不是本金偿付
+function finLeaseNote(fl, fcf) {
+  if (!fl) return null;
+  // 不到 1M 时 fmtUSD 印成「0M」，看着像没取到数（RKLB 四季合计约 0.4M）
+  const amt = (v) => Math.abs(v) < 1e6 ? "不到 1M" : fmtUSD(v);
+  return fl.status === "ok"
+      ? `扣融资租赁本金 ${amt(fl.ttm_principal)} 后 ${fmtUSD(fcf - fl.ttm_principal)}`
+    : fl.status === "incomplete"
+      ? `融资租赁本金季度不全（缺 ${fl.missing.join("、")}），未扣`
+    : fl.status === "annual_only"
+      ? `融资租赁本金仅年报披露（${fl.fy_end} 财年 ${amt(fl.fy_principal)}），未扣`
+    : fl.status === "not_disclosed"
+      ? `有融资租赁负债约 ${amt(fl.liability)}，本金偿付未单独披露，未扣`
+    : null;
+}
+
 // ---- TTM 汇总 tiles：估值锚定的分母（P/E、EV/FCF 都用 TTM）----
 function renderTtm(d) {
   const box = $("ttmTiles");
@@ -160,7 +178,9 @@ function renderTtm(d) {
     ["TTM OCF", t.cfo && (bank ? { ...t.cfo, note: "银行口径：含贷款业务现金流" }
                                 : t.cfo), fmtUSD],
     ["TTM FCF", bank ? null
-      : { value: fcf, note: fcf != null ? "OCF−资本开支" : null }, fmtUSD],
+      : { value: fcf, note: fcf != null
+            ? ["OCF−资本开支", finLeaseNote(t.finance_lease, fcf)].filter(Boolean).join("；")
+            : null }, fmtUSD],
     ["TTM EPS", adj && t.eps_diluted && t.eps_diluted.value != null
       ? { ...t.eps_diluted, note: epsNote(t.eps_diluted) } : t.eps_diluted,
      (v) => "$" + v.toFixed(2)],
@@ -1062,6 +1082,9 @@ function renderCashflow(d, labels) {
     const fcf = cf.fcf[i], ret = (cf.buyback[i] || 0) + (cf.dividends[i] || 0);
     if (fcf && ret) html += `<br><span style="color:${C.muted}">股东回报(回购+分红) ${fmtUSD(ret)} = FCF 的 ${(ret / fcf * 100).toFixed(0)}%</span>`;
     if (fcf && cf.sbc[i]) html += `<br><span style="color:${C.muted}">SBC = FCF 的 ${(cf.sbc[i] / fcf * 100).toFixed(0)}%</span>`;
+    const flp = (cf.finance_lease_principal || [])[i];
+    if ((cf.fcf_less_finance_lease || [])[i] != null && flp != null)
+      html += `<br><span style="color:${C.muted}">融资租赁本金 ${fmtUSD(flp)}（筹资活动流出，不在资本开支里）</span>`;
     return html;
   };
   opt.xAxis = catAxis(labels);
@@ -1078,6 +1101,12 @@ function renderCashflow(d, labels) {
     { name: "SBC(股权激励)", type: "line", data: cf.sbc,
       lineStyle: { width: 2, type: "dashed", color: C.s6 },
       itemStyle: { color: C.s6 }, symbol: "circle", symbolSize: 5,
+      connectNulls: false },
+    // 与损益图「净利率(剔一次性)」同色同线型：红虚线=调整后口径。服务端不满足
+    // 门槛时整列 null，被下面的过滤器拿掉、也不进图例
+    { name: "FCF(扣融资租赁本金)", type: "line", data: cf.fcf_less_finance_lease || [],
+      lineStyle: { width: 2, type: "dashed", color: C.s8 },
+      itemStyle: { color: C.s8 }, symbol: "circle", symbolSize: 5,
       connectNulls: false },
   ].filter(s => s.data.some(v => v != null));
   mount("cCashflow", opt);
@@ -1483,10 +1512,13 @@ function csvIncome(d) {
   return L;
 }
 function csvCashflow(d) {
-  const L = [["期间", "经营现金流", "自由现金流", "资本开支", "回购", "分红", "SBC"]];
+  const L = [["期间", "经营现金流", "自由现金流", "资本开支", "回购", "分红", "SBC",
+              "融资租赁本金", "FCF(扣融资租赁本金)"]];
   d.periods.forEach((p, i) => L.push([p.label,
     d.cashflow.ocf[i], d.cashflow.fcf[i], d.cashflow.capex[i],
-    d.cashflow.buyback[i], d.cashflow.dividends[i], d.cashflow.sbc[i]]));
+    d.cashflow.buyback[i], d.cashflow.dividends[i], d.cashflow.sbc[i],
+    (d.cashflow.finance_lease_principal || [])[i],
+    (d.cashflow.fcf_less_finance_lease || [])[i]]));
   return L;
 }
 function csvConc() {

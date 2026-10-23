@@ -291,6 +291,114 @@ def test_reshape_wires_securities_and_private_equity():
     assert r["oneoff"]["private_equity_gain"] == [None] * (len(ends) - 1) + [50.49 * B]
 
 
+def _fl_facts(flq=None, fla=None, liab=None, cfo_end="2026-06-30"):
+    """融资租赁用例：_facts() 的五个季度 + 末季为 cfo_end 的 TTM 现金流窗口。"""
+    facts = _facts()
+    facts["ttm"] = {"cfo": {"value": 100e6, "end": cfo_end}}
+    facts["finance_lease_principal_quarterly"] = flq or {}
+    facts["finance_lease_principal_annual"] = fla or {}
+    facts["finance_lease_liability_instant"] = liab or {}
+    return facts
+
+
+TTM_Q = ["2025-09-30", "2025-12-30", "2026-03-30", "2026-06-30"]
+
+
+def test_finance_lease_ok_sums_four_quarters_keeping_sign():
+    # META 近四季 0.75/0.84/0.96/0.96B
+    st = fs._finance_lease_status(_fl_facts(
+        dict(zip(TTM_Q, (0.75 * B, 0.84 * B, 0.96 * B, 0.96 * B)))))
+    assert st["status"] == "ok" and st["quarters"] == TTM_Q
+    assert st["ttm_principal"] == pytest.approx(3.51 * B)
+    # RKLB 2024-09 YTD 差分出 −0.2M：原样相加，取绝对值会多扣
+    st = fs._finance_lease_status(_fl_facts(
+        dict(zip(TTM_Q, (0.1e6, -0.2e6, 0.1e6, 0.1e6)))))
+    assert st["ttm_principal"] == pytest.approx(0.1e6)
+
+
+def test_finance_lease_incomplete_lists_missing_and_beats_annual():
+    # 缺一季就扣不全；近期年报值也不能顶上（窗口不一致）
+    flq = {e: 1e8 for e in TTM_Q if e != "2025-12-30"}
+    st = fs._finance_lease_status(_fl_facts(flq, fla={"2025-12-30": 4e8}))
+    assert st == {"status": "incomplete", "missing": ["Dec '25"]}
+
+
+def test_finance_lease_annual_only_and_recency():
+    # WMT 型：10-Q 不单列，只有 10-K 租赁附注（财年 1 月底）
+    st = fs._finance_lease_status(_fl_facts(fla={"2026-01-31": 0.89 * B},
+                                            liab={"2026-01-31": 5 * B}))
+    assert st == {"status": "annual_only", "fy_end": "2026-01-31",
+                  "fy_principal": 0.89 * B}
+    # 早于 15 个月的年报值不算近期（INTC 停在 FY2023）
+    st = fs._finance_lease_status(_fl_facts(fla={"2024-12-31": 0.1 * B}))
+    assert st == {"status": "none"}
+
+
+def test_finance_lease_not_disclosed_needs_recent_positive_liability():
+    # AAPL 型：有融资租赁负债，本金没单独标——「没标」≠「没有」
+    st = fs._finance_lease_status(_fl_facts(liab={"2025-09-27": 1.2 * B}))
+    assert st == {"status": "not_disclosed", "liability_end": "2025-09-27",
+                  "liability": 1.2 * B}
+    # 负债为 0 或太旧（NVDA 停在 2017）：没有就是没有
+    assert fs._finance_lease_status(_fl_facts(liab={"2026-06-30": 0})) == {"status": "none"}
+    assert fs._finance_lease_status(_fl_facts(liab={"2017-10-29": 1e8})) == {"status": "none"}
+    assert fs._finance_lease_status(_fl_facts()) == {"status": "none"}
+
+
+def test_finance_lease_window_undetermined_is_none():
+    # 无现金流 TTM / TTM 报错（口径滞后）：不下结论
+    facts = _fl_facts()
+    facts["ttm"] = {}
+    assert fs._finance_lease_status(facts) is None
+    facts["ttm"] = {"cfo": {"value": None, "error": "口径滞后"}}
+    assert fs._finance_lease_status(facts) is None
+    # 有末季没有值：FCF 卡片本身是「—」，注记也不能单独冒出来
+    facts["ttm"] = {"cfo": {"value": None, "end": "2026-06-30"}}
+    facts["finance_lease_principal_quarterly"] = {e: 1e6 for e in TTM_Q}
+    assert fs._finance_lease_status(facts) is None
+    # 末季对不上现金流季度序列，或窗口里断了一季
+    assert fs._finance_lease_status(_fl_facts(cfo_end="2026-09-30")) is None
+    facts = _fl_facts()
+    del facts["cfo_quarterly"]["2025-12-30"]
+    assert fs._finance_lease_status(facts) is None
+
+
+def test_reshape_finance_lease_line_quarterly():
+    """接线：季度图的扣除线与 TTM 卡片同一门槛；没过门槛整列 null，原始本金照给。"""
+    flq = {e: 1e6 for e in TTM_Q}
+    r = fs._reshape(_fl_facts(flq), {"name": "T"}, "quarterly", 3)
+    cf = r["cashflow"]
+    assert r["ttm"]["finance_lease"]["status"] == "ok"
+    # 窗口外的首期没标：那一期断开，其余 = FCF − 本金
+    assert cf["fcf_less_finance_lease"] == [None] + [f - 1e6 for f in cf["fcf"][1:]]
+    assert cf["fcf"] == [o - c for o, c in zip(cf["ocf"], cf["capex"])]  # 原 FCF 不动
+
+    del flq["2025-12-30"]
+    r = fs._reshape(_fl_facts(flq), {"name": "T"}, "quarterly", 3)
+    assert r["ttm"]["finance_lease"]["status"] == "incomplete"
+    assert r["cashflow"]["fcf_less_finance_lease"] == [None] * 5
+    assert r["cashflow"]["finance_lease_principal"] == [None, 1e6, None, 1e6, 1e6]
+
+    r = fs._reshape(_facts(), {"name": "T"}, "quarterly", 3)   # 无现金流 TTM
+    assert "finance_lease" not in r["ttm"]
+    assert r["cashflow"]["fcf_less_finance_lease"] == [None] * 5
+
+
+def test_reshape_finance_lease_line_annual_uses_latest_fy():
+    # 年度图看窗口里最新财年标没标：仅年报披露的发行人（TTM 判 annual_only）年度图照画
+    facts = _fl_facts(fla={"2025-12-31": 0.9 * B})
+    facts["revenue_annual"] = {"2024-12-31": 10 * B, "2025-12-31": 12 * B}
+    facts["cfo_annual"] = {"2024-12-31": 3 * B, "2025-12-31": 4 * B}
+    facts["capex_annual"] = {"2024-12-31": 1 * B, "2025-12-31": 1.5 * B}
+    r = fs._reshape(facts, {"name": "T"}, "annual", 2)
+    assert r["ttm"]["finance_lease"]["status"] == "annual_only"
+    assert r["cashflow"]["fcf_less_finance_lease"] == [None, pytest.approx(1.6 * B)]
+    # 最新财年没标（只剩旧年）：不画
+    facts["finance_lease_principal_annual"] = {"2024-12-31": 0.9 * B}
+    r = fs._reshape(facts, {"name": "T"}, "annual", 2)
+    assert r["cashflow"]["fcf_less_finance_lease"] == [None, None]
+
+
 def test_shared_param_contract():
     # 两个端点的 freq/years 口径必须永远一致（同一常量）
     assert FREQ_PATTERN == "^(quarterly|annual)$"
