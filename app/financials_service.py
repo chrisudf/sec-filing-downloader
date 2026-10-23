@@ -237,6 +237,55 @@ def _total_debt(inst, st_full_line: bool = False) -> list:
     return [t if t is not None else c for t, c in zip(out, combined)]
 
 
+# 「近期」= TTM 末季往前约 15 个月：年报才标一次的科目（租赁附注只在 10-K 里）
+# 最旧可以早到上个财年末，再加一个季度的申报滞后
+FL_RECENT_DAYS = 460
+
+
+def _finance_lease_status(facts: dict) -> dict | None:
+    """TTM 窗口里融资租赁本金能不能扣：FCF 卡片与季度图的「扣融资租赁本金」
+    只在近四季都单独标了才给数——缺一季就扣不全，把没扣的当成扣过比不画更误导。
+
+    窗口取 TTM 经营现金流的末季往前四个季度（与 TTM FCF 同一窗口）；定不下来
+    （无现金流 TTM、季度断档）返回 None，前端不出注记。否则 status 为：
+    - ok：四季都有 → ttm_principal 为四季之和。YTD 差分偶有几十万美元的负数
+      （RKLB 2024-09 −0.2M），原样相加、不取绝对值
+    - incomplete：只有部分季度有（ORCL/MU/CRWV 型）→ missing 列出缺的季度
+    - annual_only：一季都没有，近期却有年报值（WMT/HD/IBM/VZ 型，10-Q 不单列）
+    - not_disclosed：本金没标，资产负债表却有融资租赁负债（AAPL/MCD/T 型）
+    - none：两样都没有，不出注记（同估值引擎 fcf_caliber_warnings 的缺标签口径）
+    """
+    cfo = (facts.get("ttm") or {}).get("cfo") or {}
+    end = cfo.get("end")
+    if cfo.get("value") is None or not end:
+        return None
+    qs = sorted(k for k in (facts.get("cfo_quarterly") or {}) if k <= end)[-4:]
+    if len(qs) < 4 or qs[-1] != end or not all(
+            80 <= (date.fromisoformat(b) - date.fromisoformat(a)).days <= 100
+            for a, b in zip(qs, qs[1:])):
+        return None
+    flq = facts.get("finance_lease_principal_quarterly") or {}
+    have = [e for e in qs if e in flq]
+    if len(have) == 4:
+        return {"status": "ok", "ttm_principal": sum(flq[e] for e in qs),
+                "quarters": qs}
+    if have:
+        return {"status": "incomplete",
+                "missing": [period_label(e) for e in qs if e not in flq]}
+    floor = (date.fromisoformat(end) - timedelta(days=FL_RECENT_DAYS)).isoformat()
+    fla = facts.get("finance_lease_principal_annual") or {}
+    recent = sorted(k for k in fla if k >= floor)
+    if recent:
+        return {"status": "annual_only", "fy_end": recent[-1],
+                "fy_principal": fla[recent[-1]]}
+    liab = facts.get("finance_lease_liability_instant") or {}
+    recent = sorted(k for k, v in liab.items() if k >= floor and v and v > 0)
+    if recent:
+        return {"status": "not_disclosed", "liability_end": recent[-1],
+                "liability": liab[recent[-1]]}
+    return {"status": "none"}
+
+
 def _reshape(facts: dict, info: dict, freq: str, years: int) -> dict:
     suffix = "_quarterly" if freq == "quarterly" else "_annual"
     rev = facts["revenue" + suffix]
@@ -304,6 +353,15 @@ def _reshape(facts: dict, info: dict, freq: str, years: int) -> dict:
     buyback = dur("buyback")      # Payments* 均为正数（流出）
     dividends = dur("dividends")
     sbc = dur("sbc")              # 非现金加回项，正数
+    # 扣融资租赁本金的 FCF：季度图与 TTM 卡片同一个门槛（近四季齐全）；年度图看
+    # 窗口里最新一个财年标没标——仅年报披露的发行人，年度图正是它的数该出现的地方
+    fl_principal = dur("finance_lease_principal")
+    fl = _finance_lease_status(facts)
+    if fl is not None:
+        ttm["finance_lease"] = fl
+    show_fl = (fl is not None and fl["status"] == "ok") if freq == "quarterly" \
+        else fl_principal[-1] is not None
+    fcf_less_fl = _sub(fcf, fl_principal) if show_fl else [None] * len(ends)
 
     cash = inst("cash")
     # 证券类：基线口径优先。NVDA 2026 起把该行拆成 债券+股票 两个新标签，
@@ -361,7 +419,9 @@ def _reshape(facts: dict, info: dict, freq: str, years: int) -> dict:
             },
         },
         "cashflow": {"ocf": ocf, "capex": capex, "fcf": fcf,
-                     "buyback": buyback, "dividends": dividends, "sbc": sbc},
+                     "buyback": buyback, "dividends": dividends, "sbc": sbc,
+                     "finance_lease_principal": fl_principal,
+                     "fcf_less_finance_lease": fcf_less_fl},
         "balance": {"cash": cash, "securities": securities,
                     "total_debt": _total_debt(inst, _st_borrowings_is_full_line(facts))},
         # 营业外/一次性组件：前端拆解瀑布图的营业外损益并标记一次性主导的期
