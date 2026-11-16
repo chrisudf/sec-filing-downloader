@@ -1069,6 +1069,10 @@ function renderBalance(d, labels) {
 // ---- 图 4：现金流·股东回报·股权激励（流出取负画到零轴下方）----
 function renderCashflow(d, labels) {
   const cf = d.cashflow;
+  // 银行格式服务端不出扣除线、页面也没有 TTM FCF 卡片：副标题里指向它们的半句跟着藏。
+  // 判空：部署过渡期浏览器可能拿旧缓存的 HTML 配新 JS，没有这个元素也不能报错
+  const flNote = $("cfFlNote");
+  if (flNote) flNote.style.display = d.bank_format ? "none" : "";
   const OUT = ["资本开支", "回购", "分红"];
   const opt = baseOpt();
   opt.tooltip.formatter = (ps) => {

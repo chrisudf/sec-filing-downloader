@@ -354,13 +354,20 @@ def _reshape(facts: dict, info: dict, freq: str, years: int) -> dict:
     dividends = dur("dividends")
     sbc = dur("sbc")              # 非现金加回项，正数
     # 扣融资租赁本金的 FCF：季度图与 TTM 卡片同一个门槛（近四季齐全）；年度图看
-    # 窗口里最新一个财年标没标——仅年报披露的发行人，年度图正是它的数该出现的地方
+    # 窗口里最新一个财年标没标——仅年报披露的发行人，年度图正是它的数该出现的地方。
+    # 银行格式整套不出：OCF 含贷款发放，前端本来就不给 FCF 卡片，扣除线没有可依附
+    # 的口径（SOFI 年度图曾单独多出一条、与 FCF 柱几乎重合的线）。原始本金照给
+    bank = bool(facts.get("bank_format"))
     fl_principal = dur("finance_lease_principal")
-    fl = _finance_lease_status(facts)
+    fl = None if bank else _finance_lease_status(facts)
     if fl is not None:
         ttm["finance_lease"] = fl
-    show_fl = (fl is not None and fl["status"] == "ok") if freq == "quarterly" \
-        else fl_principal[-1] is not None
+    if bank:
+        show_fl = False
+    elif freq == "quarterly":
+        show_fl = fl is not None and fl["status"] == "ok"
+    else:
+        show_fl = fl_principal[-1] is not None
     fcf_less_fl = _sub(fcf, fl_principal) if show_fl else [None] * len(ends)
 
     cash = inst("cash")

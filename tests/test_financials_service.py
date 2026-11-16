@@ -399,6 +399,24 @@ def test_reshape_finance_lease_line_annual_uses_latest_fy():
     assert r["cashflow"]["fcf_less_finance_lease"] == [None, None]
 
 
+def test_reshape_finance_lease_bank_format_never_shown():
+    # SOFI 教训：银行格式没有 FCF 卡片，年度图却单独多出一条扣除线。
+    # 季度四季齐全（非银行会判 ok）与年度最新财年已标两种情形都不许出
+    facts = _fl_facts({e: 1e6 for e in TTM_Q}, fla={"2025-12-31": 0.9 * B})
+    facts["bank_format"] = True
+    r = fs._reshape(facts, {"name": "T"}, "quarterly", 3)
+    assert "finance_lease" not in r["ttm"]
+    assert r["cashflow"]["fcf_less_finance_lease"] == [None] * 5
+    assert r["cashflow"]["finance_lease_principal"] == [None, 1e6, 1e6, 1e6, 1e6]
+    facts["revenue_annual"] = {"2024-12-31": 10 * B, "2025-12-31": 12 * B}
+    facts["cfo_annual"] = {"2024-12-31": 3 * B, "2025-12-31": 4 * B}
+    facts["capex_annual"] = {"2024-12-31": 1 * B, "2025-12-31": 1.5 * B}
+    r = fs._reshape(facts, {"name": "T"}, "annual", 2)
+    assert "finance_lease" not in r["ttm"]
+    assert r["cashflow"]["fcf_less_finance_lease"] == [None, None]
+    assert r["cashflow"]["finance_lease_principal"] == [None, 0.9 * B]
+
+
 def test_shared_param_contract():
     # 两个端点的 freq/years 口径必须永远一致（同一常量）
     assert FREQ_PATTERN == "^(quarterly|annual)$"
