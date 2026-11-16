@@ -232,6 +232,15 @@ def test_dividends_fallback_tag_declared():
     assert SPEC["dividends"]["ytd_flow"] is True
 
 
+def test_finance_lease_liability_declared_instant_total_first():
+    """契约：图表端靠它分辨「本金没单独标」与「没有融资租赁」。同一份申报里先列的
+    标签胜出，总额必须排第一，否则只拿到流动或非流动那一半。"""
+    item = SPEC["finance_lease_liability"]
+    assert item["instant"] is True and item["ytd_flow"] is False
+    assert item["tags"][0] == "FinanceLeaseLiability"
+    assert "CapitalLeaseObligations" in item["tags"]   # ASC 842 前的老标签
+
+
 def test_dividends_fill_covers_empty_main_tags():
     """PFE 形态：主列表两个标签一条数据都没有，全靠回退标签。"""
     facts = {"PaymentsOfOrdinaryDividends": F(

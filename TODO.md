@@ -628,6 +628,24 @@ RKLB/SOFI/COHR/TSLA/AMZN/SPCX 不回购；GOOG 2026Q1–Q2、META 2025Q4 起停�
 探测脚本思路：按「average price」+「shares purchased」+「publicly announced」+ 月份名给每张表打分
 取最高分，不依赖标题位置（季报 Item 2 与年报 Item 5 通用）。
 
+## 🏗️ FCF 扣融资租赁本金（2026-10-23，`feat/fcf-finance-lease`）
+
+起因：META Q3'26 面板 FCF −1.16B，公司新闻稿 −2.12B，差的是融资租赁本金 0.96B（META 的 FCF
+定义扣它）。已做：原 FCF 不动，现金流图加红虚线「FCF(扣融资租赁本金)」，TTM FCF 卡片加注记。
+
+- [x] 门槛：季度图与 TTM 注记只在 TTM 四季都单独标了才出（`_finance_lease_status`）；年度图看窗口内
+      最新财年。没出时注记写原因：季度不全（ORCL/MU/CRWV）、仅年报披露（WMT/HD/IBM/VZ/KR/FDX/
+      TGT/UAL/DAL）、有融资租赁负债但本金未单独披露（AAPL/MCD/T/DLR/AVGO）。两样都没有的不出注记。
+- [x] 46 只实测（TTM 本金 / FCF）：AMZN 14%、META 12%、TMUS 7%、GOOG 5%、MSFT 5%、CRM 4%，其余 <3%。
+- [x] 银行格式整套不出（2026-11-16 复核发现）：SOFI 年度图曾单独多出一条与 FCF 柱重合的扣除线（本金每年
+      0.5–0.8M，FCF 在 −1.3B 到 −7.3B 之间）。银行没有 FCF 卡片，扣除线、TTM 状态、副标题那半句一并不出；
+      原始本金仍进接口和 CSV。19 只票用同一份数据对比改前改后，只有 SOFI 年度图变化
+- [ ] **MSFT 型扣了本金仍偏乐观**：本金偿付远小于当年新增的融资租赁资产（MSFT FY2026 本金 3.1B vs
+      `RightOfUseAssetObtainedInExchangeForFinanceLeaseLiability` 24.6B；管理层讲的「含融资租赁的
+      资本开支」是后者口径）。要不要再给一个「含新增融资租赁的资本开支」口径，待定
+- [ ] 估值引擎 `fcf_caliber_warnings` 注释说「缺标签基本等于真的没有」——上面五只不成立。引擎只打旗、
+      影响小，改注释或让它也读 `finance_lease_liability_instant`
+
 ## 🚀 v0.5 — 部署与产品化
 
 - [ ] 部署到 Railway / Fly.io（参考站即 Railway）
