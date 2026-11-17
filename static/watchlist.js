@@ -124,6 +124,8 @@ function bandCells(m) {
   const ot = m.onetime;
   const est = ot ? (ot.clean || {}) : null;
   const pe = el("td", { text: ot ? (ot.pe == null ? "亏损" : `≈${fmtPE(ot.pe)}`) : fmtPE(m.pe) });
+  // 外国发行人（20-F 无季度 XBRL）：分子换成 Yahoo 季度 EPS、经 20-F 年度数核对（foreign_band.py）
+  if (m.src === "yahoo") pe.append(mark("ʸ", m.src_note || "TTM 分子 = Yahoo 季度 EPS，经 20-F 年度数核对"));
   if (ot) pe.append(mark("⚠", onetimeText(ot, m)));
   else if (!m.fresh) {
     pe.append(mark("†", `当前 TTM 窗口被剔（一次性畸变/亏损/近零），显示的是 ${m.date} 的末个有效点`));

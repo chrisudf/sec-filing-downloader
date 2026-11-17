@@ -37,6 +37,9 @@ pe_rank_YYYY-MM-DD-manual.*，网页不读，也不会覆盖当天的整表。
     且一致预期较 30 天前下降）= 分母在被下修，下财年 PE 偏低、便宜得不实。只看家数会误标：
     2026-10-11 实跑 TSLA ↑1/↓4 但一致预期 +1.1%，RKLB ↑2/↓6 但亏损在收窄。下财年 PE 为空
     （亏损）不标——没有「便宜」可言。与 ⚠（本财年预期的一次性判据）是两个独立标记。
+  ʸ —— 外国发行人（20-F，无季度 XBRL，TSM）：TTM PE 这组的分子换成 Yahoo 季度 EPS，经 20-F
+    年度 EPS 逐年核对（foreign_band.py）。整条带同一来源，不与 SEC 季度数拼接；只在外国发行人
+    形态启用，取数失败不换源。营业线那组仍为 n/a（Yahoo 无季度营业利润长历史）。
   分位与前瞻 PE 回答的是两个问题（历史位置 vs 预期兑现后的倍数），要一起读。
 """
 import argparse
@@ -55,6 +58,7 @@ ROOT = Path(__file__).resolve().parent.parent
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 sys.path.insert(0, str(ROOT))
 import pe_band as pb  # noqa: E402
+import foreign_band as fb  # noqa: E402
 from ref_table import fetch_consensus, fy_labels, one_time_warning  # noqa: E402
 from app.edgar import contact_email  # noqa: E402
 
@@ -457,6 +461,15 @@ def collect(t, kind, email):
     import yfinance as yf
     # 一致预期与下财年修正共用一个实例：earningsTrend 按实例缓存，一只票只请求一次
     tk = yf.Ticker(t)
+    if "err" in row["gaap"] and fb.foreign_shape(inputs):
+        # 外国发行人兜底：只认形态（ifrs / 有年无季），取数失败等其它原因照旧报错
+        m = fb.foreign_reading(t, inputs, tk, row["px_date"], STALE_DAYS, MIN_DAYS)
+        if "err" in m:
+            row["notes"].append(m["err"])
+        else:
+            m["src_note"] = fb.source_note(m)
+            row["gaap"] = m
+            row["notes"].append(m["src_note"])
     try:
         cons, trend, _ = fetch_consensus(t, tk)
         row["fwd"] = forward(row["close"], cons)
@@ -495,7 +508,8 @@ def _band_cells(m):
         pe = "亏损⚠" if ot["pe"] is None else f"≈{ot['pe']:.1f}x⚠"
         rs, p3 = [c.get(k) for k in ("r10", "r5", "r3")], c.get("p3")
     else:
-        pe = f"{m['pe']:.1f}x" + ("" if m["fresh"] else f"†{m['date'][5:]}")
+        pe = (f"{m['pe']:.1f}x" + ("ʸ" if m.get("src") == "yahoo" else "")
+              + ("" if m["fresh"] else f"†{m['date'][5:]}"))
         rs, p3 = [m["r10"], m["r5"], m["r3"]], m["p3"]
     b = "—" if not p3 else f"{p3[10]:.0f}/{p3[50]:.0f}/{p3[90]:.0f}"
     return [pe] + [_pc(v) for v in rs] + [b]
@@ -550,7 +564,8 @@ def render(rows, asof, intraday=False):
           "下财年修正 = 近 30 天上调/下调下财年 EPS 预期的分析师家数 · 一致预期较 30 天前"
           "（亏损股报绝对值），只做展示、未经回测；"
           f"↓ = 分母在被下修（下调 ≥{REV_MIN_DOWN} 家且多于上调、一致预期下降，两个都要）；"
-          "Yahoo tPE = Yahoo 的 GAAP TTM PE，只做对账（和 TTM 原值差很多 = 有一次性项）。"
+          "Yahoo tPE = Yahoo 的 GAAP TTM PE，只做对账（和 TTM 原值差很多 = 有一次性项）；"
+          "ʸ = 外国发行人（20-F 无季度 XBRL），TTM 分子为 Yahoo 季度 EPS、经 20-F 年度数核对。"
           "口径细节见 valuation/pe_rank.py 文件头。", ""]
     if intraday:
         md += [f"**{INTRADAY_NOTE}**", ""]
@@ -603,6 +618,7 @@ def csv_rows(rows):
             rec[f"fy2_rev_{k}"] = rv.get(k)
         rec["fy2_down"] = bool(fw.get("fy2_down"))
         ot = (r.get("gaap") or {}).get("onetime") or {}
+        rec["gaap_src"] = (r.get("gaap") or {}).get("src") or ("sec" if "gaap" in r else None)
         rec["gaap_onetime"], rec["gaap_clean_pe"] = bool(ot), ot.get("pe")
         for k in ("r10", "r5", "r3"):
             rec[f"gaap_clean_{k}"] = (ot.get("clean") or {}).get(k)
