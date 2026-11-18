@@ -142,7 +142,7 @@ def main():
     tk = yf.Ticker(t)
     inp = pb.load_inputs(t, contact_email(), 10)
     quarters = fb.parse_yahoo_quarters(tk.get_earnings_dates(limit=100))
-    ccy, annual = fb.annual_eps(inp["facts"])
+    ccy, annual, _ = fb.load_annual(inp)
     last_px = inp["hist"]["Close"].dropna().index[-1].date()
     lo = (date.fromisoformat(min(annual)) - timedelta(days=370)).isoformat()
     fx_daily = fb.fx_history(ccy, lo, (last_px + timedelta(days=1)).isoformat())
@@ -152,6 +152,7 @@ def main():
     ok, _ = fb.accepted_quarters(quarters, checks)
     stmt = fb.parse_statement_eps(tk.quarterly_income_stmt)
     prod_q, recon = fb.reconcile_statement(quarters, ok, stmt, ccy, fx_at)
+    ok = {d: u for d, u in ok.items() if d not in {r["date"] for r in recon["dropped"]}}
     closes = [(d.date(), float(v)) for d, v in inp["hist"]["Close"].dropna().items()]
     prod = {s["date"]: s for s in fb.build_series(prod_q, ok, closes, fx_at)}
 

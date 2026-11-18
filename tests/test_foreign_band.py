@@ -237,7 +237,7 @@ def test_reconcile_skips_when_scale_disagrees():
     assert q2 is ASML_Q and not info["fixed"] and "口径对不上" in info["skipped"]
     # 没放行的季度不对照
     _, info = fb.reconcile_statement(ASML_Q, {}, ASML_STMT, "EUR")
-    assert info == {"n": 0, "fixed": [], "skipped": None}
+    assert info == {"n": 0, "fixed": [], "dropped": [], "skipped": None}
 
 
 def test_original_vals_vs_restated():
@@ -291,3 +291,93 @@ def test_asml_tail_and_statement_fix(asml):
     # 当前 TTM（欧元）= 7.34 + 7.15 + 7.58 + 12.93；不修正是 11.82，PE 高估约 3%
     last4 = [x["eps"] for x in q2 if x["date"] >= "2026-01-01"]
     assert sum(last4) == pytest.approx(35.00)
+
+
+# ---- 拆股归一 / 两套 taxonomy 合并 / 换股比推断门槛 / 放行门槛（2026-11-19 多标的回测）----
+
+def _ann(rows):
+    """{年: (最新申报值, 最早申报值)} -> annual 结构。"""
+    return {f"{y}-12-31": {"val": v, "orig": o, "filed": f"{y + 3}-02-01",
+                           "first_filed": f"{y + 1}-02-01"} for y, (v, o) in rows.items()}
+
+
+def test_split_adjust_nvo_2_for_1():
+    # NVO 2023 年 1 拆 2：FY2023 年报把 2021/2022 重述成新股本，2016–2020 仍是旧股本
+    a = _ann({2019: (16.38, 16.38), 2020: (18.01, 18.01), 2021: (10.37, 20.74),
+              2022: (12.22, 24.44), 2023: (18.62, 18.62)})
+    out, ev = fb.split_adjust(a)
+    assert ev == [{"fy_end": "2021-12-31", "factor": 2}]
+    assert out["2019-12-31"]["val"] == pytest.approx(8.19) and out["2020-12-31"]["orig"] == pytest.approx(9.005)
+    assert out["2021-12-31"]["orig"] == 10.37          # 重述年份的旧股本原始值作废
+    assert out["2023-12-31"] == a["2023-12-31"] and a["2019-12-31"]["val"] == 16.38   # 不改入参
+
+
+def test_split_adjust_ignores_accounting_restatement():
+    # ASML ASC 606：3.44 -> 3.64 不是整数比，不是拆股
+    a = _ann({2015: (3.21, 3.21), 2016: (3.64, 3.44), 2017: (4.79, 4.91)})
+    out, ev = fb.split_adjust(a)
+    assert ev == [] and out["2016-12-31"]["orig"] == 3.44 and out["2015-12-31"]["val"] == 3.21
+
+
+def test_annual_eps_merges_gaap_and_ifrs_and_continuing_ops_tag():
+    def rows(y0, y1, v, filed_lag=1):
+        return [{"start": f"{y}-04-01", "end": f"{y + 1}-03-31", "val": v, "fp": "FY",
+                 "form": "20-F", "filed": f"{y + 1 + filed_lag}-06-20"} for y in range(y0, y1)]
+    gaap = {"EarningsPerShareDiluted": {"units": {"JPY/shares": rows(2015, 2021, 100.0)}}}
+    ifrs = {"DilutedEarningsLossPerShare": {"units": {"JPY/shares": rows(2020, 2025, 200.0, filed_lag=2)}}}
+    ccy, a = fb.annual_eps(gaap, ifrs)       # SONY/TM：US GAAP 到 2021、IFRS 从 2021 起
+    assert ccy == "JPY" and min(a) == "2016-03-31" and max(a) == "2025-03-31"
+    assert a["2021-03-31"]["val"] == 200.0   # 重叠年份取申报更晚的 IFRS
+    shel = {"DilutedEarningsLossPerShareFromContinuingOperations": {"units": {
+        "USD/shares": rows(2020, 2022, 6.0)}}}
+    assert fb.annual_eps(shel)[0] == "USD"
+
+
+def test_infer_ratio_needs_majority_support():
+    # SAP 型：Yahoo 是调整后 EPS，比值在 1.3–2.1 之间漂，只有一年碰巧落在 2 上 -> 不推断
+    qs, ann, fx = [], {}, {}
+    for y, k in zip(range(2016, 2022), (1.45, 1.26, 1.40, 1.98, 1.28, 1.49)):
+        for m in ("04-20", "07-20", "10-20"):
+            qs.append({"date": f"{y}-{m}", "eps": 1.0 * k})
+        qs.append({"date": f"{y + 1}-01-25", "eps": 1.0 * k})
+        ann[f"{y}-12-31"] = {"val": 4.0, "orig": 4.0}
+        fx[f"{y}-12-31"] = 1.0
+    assert fb.infer_ratio(qs, ann, fx, "USD") is None
+
+
+def _chk(fy, ok, yahoo=1.0):
+    return {"fy_end": fy, "ok": ok, "yahoo": yahoo, "dev": 0.0 if ok else 0.3,
+            "unit": "USD", "sec": 1.0}
+
+
+def test_accept_requires_newest_20f_checkable():
+    # TM 型：Yahoo 只有到 2013 年的季度，最新 20-F 是 2025 -> 不放行尾部
+    checks = [_chk("2013-03-31", True), _chk("2025-03-31", False, None)]
+    ok, why = fb.accepted_quarters([{"date": "2025-08-01", "eps": 1.0}], checks)
+    assert ok is None and "2013-03-31" in why
+
+
+def test_accept_requires_two_of_last_three():
+    qs = [{"date": "2026-04-20", "eps": 1.0}]
+    # SAP / SHEL 型：前两年对不上、最近一年碰巧过 -> 不放行
+    checks = [_chk("2023-12-31", False), _chk("2024-12-31", False), _chk("2025-12-31", True)]
+    ok, why = fb.accepted_quarters(qs, checks)
+    assert ok is None and "调整后" in why
+    checks[1] = _chk("2024-12-31", True)
+    ok, tail = fb.accepted_quarters(qs, checks)
+    assert ok is not None and tail == 1
+
+
+def test_reconcile_drops_sign_flip_and_huge_gaps():
+    # SONY 实测：公告值每 ADR 美元、财报每股日元；季末 2025-12 公告 +0.40、财报 −169.03
+    q = [{"date": "2025-11-10", "eps": 0.34}, {"date": "2026-02-04", "eps": 0.40},
+         {"date": "2026-05-07", "eps": 0.09}, {"date": "2026-07-30", "eps": 0.36},
+         {"date": "2026-11-05", "eps": 0.48}]
+    ok = dict.fromkeys((x["date"] for x in q), "USD")
+    stmt = {"2025-09-30": 60.1, "2025-12-31": -169.03, "2026-03-31": 13.89,
+            "2026-06-30": 57.82, "2026-09-30": 76.49}
+    q2, info = fb.reconcile_statement(q, ok, stmt, "JPY", fb.fx_lookup([(date(2025, 1, 1), 155.0)]))
+    assert [r["date"] for r in info["dropped"]] == ["2026-02-04"]
+    # 0.36 vs 57.82/155 = 0.373（差 3.5%，汇率口径噪音）不改；0.34 vs 0.388（差 12%）改用财报
+    assert [r["date"] for r in info["fixed"]] == ["2025-11-10"]
+    assert q2[3]["eps"] == 0.36 and q2[1]["eps"] == 0.40      # 剔除的季度不改值，由调用方去掉
