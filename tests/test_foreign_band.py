@@ -67,39 +67,40 @@ def test_quarters_of_year_assigns_q4_announced_after_year_end():
 
 
 def test_infer_ratio():
-    assert fb.infer_ratio(QS, ANNUAL, FX) == 5
+    assert fb.infer_ratio(QS, ANNUAL, FX, "TWD") == 5
     # 换算对不上任何整比例 -> 不推断
     assert fb.infer_ratio(QS, {k: dict(v, val=v["val"] * 0.89) for k, v in ANNUAL.items()},
-                          FX) is None
+                          FX, "TWD") is None
 
 
 def test_crosscheck_and_accept():
     annual = dict(ANNUAL)
     annual["2022-12-31"] = {"val": 30.0, "filed": "2023-04-15"}   # 该年 Yahoo 偏差 −20%
-    checks = fb.crosscheck(QS, annual, FX, 5)
+    checks = fb.crosscheck(QS, annual, FX, 5, "TWD")
     assert [c["ok"] for c in checks] == [True, False, True, True]
     assert checks[1]["why"] == "偏差超限" and checks[1]["dev"] == pytest.approx(-0.2)
     ok, tail = fb.accepted_quarters(QS, checks)
-    assert tail == 1 and "2025-04-17" in ok                 # 20-F 之后的季度放行
-    assert not ok & {"2022-04-14", "2022-07-14", "2022-10-13", "2023-01-12"}  # 整年剔
+    assert tail == 1 and ok["2025-04-17"] == "USD"          # 20-F 之后的季度放行，沿用币种
+    assert {c["unit"] for c in checks if c["ok"]} == {"USD"}
+    assert not ok.keys() & {"2022-04-14", "2022-07-14", "2022-10-13", "2023-01-12"}  # 整年剔
 
 
 def test_latest_checked_year_failing_refuses_whole_band():
     annual = dict(ANNUAL)
     annual["2024-12-31"] = {"val": 30.0, "filed": "2025-04-15"}
-    ok, why = fb.accepted_quarters(QS, fb.crosscheck(QS, annual, FX, 5))
+    ok, why = fb.accepted_quarters(QS, fb.crosscheck(QS, annual, FX, 5, "TWD"))
     assert ok is None and "2024-12-31" in why
 
 
 def test_crosscheck_incomplete_year():
-    checks = fb.crosscheck(QS[:-6], ANNUAL, FX, 5)   # FY2024 只剩 1 季
+    checks = fb.crosscheck(QS[:-6], ANNUAL, FX, 5, "TWD")   # FY2024 只剩 1 季
     assert checks[-1]["why"].startswith("Yahoo 该财年") and not checks[-1]["ok"]
     ok, why = fb.accepted_quarters([], [dict(c, yahoo=None) for c in checks])
     assert ok is None
 
 
 def test_build_series_no_lookahead_and_gap():
-    ok = {q["date"] for q in QS}
+    ok = dict.fromkeys((q["date"] for q in QS), "USD")
     days = [date(2022, 1, 12), date(2022, 1, 13), date(2022, 1, 14)]
     s = fb.build_series(QS, ok, [(d, 40.0) for d in days])
     # 2022-01-13 公告的第 4 季：当天不算已知，次日起才有 4 季 TTM
@@ -109,7 +110,8 @@ def test_build_series_no_lookahead_and_gap():
     gappy = [q for q in QS if q["date"] != "2021-10-14"]
     assert fb.build_series(gappy, ok, [(date(2022, 1, 14), 40.0)]) == []
     # 未放行的季度在窗口里 -> 不算
-    assert fb.build_series(QS, ok - {"2021-07-15"}, [(date(2022, 1, 14), 40.0)]) == []
+    del ok["2021-07-15"]
+    assert fb.build_series(QS, ok, [(date(2022, 1, 14), 40.0)]) == []
 
 
 def test_summarize_series_windows():
@@ -134,8 +136,44 @@ def test_summarize_series_windows():
 
 
 def test_source_note():
-    checks = fb.crosscheck(QS, ANNUAL, FX, 5)
+    checks = fb.crosscheck(QS, ANNUAL, FX, 5, "TWD")
     m = {"xcheck": {"ccy": "TWD", "ratio": 5, "ratio_inferred": False, "tail": 1,
                     "years": checks, "n_ok": 4, "n": 4}}
     s = fb.source_note(m)
     assert "4/4" in s and "1 ADR = 5 股" in s and "1 季年报未出" in s
+
+
+# ASML 型：Yahoo 近年给本币（欧元）EPS、早年给美元；20-F 欧元、1 ADR = 1 股
+EUR_FX = 0.9
+EQ = ([{"date": d, "eps": 1.0 / EUR_FX} for d in QDATES[:4]]          # FY2021：Yahoo 美元
+      + [{"date": d, "eps": 1.0} for d in QDATES[4:]])                # FY2022 起：Yahoo 欧元
+EANN = {f"{y}-12-31": {"val": 4.0, "filed": f"{y + 1}-04-15"} for y in (2021, 2022, 2023, 2024)}
+EFX = {e: EUR_FX for e in EANN}
+
+
+def test_local_currency_years_detected_per_year():
+    assert fb.infer_ratio(EQ, EANN, EFX, "EUR") == 1
+    checks = fb.crosscheck(EQ, EANN, EFX, 1, "EUR")
+    assert [c["unit"] for c in checks] == ["USD", "EUR", "EUR", "EUR"]
+    assert all(c["ok"] for c in checks)
+    ok, tail = fb.accepted_quarters(EQ, checks)
+    assert ok["2021-04-15"] == "USD" and ok["2023-04-20"] == "EUR" and ok["2025-04-17"] == "EUR"
+
+
+def test_local_quarters_converted_at_daily_fx():
+    ok = dict.fromkeys((q["date"] for q in EQ), "EUR")
+    fx_at = fb.fx_lookup([(date(2024, 1, 1), 0.8)])
+    d = date(2024, 2, 1)
+    s = fb.build_series(EQ, ok, [(d, 50.0)], fx_at)
+    # 最近 4 季 = 4.0 欧元 ÷ 当日 0.8 = 5.0 美元 -> PE 10
+    assert s[0]["ttm_eps"] == pytest.approx(5.0) and s[0]["pe_trailing"] == pytest.approx(10.0)
+    # 当日之前没有汇率 -> 这天跳过，不拿缺失当 1
+    assert fb.build_series(EQ, ok, [(d, 50.0)], fb.fx_lookup([(date(2024, 3, 1), 0.8)])) == []
+    assert fb.build_series(EQ, ok, [(d, 50.0)]) == []
+
+
+def test_fx_annual():
+    daily = [(date(2024, 1, 1) + timedelta(days=i), 0.9) for i in range(366)]
+    assert fb.fx_annual({"2024-12-31": {}}, daily, "EUR") == {"2024-12-31": pytest.approx(0.9)}
+    assert fb.fx_annual({"2024-12-31": {}}, daily[:100], "EUR") == {}
+    assert fb.fx_annual({"2024-12-31": {}}, [], "USD") == {"2024-12-31": 1.0}
