@@ -629,7 +629,10 @@ def load_inputs(ticker, email, years=5):
     # ifrs 是前者最强的形态证据。判据必须与上面 facts 的选择同为**真值**判断
     # （0022 C7）：空 us-gaap 桩 + 有数据的 ifrs-full 并存时，facts 取了 IFRS，
     # 按键存在判 taxonomy 会标成 us-gaap——外国发行人被分类成「历史太短」
-    return {"cik": cik, "facts": facts, "dei": allf.get("dei") or {},
+    # 另一套 taxonomy（两套都有数时）：SONY/TM 在 FY2021 由 US GAAP 换 IFRS，facts 取了
+    # us-gaap 就只到 2020/2021。pe_band 自己不用；foreign_band 拼年度 EPS 时要两套都看
+    alt = allf.get("ifrs-full") if facts is allf.get("us-gaap") else allf.get("us-gaap")
+    return {"cik": cik, "facts": facts, "facts_alt": alt or {}, "dei": allf.get("dei") or {},
             "hist": hist, "splits": splits, "years": years,
             "taxonomy": "us-gaap" if allf.get("us-gaap") else "ifrs-full"}
 

@@ -31,10 +31,23 @@ sys.path.insert(0, str(Path(__file__).resolve().parent))   # 与 pe_rank 同：�
 import pe_band as pb  # noqa: E402
 
 XCHECK_TOL = 0.05     # Yahoo 年度 4 季之和 vs 20-F 折算，汇率用年均价，季度汇率差在 1–2% 内
+STMT_TOL_LOCAL = 0.015  # 公告值 vs 财报季度 EPS（同币种）：只差四舍五入，ASML Q3'26 差 8.6% 必须抓到
+STMT_TOL_FX = 0.10      # 公告值是美元、财报是本币：按公告日汇率折算，汇率口径噪音几个点
+STMT_MAX_FIX = 0.25     # 差在这以内且同号才改用财报值；更大 / 反号 -> 这一季剔除
 Q_WIN_LAG = 70        # 财年 (end−365+LAG, end+LAG] 内公告的季度归该财年：Q4 最晚 end+70 天公告
 Q_GAP = (45, 140)     # 相邻两次公告的间隔（天）：超出 = 中间缺季，这扇 TTM 窗口不算
 NICE_RATIOS = (0.1, 0.2, 0.25, 0.5, 1, 2, 3, 4, 5, 6, 8, 10, 15, 20, 25, 30, 50, 100)
-ADR_RATIO = {"TSM": 5, "ASML": 1}   # 1 ADR = N 股普通股（20-F 封面）；表外的票按年度数推断并标注
+# 1 ADR = N 股普通股（20-F 封面，当前口径）；表外的票按年度数推断并标注
+ADR_RATIO = {"TSM": 5, "ASML": 1, "SAP": 1, "NVO": 1, "SONY": 1, "TM": 10, "BABA": 8,
+             "INFY": 1, "NVS": 1, "HSBC": 5, "SHEL": 2, "AZN": 0.5, "UL": 1, "RIO": 1}
+# 年度摊薄 EPS 科目：pe_band 的两个 + 只报持续经营口径的（SHEL）
+EPS_TAGS = pb.EPS_TAGS + ["DilutedEarningsLossPerShareFromContinuingOperations"]
+# 推断换股比：同一比例至少要在这么多年、且过半可比年份上就近落到整比例才认——SAP 的 Yahoo
+# 是调整后 EPS，比值在 1.3–2 间漂，只靠「最多票」会挑出 2，并让两年碰巧过核对
+INFER_MIN_YEARS = 3
+# 放行门槛：最近 RECENT_N 个可核对财年里至少 RECENT_MIN_OK 年通过（另要求最近一年本身通过、
+# 且就是最新一份 20-F 那年）
+RECENT_N, RECENT_MIN_OK = 3, 2
 
 
 def foreign_shape(inputs):
@@ -65,16 +78,94 @@ def parse_yahoo_quarters(df):
     return [{"date": d, "eps": v} for d, v in sorted(out.items())]
 
 
-def annual_eps(facts):
-    """20-F 年度摊薄 EPS -> (币种, {财年末: {"val", "filed"}})。本币优先：TSM 同时申报一条
-    USD/shares，那是按年末汇率的便利折算，不是交易口径。没有 -> (None, {})。纯函数。"""
-    units = {u for t in pb.EPS_TAGS for u in (facts.get(t) or {}).get("units", {})
+def annual_eps(facts, alt=None):
+    """20-F 年度摊薄 EPS -> (币种, {财年末: {"val", "filed", "orig"}})。纯函数。
+
+    本币优先：TSM 同时申报一条 USD/shares，那是按年末汇率的便利折算，不是交易口径。
+    alt = 另一套 taxonomy（load_inputs 的 facts_alt）：SONY/TM 在 FY2021 由 US GAAP 换 IFRS，
+    只看一套年度数就停在 2020/2021。两套按财年末合并，同一财年取申报更晚的那套。
+    科目再兜一个「持续经营摊薄 EPS」（SHEL 只报这个）。没有 -> (None, {})。"""
+    srcs = [f for f in (facts, alt) if f]
+    units = {u for f in srcs for t in EPS_TAGS for u in (f.get(t) or {}).get("units", {})
              if u.endswith("/shares")}
     for u in sorted(units, key=lambda u: u == "USD/shares"):
-        rows = pb.pick(facts, pb.EPS_TAGS, "annual", {u})
+        rows = {}
+        for f in srcs:
+            orig = _original_vals(f, u)
+            for e, r in pb.pick(f, EPS_TAGS, "annual", {u}).items():
+                r["orig"] = orig.get(e, r["val"])
+                if e not in rows or r["filed"] > rows[e]["filed"]:
+                    if e in rows:   # 原始值取两套里最早申报的
+                        r["orig"] = rows[e]["orig"] if rows[e]["first_filed"] <= r["first_filed"] \
+                            else r["orig"]
+                    rows[e] = r
         if rows:
-            return u.split("/")[0], rows
+            return u.split("/")[0], dict(sorted(rows.items()))
     return None, {}
+
+
+SPLIT_TOL = 0.02
+
+
+def load_annual(inputs):
+    """load_inputs 的结果 -> (币种, 归一到当前股本的年度 EPS, 拆股事件)。"""
+    ccy, annual = annual_eps(inputs["facts"], inputs.get("facts_alt"))
+    annual, splits = split_adjust(annual)
+    return ccy, annual, splits
+
+
+def split_adjust(annual):
+    """20-F 年度 EPS 归一到最新股本口径 -> (新 annual, [{"fy_end", "factor"}])。纯函数。
+
+    Yahoo 的公告值按拆股追溯调整过（每 ADR、当前口径），老年报不会：NVO 2023 年 1 拆 2 后，
+    2016–2020 年 Yahoo 恰好是 20-F 的一半；SONY 2024 年 1 拆 5、TM 2021 年 1 拆 5（ADR 换股
+    比 2→10，ADR 本身没拆）。拆股后的第一份年报会把比较期按新股本重述，所以同一财年
+    「最早申报值 ÷ 最新申报值」落在整数拆股比（±2%）上 = 拆股事件；比这批重述年份更早、
+    没被重述到的年份统一除以该比例，重述年份的原始值（旧股本）作废。会计重述（ASML ASC 606，
+    3.44→3.64）不是整数比，不受影响。多次拆股从新到旧逐次累乘。乘以**当前** ADR 换股比
+    之后即与 Yahoo 同口径（TM：重述后每股 × 10 = 拆股前每股 × 2）。"""
+    ends = sorted(annual)
+    out = {e: dict(annual[e]) for e in ends}
+    events = []
+    i = len(ends) - 1
+    while i >= 0:
+        r = out[ends[i]]
+        k = r["orig"] / r["val"] if r.get("orig") and r.get("val") else 1.0
+        f = next((s for s in (1.5, 2, 3, 4, 5, 8, 10, 20, 1 / 2, 1 / 3, 1 / 4, 1 / 5, 1 / 10)
+                  if abs(k / s - 1) <= SPLIT_TOL), None)
+        if f is None:
+            i -= 1
+            continue
+        j = i                               # 这次拆股重述到的最早一年
+        while j - 1 >= 0 and out[ends[j - 1]].get("orig") and out[ends[j - 1]]["val"] and \
+                abs(out[ends[j - 1]]["orig"] / out[ends[j - 1]]["val"] / f - 1) <= SPLIT_TOL:
+            j -= 1
+        for e in ends[j:i + 1]:
+            out[e]["orig"] = out[e]["val"]
+        for e in ends[:j]:
+            out[e]["val"] /= f
+            out[e]["orig"] /= f
+        events.append({"fy_end": ends[j], "factor": f})
+        i = j - 1
+    return out, events
+
+
+def _original_vals(facts, unit):
+    """{财年末: 最早一份 20-F 申报的值}。pick 的 val 取最新申报（重述后）；季报公告值是原始
+    口径，核对要能对原始值比——ASML 2018 年追溯采用 ASC 606，2016/2017 年 EPS 从 3.44/4.91
+    重述成 3.64/4.79，Yahoo 的季度和是 3.44/4.91。纯函数。"""
+    out = {}
+    for t in EPS_TAGS:
+        for f in ((facts.get(t) or {}).get("units") or {}).get(unit, []):
+            s, e = f.get("start"), f.get("end")
+            if not s or not e or f.get("fp", "FY") != "FY":
+                continue
+            if not 350 <= (date.fromisoformat(e) - date.fromisoformat(s)).days <= 380:
+                continue
+            k = (f.get("filed") or "9999", float(f["val"]))
+            if e not in out or k < out[e]:
+                out[e] = k
+    return {e: v for e, (_, v) in out.items()}
 
 
 def quarters_of_year(quarters, fy_end):
@@ -101,42 +192,54 @@ def _nice(k):
 def infer_ratio(quarters, annual, fx, ccy):
     """ADR 换股比推断：每个财年在两种币种假设下各算 Yahoo 4 季之和 ÷ 20-F，能就近落到「整」
     比例的记一票，取票数最多的比例；没有一年能落到整比例 -> None。纯函数。"""
-    votes = Counter()
+    votes, n = Counter(), 0
     for end, a in annual.items():
         qs = quarters_of_year(quarters, end)
         if len(qs) != 4 or not fx.get(end) or not a["val"]:
             continue
+        n += 1
         ys = sum(q["eps"] for q in qs)
-        for v in _hypotheses(a["val"], fx[end], ccy).values():
-            r = _nice(ys / v) if v else None
-            if r:
-                votes[r] += 1
-    return votes.most_common(1)[0][0] if votes else None
+        hits = set()
+        for b in {a["val"], a.get("orig") or a["val"]}:
+            for v in _hypotheses(b, fx[end], ccy).values():
+                r = _nice(ys / v) if v else None
+                if r:
+                    hits.add(r)
+        votes.update(hits)                  # 一年对一个比例只投一票
+    if not votes:
+        return None
+    r, k = votes.most_common(1)[0]
+    return r if k >= INFER_MIN_YEARS and k * 2 > n else None
 
 
 def crosscheck(quarters, annual, fx, ratio, ccy):
-    """逐财年核对 -> [{"fy_end", "unit", "sec", "yahoo", "dev", "ok", "why"}]：unit = 判定的
-    Yahoo 币种（偏差小的假设），sec = 20-F 折成该币种的每 ADR 值。凑不齐 4 季 / 缺汇率的年份
-    ok=False 并写 why。纯函数。"""
+    """逐财年核对 -> [{"fy_end", "unit", "basis", "sec", "yahoo", "dev", "ok", "why"}]：
+    unit = 判定的 Yahoo 币种，basis = 对上的是原始申报值还是重述后的值（两种币种 × 两种口径
+    取偏差最小的），sec = 20-F 折成该币种的每 ADR 值。凑不齐 4 季 / 缺汇率的年份 ok=False
+    并写 why。纯函数。"""
     out = []
     for end, a in annual.items():
         qs = quarters_of_year(quarters, end)
-        rec = {"fy_end": end, "unit": None, "sec": None, "yahoo": None, "dev": None, "ok": False}
+        rec = {"fy_end": end, "unit": None, "basis": None, "sec": None, "yahoo": None,
+               "dev": None, "ok": False}
         if len(qs) != 4:
             rec["why"] = f"Yahoo 该财年 {len(qs)} 季"
         elif not fx.get(end):
             rec["why"] = "缺年均汇率"
         else:
             ys = sum(q["eps"] for q in qs)
-            devs = {u: ys / (v * ratio) - 1 for u, v in _hypotheses(a["val"], fx[end], ccy).items()
-                    if v}
-            if not devs:
+            vals = {"重述后": a["val"]}
+            if a.get("orig") is not None and a["orig"] != a["val"]:
+                vals["原始"] = a["orig"]
+            cands = {(u, b): v * ratio for b, sv in vals.items()
+                     for u, v in _hypotheses(sv, fx[end], ccy).items() if v}
+            if not cands:
                 rec["why"] = "20-F EPS 为 0"
             else:
-                u = min(devs, key=lambda u: abs(devs[u]))
-                rec.update(unit=u, yahoo=ys, dev=devs[u],
-                           sec=_hypotheses(a["val"], fx[end], ccy)[u] * ratio,
-                           ok=abs(devs[u]) <= XCHECK_TOL)
+                (u, b), sec = min(cands.items(), key=lambda kv: abs(ys / kv[1] - 1))
+                dev = ys / sec - 1
+                rec.update(unit=u, basis=b, yahoo=ys, dev=dev, sec=sec,
+                           ok=abs(dev) <= XCHECK_TOL)
                 if not rec["ok"]:
                     rec["why"] = "偏差超限"
         out.append(rec)
@@ -150,9 +253,20 @@ def accepted_quarters(quarters, checks):
     if not checked:
         return None, "没有一年凑齐 4 季可与 20-F 核对"
     last = checked[-1]
+    newest = max(c["fy_end"] for c in checks)
+    if last["fy_end"] != newest:
+        # TM：Yahoo 在 FY2015–FY2025 一季都没有，「最近可核对年份」是 2013——拿它给 2025 年
+        # 之后的季度放行等于没核对
+        return None, (f"最新一份 20-F（FY 至 {newest}）Yahoo 凑不齐 4 季，最近能核对的是 "
+                      f"{last['fy_end']}，尾部季度无从担保")
     if not last["ok"]:
         return None, (f"最近可核对财年（至 {last['fy_end']}）Yahoo 与 20-F 偏差 "
                       f"{last['dev']:+.1%}，超出 ±{XCHECK_TOL:.0%}")
+    recent = checked[-RECENT_N:]
+    if sum(c["ok"] for c in recent) < min(RECENT_MIN_OK, len(recent)):
+        # SAP / SHEL：Yahoo 给的是调整后 EPS，前几年 +25%~+110% 对不上，最近一年碰巧在 5% 内
+        return None, (f"最近 {len(recent)} 个可核对财年只有 {sum(c['ok'] for c in recent)} 年"
+                      f"通过——Yahoo 口径不稳（多半是调整后 EPS），单年碰巧对上不算")
     ok = {q["date"]: c["unit"] for c in checks if c["ok"]
           for q in quarters_of_year(quarters, c["fy_end"])}
     tail_from = (date.fromisoformat(max(c["fy_end"] for c in checks))
@@ -160,6 +274,74 @@ def accepted_quarters(quarters, checks):
     tail = [q["date"] for q in quarters if q["date"] > tail_from]
     ok.update(dict.fromkeys(tail, last["unit"]))
     return ok, len(tail)
+
+
+def parse_statement_eps(df):
+    """yfinance quarterly_income_stmt -> {季末 ISO: 摊薄 EPS}（财报币种，Yahoo 已按每 ADR 给）。
+    NaN 丢掉；没有这一行 -> {}。纯函数。"""
+    if df is None or getattr(df, "empty", True) or "Diluted EPS" not in df.index:
+        return {}
+    out = {}
+    for c, v in df.loc["Diluted EPS"].items():
+        try:
+            f = float(v)
+        except (TypeError, ValueError):
+            continue
+        if f == f:
+            out[c.date().isoformat() if hasattr(c, "date") else str(c)[:10]] = f
+    return out
+
+
+def reconcile_statement(quarters, ok, stmt, ccy, fx_at=None):
+    """公告值（earnings dates）与 Yahoo 财报季度摊薄 EPS（另一路数据，覆盖最近约 5 季）逐季对照。
+
+    为什么要：年度核对管不到最新 20-F 之后的季度，也藏得住单季误差（2026-11 实测 ASML
+    Q3'26 公告值 11.82 欧元，6-K 与财报都是 12.93；Q4'21 公告值 3.93、6-K 4.38，那年合计
+    只差 −3% 照样过了年度核对）。财报这一路与 6-K 原文吻合，所以对不上时以它为准。
+    比较在公告值的币种里做：本币直接比（容差 STMT_TOL_LOCAL，只有四舍五入），美元按公告日
+    汇率把财报值换过来（容差 XCHECK_TOL）。先看口径：过半对照季吻合才算同一口径（每 ADR /
+    每股、币种都对），否则整路不用。纯函数。
+    差得少（≤ STMT_MAX_FIX 且同号）才改用财报值；差太多或正负相反 -> 记进 dropped，调用方
+    把这一季从放行集合里去掉。美元季的容差 STMT_TOL_FX 比年度核对宽：两路的汇率口径
+    （季均 vs 公告日）本身就差几个点，SONY 实测 0.36 vs 0.40。
+    -> (修正后的 quarters 副本, {"n", "fixed": [...], "dropped": [...], "skipped": 原因或 None})"""
+    pairs = []
+    for i, q in enumerate(quarters):
+        u = ok.get(q["date"])
+        if u is None:
+            continue
+        for end, s in stmt.items():
+            if 0 < (date.fromisoformat(q["date"]) - date.fromisoformat(end)).days <= Q_WIN_LAG:
+                if u == ccy:
+                    s_u, tol = s, STMT_TOL_LOCAL
+                else:
+                    r = fx_at(date.fromisoformat(q["date"])) if fx_at else None
+                    if not r:
+                        break
+                    s_u, tol = s / r, STMT_TOL_FX
+                pairs.append((i, end, s_u, tol))
+                break
+    info = {"n": len(pairs), "fixed": [], "dropped": [], "skipped": None}
+    if not pairs:
+        return quarters, info
+    agree = [abs(quarters[i]["eps"] / s - 1) <= tol for i, _, s, tol in pairs if s]
+    if sum(agree) * 2 <= len(pairs):          # 严格过半：2/4 吻合不足以证明同口径
+        info["skipped"] = f"财报季度 EPS 与公告值口径对不上（{sum(agree)}/{len(pairs)} 季吻合），未用"
+        return quarters, info
+    out = [dict(q) for q in quarters]
+    for i, end, s, tol in pairs:
+        if not s or abs(out[i]["eps"] / s - 1) <= tol:
+            continue
+        rec = {"date": out[i]["date"], "period_end": end, "yahoo": out[i]["eps"], "stmt": s,
+               "unit": ok[out[i]["date"]]}
+        if out[i]["eps"] * s > 0 and abs(out[i]["eps"] / s - 1) <= STMT_MAX_FIX:
+            info["fixed"].append(rec)
+            out[i]["eps"] = s
+        else:
+            # SONY 季末 2025-12：公告值 +0.40 美元、财报 −169 日元——差太多 / 正负相反，两路
+            # 都不敢信：这一季剔除（含它的 TTM 窗口不出点，网页 †），不拿哪一路去猜
+            info["dropped"].append(rec)
+    return out, info
 
 
 def fx_lookup(fx_daily):
@@ -283,7 +465,7 @@ def foreign_reading(t, inputs, tk, last_px_date, stale_days=7, min_days=250):
         quarters = parse_yahoo_quarters(tk.get_earnings_dates(limit=100))
         if len(quarters) < 4:
             return {"err": f"{t} Yahoo 季度 EPS 不足 4 季"}
-        ccy, annual = annual_eps(inputs["facts"])
+        ccy, annual, splits = load_annual(inputs)
         if not annual:
             return {"err": f"{t} 20-F 没有年度摊薄 EPS，无从核对 Yahoo 季度数"}
         lo = (date.fromisoformat(min(annual)) - timedelta(days=370)).isoformat()
@@ -298,8 +480,15 @@ def foreign_reading(t, inputs, tk, last_px_date, stale_days=7, min_days=250):
         ok, tail = accepted_quarters(quarters, checks)
         if ok is None:
             return {"err": f"{t} Yahoo 季度 EPS 未通过 20-F 核对：{tail}"}
+        fx_at = fx_lookup(fx_daily)
+        try:
+            stmt = parse_statement_eps(tk.quarterly_income_stmt)
+        except Exception:  # noqa: BLE001 —— 财报这一路取不到只是少一道对照
+            stmt = {}
+        quarters, recon = reconcile_statement(quarters, ok, stmt, ccy, fx_at)
+        ok = {d: u for d, u in ok.items() if d not in {r["date"] for r in recon["dropped"]}}
         closes = [(d.date(), float(v)) for d, v in inputs["hist"]["Close"].dropna().items()]
-        m = summarize_series(build_series(quarters, ok, closes, fx_lookup(fx_daily)),
+        m = summarize_series(build_series(quarters, ok, closes, fx_at),
                              last_px_date, stale_days=stale_days, min_days=min_days)
     except Exception as e:  # noqa: BLE001
         msg = str(e).splitlines()[0][:100] if str(e) else type(e).__name__
@@ -307,7 +496,15 @@ def foreign_reading(t, inputs, tk, last_px_date, stale_days=7, min_days=250):
     m["src"] = "yahoo"
     m["xcheck"] = {"ccy": ccy, "ratio": ratio, "ratio_inferred": inferred, "tail": tail,
                    "years": checks[-6:], "n_ok": sum(c["ok"] for c in checks),
-                   "n": len(checks), "units": sorted({c["unit"] for c in checks if c["ok"]})}
+                   "n": len(checks), "units": sorted({c["unit"] for c in checks if c["ok"]}),
+                   "splits": splits,
+                   "stmt": recon}
+    # 一致预期（earnings_estimate / eps_trend）与公告值同属 Yahoo 分析师口径、币种相同（ASML
+    # 季度预期 10.76 vs 实际 12.93 都是欧元；TSM 4.52 vs 4.60 都是每 ADR 美元）：最新一季的币种
+    # 就是前瞻 PE 分母的币种。pe_rank 用它把一致预期折成美元，不然美元收盘 ÷ 欧元 EPS
+    last_unit = ok.get(quarters[-1]["date"]) if quarters else None
+    m["xcheck"]["eps_ccy"] = last_unit
+    m["xcheck"]["fx_now"] = (fx_at(last_px_date) if last_unit and last_unit != "USD" else None)
     return m
 
 
@@ -324,9 +521,22 @@ def source_note(m):
     s = (f"外国发行人（20-F 无季度 XBRL）：TTM 分子 = Yahoo 季度 EPS（每 ADR，{unit_s}），"
          f"经 20-F 年度 EPS 核对 {x['n_ok']}/{x['n']} 年通过（±{XCHECK_TOL:.0%}，"
          f"{x['ccy']} 按年均汇率、1 ADR = {x['ratio']:g} 股{'（推断）' if x['ratio_inferred'] else ''}）")
+    for sp in x.get("splits") or []:
+        s += f"；20-F 年度数已按拆股归一（{sp['fy_end'][:4]} 年起重述，比例 {sp['factor']:g}）"
     if last:
         s += (f"；最近核对 FY 至 {last['fy_end']}：Yahoo {last['yahoo']:.2f} vs 20-F "
               f"{last['sec']:.2f} {last.get('unit') or ''}").rstrip()
     if x["tail"]:
         s += f"；20-F 之后 {x['tail']} 季年报未出、暂未核对"
+    st = x.get("stmt") or {}
+    if st.get("skipped"):
+        s += f"；{st['skipped']}"
+    elif st.get("n"):
+        s += f"；最近 {st['n']} 季已与 Yahoo 财报季度摊薄 EPS 逐季对照"
+        for f in st["fixed"]:
+            s += (f"，季末 {f['period_end']} 公告值 {f['yahoo']:.2f} ≠ 财报 {f['stmt']:.2f}"
+                  f" {f['unit']}，采用财报")
+        for f in st.get("dropped") or []:
+            s += (f"，季末 {f['period_end']} 公告值 {f['yahoo']:.2f} 与财报 {f['stmt']:.2f}"
+                  f" {f['unit']} 差太多，该季剔除（含它的 TTM 窗口不出点）")
     return s + "。营业线 / 一次性项还原不适用"

@@ -1,7 +1,9 @@
 # -*- coding: utf-8 -*-
 """外国发行人 TTM PE 兜底（valuation/foreign_band.py）的纯函数：形态判定、20-F 核对、
 防前视的逐日 TTM、窗口分位。联网部分（Yahoo earnings dates / 汇率）不在这里测。"""
+import json
 from datetime import date, timedelta
+from pathlib import Path
 
 import pandas as pd
 import pytest
@@ -185,3 +187,206 @@ def test_sanity_fx_catches_inverted_quote():
     fb.sanity_fx(32.943, None, "TWD")             # 对照取不到不拦
     with pytest.raises(RuntimeError):
         fb.sanity_fx(1.09721, 1.09721, "EUR")     # 拿反了：本该 0.91 却是 1.10
+
+
+def _stmt_df(vals):
+    cols = pd.to_datetime(list(vals))
+    return pd.DataFrame([list(vals.values())], index=["Diluted EPS"], columns=cols)
+
+
+def test_parse_statement_eps():
+    df = _stmt_df({"2026-09-30": 12.93, "2026-06-30": float("nan")})
+    assert fb.parse_statement_eps(df) == {"2026-09-30": 12.93}
+    assert fb.parse_statement_eps(None) == {}
+    assert fb.parse_statement_eps(pd.DataFrame(index=["Net Income"])) == {}
+
+
+# 2026-11 实测 ASML：公告值 Q3'26 11.82，财报与 6-K 都是 12.93；其余四季两路一致
+ASML_Q = [{"date": "2025-10-15", "eps": 5.49}, {"date": "2026-01-27", "eps": 7.34},
+          {"date": "2026-04-14", "eps": 7.15}, {"date": "2026-07-13", "eps": 7.58},
+          {"date": "2026-10-14", "eps": 11.82}]
+ASML_STMT = {"2025-09-30": 5.48, "2025-12-31": 7.34, "2026-03-31": 7.15,
+             "2026-06-30": 7.58, "2026-09-30": 12.93}
+
+
+def test_reconcile_fixes_bad_quarter_in_local_currency():
+    ok = dict.fromkeys((q["date"] for q in ASML_Q), "EUR")
+    q2, info = fb.reconcile_statement(ASML_Q, ok, ASML_STMT, "EUR")
+    assert info["n"] == 5 and info["skipped"] is None
+    assert [f["date"] for f in info["fixed"]] == ["2026-10-14"]   # 5.49 vs 5.48 是四舍五入，不改
+    assert q2[-1]["eps"] == 12.93 and ASML_Q[-1]["eps"] == 11.82   # 不改原列表
+
+
+def test_reconcile_usd_quarters_via_fx():
+    # TSM 型：公告值每 ADR 美元，财报每 ADR 台币
+    q = [{"date": "2026-07-16", "eps": 4.31}, {"date": "2026-10-15", "eps": 4.60}]
+    ok = dict.fromkeys((x["date"] for x in q), "USD")
+    stmt = {"2026-06-30": 4.31 * 32, "2026-09-30": 4.60 * 32}
+    q2, info = fb.reconcile_statement(q, ok, stmt, "TWD", fb.fx_lookup([(date(2026, 1, 1), 32.0)]))
+    assert info["n"] == 2 and not info["fixed"] and q2 == q
+    # 没汇率 -> 美元季度不对照
+    _, info = fb.reconcile_statement(q, ok, stmt, "TWD")
+    assert info["n"] == 0
+
+
+def test_reconcile_skips_when_scale_disagrees():
+    # 财报给的是每普通股（差一个换股比 5）：多数季对不上 = 口径不同，整路不用，不能全改
+    ok = dict.fromkeys((q["date"] for q in ASML_Q), "EUR")
+    stmt = {k: v / 5 for k, v in ASML_STMT.items()}
+    q2, info = fb.reconcile_statement(ASML_Q, ok, stmt, "EUR")
+    assert q2 is ASML_Q and not info["fixed"] and "口径对不上" in info["skipped"]
+    # 没放行的季度不对照
+    _, info = fb.reconcile_statement(ASML_Q, {}, ASML_STMT, "EUR")
+    assert info == {"n": 0, "fixed": [], "dropped": [], "skipped": None}
+
+
+def test_original_vals_vs_restated():
+    def row(v, filed):
+        return {"start": "2016-01-01", "end": "2016-12-31", "val": v, "fp": "FY",
+                "form": "20-F", "filed": filed}
+    facts = {"EarningsPerShareDiluted": {"units": {"EUR/shares": [
+        row(3.64, "2019-02-06"), row(3.44, "2017-02-08"), row(3.44, "2018-02-07")]}}}
+    ccy, a = fb.annual_eps(facts)
+    assert a["2016-12-31"]["val"] == 3.64 and a["2016-12-31"]["orig"] == 3.44
+
+
+# ---- ASML 真实数据回归（tests/fixtures/asml_foreign_band.json，2026-11-18 快照）----
+# 独立验算见 docs/asml_pe_verification.md（scripts/verify_foreign_6k.py，6-K 原文对照）
+
+@pytest.fixture(scope="module")
+def asml():
+    p = Path(__file__).parent / "fixtures" / "asml_foreign_band.json"
+    return json.loads(p.read_text(encoding="utf-8"))
+
+
+def test_asml_crosscheck_regression(asml):
+    q, a, fx = asml["quarters"], asml["annual"], asml["fx"]
+    assert fb.infer_ratio(q, a, fx, "EUR") == 1
+    checks = {c["fy_end"][:4]: c for c in fb.crosscheck(q, a, fx, 1, "EUR")}
+    # 2011：Yahoo 美元数整体偏低（6-K 对照 −7%~−10%）-> 剔除；不能靠放宽容差放进来
+    assert not checks["2011"]["ok"] and checks["2011"]["unit"] == "USD"
+    # 2013 年起 Yahoo 改给欧元；之前美元
+    assert checks["2012"]["unit"] == "USD"
+    assert all(checks[str(y)]["unit"] == "EUR" for y in range(2013, 2026))
+    # ASC 606 追溯重述：2016/2017 对的是 20-F 原始申报值（3.44/4.91），不是重述后的 3.64/4.79
+    for y, v in (("2016", 3.44), ("2017", 4.91)):
+        assert checks[y]["ok"] and checks[y]["basis"] == "原始"
+        assert checks[y]["sec"] == pytest.approx(v)
+    # 2014 年起每年都过、且（2021 除外）与 20-F 差在四舍五入以内
+    for y in range(2014, 2026):
+        c = checks[str(y)]
+        assert c["ok"], y
+        if y != 2021:
+            assert abs(c["dev"]) < 0.006, (y, c["dev"])
+    # 2021：Yahoo 把 Q4'21 记成 3.93（6-K 4.38），年度合计 −3.0% 仍在容差内——已知残留
+    assert checks["2021"]["dev"] == pytest.approx(-0.030, abs=0.001)
+
+
+def test_asml_tail_and_statement_fix(asml):
+    q, a, fx = asml["quarters"], asml["annual"], asml["fx"]
+    ok, tail = fb.accepted_quarters(q, fb.crosscheck(q, a, fx, 1, "EUR"))
+    assert tail == 3 and all(ok[d] == "EUR" for d in ("2026-04-14", "2026-07-13", "2026-10-14"))
+    q2, info = fb.reconcile_statement(q, ok, ASML_STMT, "EUR")
+    assert [f["date"] for f in info["fixed"]] == ["2026-10-14"]
+    # 当前 TTM（欧元）= 7.34 + 7.15 + 7.58 + 12.93；不修正是 11.82，PE 高估约 3%
+    last4 = [x["eps"] for x in q2 if x["date"] >= "2026-01-01"]
+    assert sum(last4) == pytest.approx(35.00)
+
+
+# ---- 拆股归一 / 两套 taxonomy 合并 / 换股比推断门槛 / 放行门槛（2026-11-19 多标的回测）----
+
+def _ann(rows):
+    """{年: (最新申报值, 最早申报值)} -> annual 结构。"""
+    return {f"{y}-12-31": {"val": v, "orig": o, "filed": f"{y + 3}-02-01",
+                           "first_filed": f"{y + 1}-02-01"} for y, (v, o) in rows.items()}
+
+
+def test_split_adjust_nvo_2_for_1():
+    # NVO 2023 年 1 拆 2：FY2023 年报把 2021/2022 重述成新股本，2016–2020 仍是旧股本
+    a = _ann({2019: (16.38, 16.38), 2020: (18.01, 18.01), 2021: (10.37, 20.74),
+              2022: (12.22, 24.44), 2023: (18.62, 18.62)})
+    out, ev = fb.split_adjust(a)
+    assert ev == [{"fy_end": "2021-12-31", "factor": 2}]
+    assert out["2019-12-31"]["val"] == pytest.approx(8.19) and out["2020-12-31"]["orig"] == pytest.approx(9.005)
+    assert out["2021-12-31"]["orig"] == 10.37          # 重述年份的旧股本原始值作废
+    assert out["2023-12-31"] == a["2023-12-31"] and a["2019-12-31"]["val"] == 16.38   # 不改入参
+
+
+def test_split_adjust_ignores_accounting_restatement():
+    # ASML ASC 606：3.44 -> 3.64 不是整数比，不是拆股
+    a = _ann({2015: (3.21, 3.21), 2016: (3.64, 3.44), 2017: (4.79, 4.91)})
+    out, ev = fb.split_adjust(a)
+    assert ev == [] and out["2016-12-31"]["orig"] == 3.44 and out["2015-12-31"]["val"] == 3.21
+
+
+def test_annual_eps_merges_gaap_and_ifrs_and_continuing_ops_tag():
+    def rows(y0, y1, v, filed_lag=1):
+        return [{"start": f"{y}-04-01", "end": f"{y + 1}-03-31", "val": v, "fp": "FY",
+                 "form": "20-F", "filed": f"{y + 1 + filed_lag}-06-20"} for y in range(y0, y1)]
+    gaap = {"EarningsPerShareDiluted": {"units": {"JPY/shares": rows(2015, 2021, 100.0)}}}
+    ifrs = {"DilutedEarningsLossPerShare": {"units": {"JPY/shares": rows(2020, 2025, 200.0, filed_lag=2)}}}
+    ccy, a = fb.annual_eps(gaap, ifrs)       # SONY/TM：US GAAP 到 2021、IFRS 从 2021 起
+    assert ccy == "JPY" and min(a) == "2016-03-31" and max(a) == "2025-03-31"
+    assert a["2021-03-31"]["val"] == 200.0   # 重叠年份取申报更晚的 IFRS
+    shel = {"DilutedEarningsLossPerShareFromContinuingOperations": {"units": {
+        "USD/shares": rows(2020, 2022, 6.0)}}}
+    assert fb.annual_eps(shel)[0] == "USD"
+
+
+def test_infer_ratio_needs_majority_support():
+    # SAP 型：Yahoo 是调整后 EPS，比值在 1.3–2.1 之间漂，只有一年碰巧落在 2 上 -> 不推断
+    qs, ann, fx = [], {}, {}
+    for y, k in zip(range(2016, 2022), (1.45, 1.26, 1.40, 1.98, 1.28, 1.49)):
+        for m in ("04-20", "07-20", "10-20"):
+            qs.append({"date": f"{y}-{m}", "eps": 1.0 * k})
+        qs.append({"date": f"{y + 1}-01-25", "eps": 1.0 * k})
+        ann[f"{y}-12-31"] = {"val": 4.0, "orig": 4.0}
+        fx[f"{y}-12-31"] = 1.0
+    assert fb.infer_ratio(qs, ann, fx, "USD") is None
+
+
+def _chk(fy, ok, yahoo=1.0):
+    return {"fy_end": fy, "ok": ok, "yahoo": yahoo, "dev": 0.0 if ok else 0.3,
+            "unit": "USD", "sec": 1.0}
+
+
+def test_accept_requires_newest_20f_checkable():
+    # TM 型：Yahoo 只有到 2013 年的季度，最新 20-F 是 2025 -> 不放行尾部
+    checks = [_chk("2013-03-31", True), _chk("2025-03-31", False, None)]
+    ok, why = fb.accepted_quarters([{"date": "2025-08-01", "eps": 1.0}], checks)
+    assert ok is None and "2013-03-31" in why
+
+
+def test_accept_requires_two_of_last_three():
+    qs = [{"date": "2026-04-20", "eps": 1.0}]
+    # SAP / SHEL 型：前两年对不上、最近一年碰巧过 -> 不放行
+    checks = [_chk("2023-12-31", False), _chk("2024-12-31", False), _chk("2025-12-31", True)]
+    ok, why = fb.accepted_quarters(qs, checks)
+    assert ok is None and "调整后" in why
+    checks[1] = _chk("2024-12-31", True)
+    ok, tail = fb.accepted_quarters(qs, checks)
+    assert ok is not None and tail == 1
+
+
+def test_reconcile_drops_sign_flip_and_huge_gaps():
+    # SONY 实测：公告值每 ADR 美元、财报每股日元；季末 2025-12 公告 +0.40、财报 −169.03
+    q = [{"date": "2025-11-10", "eps": 0.34}, {"date": "2026-02-04", "eps": 0.40},
+         {"date": "2026-05-07", "eps": 0.09}, {"date": "2026-07-30", "eps": 0.36},
+         {"date": "2026-11-05", "eps": 0.48}]
+    ok = dict.fromkeys((x["date"] for x in q), "USD")
+    stmt = {"2025-09-30": 60.1, "2025-12-31": -169.03, "2026-03-31": 13.89,
+            "2026-06-30": 57.82, "2026-09-30": 76.49}
+    q2, info = fb.reconcile_statement(q, ok, stmt, "JPY", fb.fx_lookup([(date(2025, 1, 1), 155.0)]))
+    assert [r["date"] for r in info["dropped"]] == ["2026-02-04"]
+    # 0.36 vs 57.82/155 = 0.373（差 3.5%，汇率口径噪音）不改；0.34 vs 0.388（差 12%）改用财报
+    assert [r["date"] for r in info["fixed"]] == ["2025-11-10"]
+    assert q2[3]["eps"] == 0.36 and q2[1]["eps"] == 0.40      # 剔除的季度不改值，由调用方去掉
+
+
+def test_reconcile_requires_strict_majority():
+    # 4 季里只有 2 季吻合 = 口径没被证明，不能拿它去改另外 2 季
+    q = ASML_Q[1:]
+    ok = dict.fromkeys((x["date"] for x in q), "EUR")
+    stmt = {"2025-12-31": 7.34, "2026-03-31": 7.15, "2026-06-30": 9.99, "2026-09-30": 12.93}
+    q2, info = fb.reconcile_statement(q, ok, stmt, "EUR")
+    assert q2 is q and not info["fixed"] and "2/4" in info["skipped"]

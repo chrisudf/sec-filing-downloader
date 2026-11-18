@@ -604,3 +604,38 @@ def test_tickers_run_does_not_clobber_full_table(monkeypatch, tmp_path):
     assert full.read_text(encoding="utf-8") == full_text    # 整表没被覆盖
     assert '"GLD"' in full_text
     assert '"GLD"' not in (out / manual[1]).read_text(encoding="utf-8")
+
+
+# ---- 一致预期折美元（外国发行人：Yahoo 一致预期与公告值同币种）----
+
+CONS_EUR = {"fy1": {"avg": 41.41, "low": 37.12, "high": 43.77, "n": 24},
+            "fy2": {"avg": 56.43, "low": 37.43, "high": 63.89, "n": 27}}
+TREND_EUR = {"+1y": {"current": 56.43, "30daysAgo": 51.73}}
+
+
+def _foreign_row(ccy, fx):
+    return {"gaap": {"src": "yahoo", "xcheck": {"eps_ccy": ccy, "fx_now": fx}}}
+
+
+def test_consensus_in_usd_converts_eur():
+    cons, trend, why = pr.consensus_in_usd(_foreign_row("EUR", 0.9114), CONS_EUR, TREND_EUR)
+    assert cons["fy2"]["avg"] == pytest.approx(56.43 / 0.9114)
+    assert cons["fy2"]["high"] == pytest.approx(63.89 / 0.9114) and cons["fy2"]["n"] == 27
+    assert trend["+1y"]["current"] / trend["+1y"]["30daysAgo"] == pytest.approx(56.43 / 51.73)
+    assert "EUR" in why
+    fw = pr.forward(1383.11, cons)
+    # ASML 2026-11-18：美元收盘 ÷ 欧元 EPS 是 24.5x，折美元后约 22.3x
+    assert fw["fy2_pe"] == pytest.approx(1383.11 / (56.43 / 0.9114))
+    assert 22.0 < fw["fy2_pe"] < 22.6
+    assert CONS_EUR["fy2"]["avg"] == 56.43          # 不改入参
+
+
+def test_consensus_in_usd_passthrough_and_refusals():
+    # 美股（没有兜底读数）/ 兜底判定为美元（TSM）：原样
+    assert pr.consensus_in_usd({"gaap": {"pe": 20}}, CONS_EUR, None) == (CONS_EUR, None, None)
+    assert pr.consensus_in_usd(_foreign_row("USD", None), CONS_EUR, None)[0] is CONS_EUR
+    # 非美元但没有当日汇率 / 外国发行人兜底没出数：不出前瞻 PE，不拿混币种的数凑
+    cons, _, why = pr.consensus_in_usd(_foreign_row("EUR", None), CONS_EUR, None)
+    assert cons is None and "EUR" in why
+    cons, _, why = pr.consensus_in_usd({"gaap": {"err": "x"}}, CONS_EUR, None, foreign=True)
+    assert cons is None and "币种" in why
