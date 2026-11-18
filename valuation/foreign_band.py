@@ -239,12 +239,29 @@ def summarize_series(series, last_px_date, key="pe_trailing", stale_days=7, min_
 # ---- 联网 ----
 
 def fx_history(ccy, start, end):
-    """[(date, 1 美元 = ? 本币)] 日序列（yfinance 的 {ccy}=X）。USD -> []。"""
+    """[(date, 1 美元 = ? 本币)] 日序列（yfinance 的 {ccy}=X）。USD -> []。
+
+    方向：Yahoo 的 {ccy}=X 对所有币种都是「1 美元 = ? 本币」（2026-11-18 实测 EUR=X 0.911、
+    TWD=X 32.9、GBP=X 0.759、JPY=X 159.4；对应 {ccy}USD=X 是倒数 1.097 / 0.0304 / 1.317）。
+    本模块一律「本币 ÷ 汇率 = 美元」。fetch_facts 用的是 {ccy}USD=X（美元/本币，乘）——两边
+    方向相反但各自自洽，不要混用；sanity_fx 兜住拿错报价的情况。"""
     if ccy == "USD":
         return []
     import yfinance as yf
     px = yf.Ticker(f"{ccy}=X").history(start=start, end=end)["Close"].dropna()
-    return [(d.date(), float(v)) for d, v in px.items()]
+    out = [(d.date(), float(v)) for d, v in px.items()]
+    if out:
+        inv = yf.Ticker(f"{ccy}USD=X").history(period="5d")["Close"].dropna()
+        sanity_fx(out[-1][1], float(inv.iloc[-1]) if len(inv) else None, ccy)
+    return out
+
+
+def sanity_fx(local_per_usd, usd_per_local, ccy, tol=0.05):
+    """{ccy}=X 与 {ccy}USD=X 应互为倒数：不是 -> 报价方向拿错了，抛 RuntimeError（整组不出，
+    不带着反向汇率往下算）。对照取不到时不拦。纯函数。"""
+    if usd_per_local and abs(local_per_usd * usd_per_local - 1) > tol:
+        raise RuntimeError(f"{ccy} 汇率方向对不上：{ccy}=X {local_per_usd:.5g} × "
+                           f"{ccy}USD=X {usd_per_local:.5g} ≠ 1")
 
 
 def fx_annual(annual, fx_daily, ccy):

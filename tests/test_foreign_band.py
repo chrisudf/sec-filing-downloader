@@ -177,3 +177,11 @@ def test_fx_annual():
     assert fb.fx_annual({"2024-12-31": {}}, daily, "EUR") == {"2024-12-31": pytest.approx(0.9)}
     assert fb.fx_annual({"2024-12-31": {}}, daily[:100], "EUR") == {}
     assert fb.fx_annual({"2024-12-31": {}}, [], "USD") == {"2024-12-31": 1.0}
+
+
+def test_sanity_fx_catches_inverted_quote():
+    fb.sanity_fx(0.9114, 1.09721, "EUR")          # 实测：互为倒数，放行
+    fb.sanity_fx(32.943, 0.03036, "TWD")
+    fb.sanity_fx(32.943, None, "TWD")             # 对照取不到不拦
+    with pytest.raises(RuntimeError):
+        fb.sanity_fx(1.09721, 1.09721, "EUR")     # 拿反了：本该 0.91 却是 1.10

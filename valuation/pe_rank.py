@@ -37,8 +37,8 @@ pe_rank_YYYY-MM-DD-manual.*，网页不读，也不会覆盖当天的整表。
     且一致预期较 30 天前下降）= 分母在被下修，下财年 PE 偏低、便宜得不实。只看家数会误标：
     2026-10-11 实跑 TSLA ↑1/↓4 但一致预期 +1.1%，RKLB ↑2/↓6 但亏损在收窄。下财年 PE 为空
     （亏损）不标——没有「便宜」可言。与 ⚠（本财年预期的一次性判据）是两个独立标记。
-  ʸ —— 外国发行人（20-F，无季度 XBRL，TSM）：TTM PE 这组的分子换成 Yahoo 季度 EPS，经 20-F
-    年度 EPS 逐年核对（foreign_band.py）。整条带同一来源，不与 SEC 季度数拼接；只在外国发行人
+  ʸ —— 外国发行人（20-F，无季度 XBRL，TSM/ASML）：TTM PE 这组的分子换成 Yahoo 季度 EPS（币种逐年
+    判定：美元或本币，本币按当日汇率换美元），经 20-F 年度 EPS 逐年核对（foreign_band.py）。整条带同一来源，不与 SEC 季度数拼接；只在外国发行人
     形态启用，取数失败不换源。营业线那组仍为 n/a（Yahoo 无季度营业利润长历史）。
   分位与前瞻 PE 回答的是两个问题（历史位置 vs 预期兑现后的倍数），要一起读。
 """
@@ -565,7 +565,7 @@ def render(rows, asof, intraday=False):
           "（亏损股报绝对值），只做展示、未经回测；"
           f"↓ = 分母在被下修（下调 ≥{REV_MIN_DOWN} 家且多于上调、一致预期下降，两个都要）；"
           "Yahoo tPE = Yahoo 的 GAAP TTM PE，只做对账（和 TTM 原值差很多 = 有一次性项）；"
-          "ʸ = 外国发行人（20-F 无季度 XBRL），TTM 分子为 Yahoo 季度 EPS、经 20-F 年度数核对。"
+          "ʸ = 外国发行人（20-F 无季度 XBRL），TTM 分子为 Yahoo 季度 EPS（币种逐年判定）、经 20-F 年度数核对。"
           "口径细节见 valuation/pe_rank.py 文件头。", ""]
     if intraday:
         md += [f"**{INTRADAY_NOTE}**", ""]
