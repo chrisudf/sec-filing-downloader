@@ -400,6 +400,12 @@ def foreign_reading(t, inputs, tk, last_px_date, stale_days=7, min_days=250):
                    "years": checks[-6:], "n_ok": sum(c["ok"] for c in checks),
                    "n": len(checks), "units": sorted({c["unit"] for c in checks if c["ok"]}),
                    "stmt": recon}
+    # 一致预期（earnings_estimate / eps_trend）与公告值同属 Yahoo 分析师口径、币种相同（ASML
+    # 季度预期 10.76 vs 实际 12.93 都是欧元；TSM 4.52 vs 4.60 都是每 ADR 美元）：最新一季的币种
+    # 就是前瞻 PE 分母的币种。pe_rank 用它把一致预期折成美元，不然美元收盘 ÷ 欧元 EPS
+    last_unit = ok.get(quarters[-1]["date"]) if quarters else None
+    m["xcheck"]["eps_ccy"] = last_unit
+    m["xcheck"]["fx_now"] = (fx_at(last_px_date) if last_unit and last_unit != "USD" else None)
     return m
 
 

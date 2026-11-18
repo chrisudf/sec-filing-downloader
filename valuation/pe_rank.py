@@ -411,6 +411,36 @@ def forward(close, cons):
     return out
 
 
+def consensus_in_usd(row, cons, trend, foreign=False):
+    """一致预期折成美元 -> (cons, trend, 脚注或 None)。纯函数。
+
+    Yahoo 的一致预期跟公告值同币种，外国发行人不一定是美元（ASML 是欧元：FY27 €56.43，
+    直接拿美元收盘去除，下财年 PE 24.5x，折美元后 22.3x）。币种取外国发行人兜底判定的
+    最新一季币种（row["gaap"]["xcheck"]["eps_ccy"]），按当日汇率（1 美元 = fx 本币）折算；
+    美股 / 兜底判定为美元的原样返回。外国发行人但币种判定不了 -> 不出前瞻 PE（cons=None），
+    不带着可能混币种的数往下算。"""
+    g = row.get("gaap") or {}
+    x = g.get("xcheck") if g.get("src") == "yahoo" else None
+    if x is None:
+        if foreign:
+            return None, trend, "外国发行人的一致预期币种无从判定（Yahoo 季度兜底未出数），前瞻 PE 不出"
+        return cons, trend, None
+    ccy, fx = x.get("eps_ccy"), x.get("fx_now")
+    if ccy in (None, "USD"):
+        return cons, trend, None
+    if not fx:
+        return None, trend, f"一致预期是 {ccy}、取不到当日汇率，前瞻 PE 不出"
+
+    def cv(v):
+        return v / fx if isinstance(v, (int, float)) and v == v else v
+    cons = {k: {f: (cv(v) if f in ("avg", "low", "high") else v) for f, v in c.items()}
+            for k, c in cons.items()}
+    if trend:
+        trend = {p: {c: cv(v) for c, v in d.items()} for p, d in trend.items()}
+    return cons, trend, (f"一致预期为 {ccy}（Yahoo 与公告值同币种），按当日汇率 1 美元 = "
+                         f"{fx:.4f} {ccy} 折成美元后再算本财年 / 下财年 PE")
+
+
 def yahoo_info(t):
     import yfinance as yf
     try:
@@ -472,7 +502,10 @@ def collect(t, kind, email):
             row["notes"].append(m["src_note"])
     try:
         cons, trend, _ = fetch_consensus(t, tk)
-        row["fwd"] = forward(row["close"], cons)
+        cons, trend, why = consensus_in_usd(row, cons, trend, foreign=fb.foreign_shape(inputs))
+        if why:
+            row["notes"].append(why)
+        row["fwd"] = forward(row["close"], cons) if cons is not None else {}
         flag = one_time_flag(trend)
         if flag:
             row["fwd"]["fy1_suspect"] = flag
@@ -480,7 +513,13 @@ def collect(t, kind, email):
     except (SystemExit, Exception) as e:   # fetch_consensus 取不到时 raise SystemExit
         row["fwd"] = {}
         row["notes"].append(f"一致预期取不到：{str(e).splitlines()[0][:80]}")
-    apply_revisions(row, revisions(t, tk))
+    rev = revisions(t, tk)
+    x = (row["gaap"].get("xcheck") or {}) if row["gaap"].get("src") == "yahoo" else {}
+    if x.get("eps_ccy") not in (None, "USD") and x.get("fx_now") and "err" not in rev:
+        # 家数和百分比与币种无关；亏损股显示的绝对值 a→b 要和前瞻 PE 同一币种
+        rev = {k: (v / x["fx_now"] if k in ("eps", "eps_30d") and v is not None else v)
+               for k, v in rev.items()}
+    apply_revisions(row, rev)
     # 财年标签：Yahoo 的 lastFiscalYearEnd 覆盖所有票（XBRL 带缺席的 TSM/RKLB 也有）
     lfy = row["yh"].get("last_fy_end")
     src = {"fiscal_years": [{"fy_end": lfy}]} if lfy else (b10_eps or {})
