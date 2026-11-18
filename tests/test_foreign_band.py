@@ -381,3 +381,12 @@ def test_reconcile_drops_sign_flip_and_huge_gaps():
     # 0.36 vs 57.82/155 = 0.373（差 3.5%，汇率口径噪音）不改；0.34 vs 0.388（差 12%）改用财报
     assert [r["date"] for r in info["fixed"]] == ["2025-11-10"]
     assert q2[3]["eps"] == 0.36 and q2[1]["eps"] == 0.40      # 剔除的季度不改值，由调用方去掉
+
+
+def test_reconcile_requires_strict_majority():
+    # 4 季里只有 2 季吻合 = 口径没被证明，不能拿它去改另外 2 季
+    q = ASML_Q[1:]
+    ok = dict.fromkeys((x["date"] for x in q), "EUR")
+    stmt = {"2025-12-31": 7.34, "2026-03-31": 7.15, "2026-06-30": 9.99, "2026-09-30": 12.93}
+    q2, info = fb.reconcile_statement(q, ok, stmt, "EUR")
+    assert q2 is q and not info["fixed"] and "2/4" in info["skipped"]

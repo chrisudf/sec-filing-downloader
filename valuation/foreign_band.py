@@ -325,7 +325,7 @@ def reconcile_statement(quarters, ok, stmt, ccy, fx_at=None):
     if not pairs:
         return quarters, info
     agree = [abs(quarters[i]["eps"] / s - 1) <= tol for i, _, s, tol in pairs if s]
-    if sum(agree) * 2 < len(pairs):
+    if sum(agree) * 2 <= len(pairs):          # 严格过半：2/4 吻合不足以证明同口径
         info["skipped"] = f"财报季度 EPS 与公告值口径对不上（{sum(agree)}/{len(pairs)} 季吻合），未用"
         return quarters, info
     out = [dict(q) for q in quarters]
