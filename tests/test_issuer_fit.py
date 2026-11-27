@@ -227,3 +227,18 @@ def test_load_inputs_taxonomy_truthiness(monkeypatch):
     inp = pb.load_inputs("DUAL", "x@example.com")
     assert inp["taxonomy"] == "ifrs-full"
     assert inp["facts"] == {"ProfitLoss": {"units": {}}}
+
+
+# ---------- 2026-11-27：伯克希尔型（股数只按股份类别维度申报）不许说成新上市 ----------
+
+def test_band_msg_class_dimension_shares():
+    usd = {"NetIncomeLoss": {"units": {"USD": []}}}
+    msg = insufficient_q_msg("BRK-B", "净利 72 期/股数 0 期", "us-gaap", usd,
+                             ["WeightedAverageNumberOfDilutedSharesOutstanding"], 0, 0,
+                             n_num_q=72)
+    assert "股份类别维度" in msg and "前瞻 PE" in msg
+    assert "新上市" not in msg and "外国发行人" not in msg
+    # 分子也很短的仍按历史太短处理（新上市票的股数 0 期不是维度问题）
+    msg = insufficient_q_msg("IPOX", "净利 3 期/股数 0 期", "us-gaap", usd,
+                             ["NetIncomeLoss"], 0, 0, n_num_q=3)
+    assert "历史太短" in msg
