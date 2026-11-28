@@ -62,6 +62,8 @@ BASIS_KEY = {"forward": "pe_forward", "trailing": "pe_trailing", "ntm": "pe_ntm"
 # near-zero 地板一致（都认为分母不代表盈利能力），且全量留痕可核对，故不额外
 # 加绝对量级门槛——真要放宽，改这里而不是调 K（K 是按畸变幅度校准的）。
 ANOM_K = 1.25
+# 滚动四季窗的相邻期末间隔（天）。上限放到 120 容纳 16 周季度（COST 第四季），见 _consecutive
+Q_GAP_MIN, Q_GAP_MAX = 80, 120
 
 NI_TAGS = ["NetIncomeLoss", "ProfitLossAttributableToOwnersOfParent", "ProfitLoss"]
 # 营收 tag 与 fetch_facts.TAGS_STANDARD/TAGS_IFRS 的 revenue 候选一致；总营收 tag 与
@@ -423,16 +425,30 @@ def _same_fq(k1, k2, tol=45):
     return rem <= tol or rem >= 365.25 - tol
 
 
+def _consecutive(ends) -> bool:
+    """相邻期末都是"一个季度"的间隔 -> 四季窗连续。
+
+    上限 120 天而不是 100：COST 财年 12/12/12/16 周，第四季期末离第三季 112 天。
+    旧上限 100 让每扇跨过第三→第四季这 112 天的窗都被丢掉，TTM 只剩「截至第三季」
+    那一扇，年报出来后仍滞后一个季度、且 fresh 照样判真（2026-11-27 加 COST 时撞上）。
+    120 仍远小于缺一季的间隔（≥160 天），连续性校验的本意不变。
+
+    pick() 的季度**时长**过滤仍是 80-100 天，对 COST 不碍事：第四季没有 10-Q，
+    是 derive_q4 用「年报 − 前三季」补出来的，不经那道过滤（tests/test_q_gap.py
+    从原始 facts 走 compute_band 钉住）。16 周季度直接申报在 10-Q 里的发行人
+    （KR/ACI/JACK 的第一季）仍会在 pick 被丢，见 TODO.md。"""
+    return all(Q_GAP_MIN <= (b - a).days <= Q_GAP_MAX for a, b in zip(ends, ends[1:]))
+
+
 def _valid_windows(ni_q):
-    """滚动四季窗迭代器（相邻期末 80-100 天的连续性校验）。
+    """滚动四季窗迭代器（相邻期末一个季度间隔的连续性校验，见 _consecutive）。
 
     loo_outlier_map 与 loo_covered_periods 必须扫**同一批**窗口——各写一份窗口
     校验会在边界窗上判出两个答案（季节性密度闸的分母与分子随之错位）。"""
     qs = sorted(ni_q.items())
     for i in range(3, len(qs)):
         window = qs[i - 3:i + 1]
-        ends = [date.fromisoformat(k) for k, _ in window]
-        if all(80 <= (ends[j + 1] - ends[j]).days <= 100 for j in range(3)):
+        if _consecutive([date.fromisoformat(k) for k, _ in window]):
             yield window
 
 
@@ -552,8 +568,7 @@ def build_ttm_eps(ni_q, sh_q, anom_k=ANOM_K, omap=None, covered=None):
         covered = loo_covered_periods(ni_q)
     for i in range(3, len(qs)):
         window = qs[i - 3:i + 1]
-        ends = [date.fromisoformat(k) for k, _ in window]
-        if not all(80 <= (ends[j + 1] - ends[j]).days <= 100 for j in range(3)):
+        if not _consecutive([date.fromisoformat(k) for k, _ in window]):
             continue
         sh = [sh_q.get(k) for k, _ in window]
         if not all(sh):
@@ -681,18 +696,31 @@ def _has_nonusd_units(facts, tags) -> bool:
     return False
 
 
-def insufficient_q_msg(ticker, detail, taxonomy, facts, tags, n_annual, n_q) -> str:
+def insufficient_q_msg(ticker, detail, taxonomy, facts, tags, n_annual, n_q,
+                       n_num_q=None) -> str:
     """季度序列不足的报错分类（0020）。
 
     「外国发行人常无季度 XBRL」此前是唯一措辞——美股新上市票（年度 0 期 +
     2 个季度）也被诊断成外国发行人，实测把失败原因带偏。外国发行人措辞只给
     真正像外国发行人的形态：ifrs taxonomy / 非美元申报 / 有年度却无任何季度
-    （20-F 年报节奏）；其余按「历史太短」呈现，并给出可行动的下一步。"""
+    （20-F 年报节奏）；其余按「历史太短」呈现，并给出可行动的下一步。
+
+    n_num_q（股数那一处传入，= 净利÷EPS 兜底所用的**净利**季度期数）：净利有长历史
+    而股数一期都没有 = 股数/EPS 只按股份类别维度申报（伯克希尔 A/B 股：2016 年起
+    companyfacts 里既无合并股数也无 EPS，净利÷EPS 兜底也没料）。这不是"新上市"，
+    等多少 10-Q 都不会好——2026-11-27 加 BRK-B 时旧措辞把它说成"历史太短、待后续 10-Q"。
+    外国形态先判（#45 评审）：伯克希尔型只从「历史太短」那一档里分出来，原本判成
+    外国发行人的形态（ifrs / 非美元 / 有年度无季度）不受影响。走到这一档时 n_q==0
+    已隐含年度股数也是 0 期——BRK 正是年度、季度都没有合并口径。"""
     foreign = (taxonomy == "ifrs-full" or _has_nonusd_units(facts, tags)
                or (n_annual > 0 and n_q == 0))
     if foreign:
         return (f"{ticker} 季度 XBRL 不足（{detail}）"
                 "——外国发行人常无季度 XBRL，本工具需要季度序列")
+    if n_q == 0 and n_num_q and n_num_q >= 8:
+        return (f"{ticker} 季度 XBRL 不足（{detail}）"
+                "——股数/EPS 只按股份类别维度申报（伯克希尔 A/B 股型），SEC 汇总接口无合并"
+                "口径，TTM 带做不出来；看前瞻 PE")
     return (f"{ticker} 季度 XBRL 不足（{detail}）"
             "——历史太短（新上市发行人常见），带子需 >=4 个连续季度，"
             "待后续 10-Q 申报后再试")
@@ -772,7 +800,9 @@ def compute_band(ticker, email, years=5, basis="forward", include_series=False,
     if len(sh_q) < 4:
         raise RuntimeError(insufficient_q_msg(
             ticker, f"{NUM_WORD} {len(ni_q)} 期/股数 {len(sh_q)} 期",
-            inputs.get("taxonomy"), facts, SH_TAGS, len(sh_a), len(sh_q)))
+            inputs.get("taxonomy"), facts, SH_TAGS, len(sh_a), len(sh_q),
+            # 伯克希尔型判据看兜底用的净利，不看本带分子（rps/opeps 时是营收/营业利润）
+            n_num_q=len(ni4sh_q)))
     # 残留口径跳变哨兵：逐条 filed 规则的兜底（yfinance 拆股日偏差、罕见的不重述
     # 再申报都会在相邻期股数上留下台阶）。只留痕不修数——修数需要能定位口径边界，
     # 启发式做不到，上面的教训就是这么来的

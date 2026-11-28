@@ -227,3 +227,55 @@ def test_load_inputs_taxonomy_truthiness(monkeypatch):
     inp = pb.load_inputs("DUAL", "x@example.com")
     assert inp["taxonomy"] == "ifrs-full"
     assert inp["facts"] == {"ProfitLoss": {"units": {}}}
+
+
+# ---------- 2026-11-27：伯克希尔型（股数只按股份类别维度申报）不许说成新上市 ----------
+
+def test_band_msg_class_dimension_shares():
+    usd = {"NetIncomeLoss": {"units": {"USD": []}}}
+    msg = insufficient_q_msg("BRK-B", "净利 72 期/股数 0 期", "us-gaap", usd,
+                             ["WeightedAverageNumberOfDilutedSharesOutstanding"], 0, 0,
+                             n_num_q=72)
+    assert "股份类别维度" in msg and "前瞻 PE" in msg
+    assert "新上市" not in msg and "外国发行人" not in msg
+    # 分子也很短的仍按历史太短处理（新上市票的股数 0 期不是维度问题）
+    msg = insufficient_q_msg("IPOX", "净利 3 期/股数 0 期", "us-gaap", usd,
+                             ["NetIncomeLoss"], 0, 0, n_num_q=3)
+    assert "历史太短" in msg
+
+
+def test_band_msg_foreign_checked_before_class_dimension():
+    """#45 评审：伯克希尔型只从「历史太短」里分出来，外国形态（ifrs / 有年度无季度）照旧。"""
+    usd = {"NetIncomeLoss": {"units": {"USD": []}}}
+    tags = ["WeightedAverageNumberOfDilutedSharesOutstanding"]
+    for taxonomy, n_annual in (("ifrs-full", 5), ("ifrs-full", 0), ("us-gaap", 5)):
+        msg = insufficient_q_msg("FPI", "净利 72 期/股数 0 期", taxonomy, usd, tags,
+                                 n_annual, 0, n_num_q=72)
+        assert "外国发行人" in msg and "股份类别维度" not in msg
+
+
+def _no_share_facts(n=12, with_ni=True):
+    """伯克希尔形态的原始 facts：净利、营收都有长历史，股数和 EPS 一条合并口径都没有。"""
+    from tests.test_pe_band_guards import _facts, _quarter_ends
+    f = _facts(_quarter_ends(n), [100.0] * n)
+    del f["WeightedAverageNumberOfDilutedSharesOutstanding"]
+    f["Revenues"] = {"units": {"USD": [dict(r, val=r["val"] * 10)
+                                       for r in f["NetIncomeLoss"]["units"]["USD"]]}}
+    if not with_ni:
+        del f["NetIncomeLoss"]
+    return f
+
+
+def test_compute_band_class_dimension_keys_off_net_income():
+    """#45 评审：判据用 净利÷EPS 兜底的净利期数，不用本带分子（P/S 带是营收）。"""
+    from tests.test_pe_band_guards import _hist, _inputs
+    from valuation.pe_band import compute_band
+    for metric in ("eps", "rps"):
+        with pytest.raises(RuntimeError, match="股份类别维度"):
+            compute_band("BRKX", "x@example.com", years=5, basis="trailing",
+                         metric=metric, inputs=_inputs(_no_share_facts(), _hist()))
+    # 营收长、净利一期没有：股数缺失不是「净利有、EPS 没有」的伯克希尔型
+    with pytest.raises(RuntimeError) as ei:
+        compute_band("REVX", "x@example.com", years=5, basis="trailing", metric="rps",
+                     inputs=_inputs(_no_share_facts(with_ni=False), _hist()))
+    assert "股份类别维度" not in str(ei.value)
